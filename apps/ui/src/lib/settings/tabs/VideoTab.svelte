@@ -409,10 +409,10 @@
         <Segmented
           {...ctl}
           name="video-capture-method"
-          value={video.no_border_capture ? experimental : standard}
+          value={video.no_border_capture ? 'experimental' : 'standard'}
           options={CAPTURE_METHOD_OPTIONS}
           {disabled}
-          onchange={(v) => setPath(video.no_border_capture, v === experimental)}
+          onchange={(v) => setPath('video.no_border_capture', v === 'experimental')}
         />
       {/snippet}
     </FieldRow>

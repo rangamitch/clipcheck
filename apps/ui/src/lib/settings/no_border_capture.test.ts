@@ -98,3 +98,14 @@ describe('video.no_border_capture write path', () => {
     expect(diffPatch(saved, draft)).toEqual({ video: { cursor: false } });
   });
 });
+
+describe('Capture Method control wiring', () => {
+  it('binds the Segmented control to video.no_border_capture with quoted literals', async () => {
+    const { readFileSync } = await import('node:fs');
+    const src = readFileSync('src/lib/settings/tabs/VideoTab.svelte', 'utf8');
+    expect(src).toContain("value={video.no_border_capture ? 'experimental' : 'standard'}");
+    expect(src).toContain("setPath('video.no_border_capture', v === 'experimental')");
+    expect(src).toContain("label: 'Standard Capture'");
+    expect(src).toContain("label: 'Experimental Capture'");
+  });
+});
