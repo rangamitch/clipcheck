@@ -163,7 +163,9 @@ jobs:
             echo "error: expected exactly one installer, found ${#setups[@]}"
             exit 1
           fi
-          npx tauri signer sign -f "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "${setups[0]}"
+          # The signer reads TAURI_SIGNING_PRIVATE_KEY (key contents) and
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD from the environment; passing -f/-p as well is a clap conflict.
+          npx tauri signer sign "${setups[0]}"
           test -s "${setups[0]}.sig"
 
       - name: Stage the installer and check its size budget
