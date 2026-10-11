@@ -429,8 +429,12 @@ test('docs: scripts/test-all.sh named in release.md exists', { timeout: TIMEOUT 
   assert.ok(existsSync(join(ROOT, 'scripts', 'test-all.sh')));
 });
 
-test('docs: section 8 says the updater pubkey is the DEV key and the config really has one', { timeout: TIMEOUT }, () => {
+test('docs: section 8 names the production updater key id and the config pubkey really has that id', { timeout: TIMEOUT }, () => {
   const conf = JSON.parse(read('apps/ui/src-tauri/tauri.conf.json'));
-  assert.ok(conf.plugins?.updater?.pubkey, 'updater pubkey must be set (dev key)');
-  assert.match(read('docs/release.md'), /DEV/);
+  const pubkey = conf.plugins?.updater?.pubkey;
+  assert.ok(pubkey, 'updater pubkey must be set');
+  // The pubkey is base64 of a minisign file whose comment line ends with the key id.
+  const keyId = /public key: ([0-9A-F]{16})/.exec(Buffer.from(pubkey, 'base64').toString('utf8'))?.[1];
+  assert.ok(keyId, 'pubkey must decode to a minisign public key');
+  assert.ok(read('docs/release.md').includes(keyId), 'docs/release.md must name the key id ' + keyId);
 });
