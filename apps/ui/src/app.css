@@ -27,6 +27,26 @@ body {
   font-size: 14px;
 }
 
+/* This is an app, not a document: no text selection by drag, double click or Ctrl+A. */
+html,
+body,
+body * {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* Text fields stay selectable so people can edit, copy and paste what they type. */
+input,
+textarea,
+[contenteditable='true'] {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+img {
+  -webkit-user-drag: none;
+}
+
 #app {
   height: 100%;
 }
