@@ -928,13 +928,21 @@ impl Core {
         const QUIET: Duration = Duration::from_millis(100);
         const DEADLINE: Duration = Duration::from_secs(5);
         let deadline = Instant::now() + DEADLINE;
+        // Only recorder events extend the quiet period. The 100 ms levels tick (and any
+        // other message) must not, or a tick landing in every window keeps the drain
+        // running to the deadline and the daemon misses its exit budget.
+        let mut quiet_until = Instant::now() + QUIET;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            let now = Instant::now();
+            let until = quiet_until.min(deadline);
+            if now >= until {
                 break;
             }
-            match rx.recv_timeout(QUIET.min(left)) {
-                Ok(Msg::Recorder(event)) => self.on_recorder(event),
+            match rx.recv_timeout(until - now) {
+                Ok(Msg::Recorder(event)) => {
+                    self.on_recorder(event);
+                    quiet_until = Instant::now() + QUIET;
+                }
                 Ok(_) => {}
                 Err(_) => break,
             }

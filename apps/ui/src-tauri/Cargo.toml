@@ -32,11 +32,11 @@ url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-tauri = { version = "2", features = [] }
+tauri = "2"
 windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell"] }
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = "2"
 
 [dev-dependencies]
 clipcheck-testkit = { path = "../../../crates/testkit" }

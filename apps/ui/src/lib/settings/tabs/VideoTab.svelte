@@ -396,9 +396,9 @@
     </FieldRow>
 
     <FieldRow
-      label="No-border capture (Windows 10)"
+      label="No-border capture"
       path="video.no_border_capture"
-      help="Removes the coloured outline Windows draws around a recorded game. Only Windows 10 needs this; Windows 11 already hides it. It records the screen area under the game instead of the game window, so a notification or window on top of the game will appear in your clips. Only used when the game is borderless fullscreen; otherwise normal capture is used."
+      help="Records the screen area under the game instead of the game window, so Windows never draws its coloured outline. This can fix border and recording problems on Windows 10; on Windows 11 it is simply an alternative capture mode. A notification or window on top of the game will appear in your clips. Only used when the game is borderless fullscreen; otherwise normal capture is used."
     >
       {#snippet children(ctl)}
         <Toggle

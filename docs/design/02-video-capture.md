@@ -925,6 +925,8 @@ Full contract in `docs/impl/no-border-capture.md`.
 
 ### 5.15 v2 game-hook design sketch (not built in v1)
 
+Status (D64): parked, not scheduled. Desktop Duplication (5.16) covers the Windows 10 border case without injecting into games, and injection carries anti-cheat ban, antivirus and crash risk. Revisit only if Windows 10 testing shows 5.16 fails, or users repeatedly report overlay leakage or windowed/exclusive-fullscreen gaps that borderless mode cannot fix. Any build starts DX11/DX12-only and refuses games with known anti-cheat.
+
 Purpose: record exclusive-fullscreen games that WGC cannot capture. Same approach as OBS "game capture". Designed here so the v1 interfaces do not block it. Nothing in this section is implemented in v1.
 
 ```
