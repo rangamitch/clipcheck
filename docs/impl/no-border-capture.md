@@ -137,7 +137,7 @@ Own error mapper (wgc's `werr` is private): `derr(context) -> impl Fn(windows::c
 
 `store.ts` Video type: `no_border_capture: boolean`. `video.ts` default `false`. In
 `VideoTab.svelte`, inside the existing `<details class="advanced">`, after "Show the mouse cursor":
-`FieldRow label="No-border capture (Windows 10)" path="video.no_border_capture"` with a `Toggle`.
+`FieldRow label="Capture Method" path="video.no_border_capture"` with a `Segmented` control ("Standard Capture" = false, "Experimental Capture" = true), same style as the GPU/CPU encoder choice.
 Help: "Removes the coloured outline Windows draws around a recorded game. Windows 10 only needs
 this; Windows 11 already hides it. It records the screen area under the game instead of the window,
 so a notification or window on top of the game will appear in your clips. Only used when the game

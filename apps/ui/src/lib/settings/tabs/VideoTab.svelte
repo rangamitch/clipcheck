@@ -70,6 +70,11 @@
   const FPS_OPTIONS = FPS_CHOICES.map((f) => ({ value: String(f), label: `${f} FPS` }));
   const BITRATE_OPTIONS = bitrateOptions();
 
+  const CAPTURE_METHOD_OPTIONS: { value: 'standard' | 'experimental'; label: string }[] = [
+    { value: 'standard', label: 'Standard Capture' },
+    { value: 'experimental', label: 'Experimental Capture' },
+  ];
+
   const gpuMode = $derived<'gpu' | 'cpu'>(video?.encoder === 'software' ? 'cpu' : 'gpu');
   const codec = $derived(video?.codec ?? 'h264');
   const cqLimit = $derived(cqMax(codec));
@@ -396,16 +401,18 @@
     </FieldRow>
 
     <FieldRow
-      label="No-border capture"
+      label="Capture Method"
       path="video.no_border_capture"
-      help="Records the screen area under the game instead of the game window, so Windows never draws its coloured outline. This can fix border and recording problems on Windows 10; on Windows 11 it is simply an alternative capture mode. A notification or window on top of the game will appear in your clips. Only used when the game is borderless fullscreen; otherwise normal capture is used."
+      help="Standard Capture records the game window and is right for most people. Experimental Capture records the screen area under the game instead, so Windows never draws its coloured outline. It can fix border and recording problems on Windows 10 and is also usable on Windows 11. A notification or window on top of the game will appear in your clips. It is only used when the game is borderless fullscreen; otherwise Standard Capture is used."
     >
       {#snippet children(ctl)}
-        <Toggle
+        <Segmented
           {...ctl}
-          checked={video.no_border_capture ?? false}
+          name="video-capture-method"
+          value={video.no_border_capture ? experimental : standard}
+          options={CAPTURE_METHOD_OPTIONS}
           {disabled}
-          onchange={(v) => setPath('video.no_border_capture', v)}
+          onchange={(v) => setPath(video.no_border_capture, v === experimental)}
         />
       {/snippet}
     </FieldRow>

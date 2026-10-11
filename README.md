@@ -91,7 +91,7 @@ buffer. If you only want clips, turn off full-session recording in **Settings > 
 - Hotkeys use a passive low-level keyboard hook (keys keep working in other apps). Some anti-cheat
   systems may flag global keyboard hooks; this has not been tested against anti-cheat.
 - On Windows 10 the yellow capture border around the game cannot be turned off in normal window
-  capture. Settings > Video > Advanced > No-border capture records without it, but then records the
+  capture. Settings > Video > Advanced > Capture Method > Experimental Capture records without it, but then records the
   screen area under the game (borderless fullscreen only), so notifications on top of the game
   appear in clips.
 - Playing H.265 recordings in the app depends on Windows' HEVC codec being installed.
