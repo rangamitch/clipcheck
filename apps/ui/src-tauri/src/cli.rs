@@ -105,6 +105,12 @@ pub fn update_shutdown_command() -> Value {
     json!({ "type": "shutdown", "data": { "reason": "update", "mode": "update" } })
 }
 
+/// The `shutdown` command for "stop recording and update": mode `force` is never refused, and
+/// the daemon finalizes (saves) the active session on its normal shutdown path (D47).
+pub fn forced_update_shutdown_command() -> Value {
+    json!({ "type": "shutdown", "data": { "reason": "update", "mode": "force" } })
+}
+
 /// Error code of an error reply: `data.code`, with a top-level `code` as fallback.
 fn error_code(body: &Value) -> Option<&str> {
     body.get("data")
@@ -322,6 +328,14 @@ mod tests {
         assert_eq!(cmd["data"]["reason"], "update");
         assert_eq!(cmd["data"]["mode"], "update");
         assert!(cmd.get("reason").is_none());
+    }
+
+    #[test]
+    fn forced_update_shutdown_command_uses_force_mode() {
+        assert_eq!(
+            forced_update_shutdown_command(),
+            json!({ "type": "shutdown", "data": { "reason": "update", "mode": "force" } })
+        );
     }
 
     #[test]

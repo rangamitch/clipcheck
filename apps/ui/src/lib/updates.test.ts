@@ -268,6 +268,39 @@ describe('store inside Tauri (invoke and listen mocked)', () => {
     expect(get(updateStore).installing).toBe(false);
   });
 
+  it('installNow(true) passes stopRecording to install_update', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await installNow(true);
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith('install_update', { stopRecording: true });
+  });
+
+  it('installNow() defaults to stopRecording false', async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    await installNow();
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith('install_update', { stopRecording: false });
+  });
+
+  it('reopening the dialog clears a stale recording error', () => {
+    updateStore.update((s) => ({
+      ...s,
+      available: info(),
+      error: { kind: 'recording', message: 'A recording is in progress.' },
+    }));
+    openUpdateModal();
+    expect(get(updateStore).error).toBeNull();
+    expect(get(updateStore).modalOpen).toBe(true);
+  });
+
+  it('initUpdates restores a pending update found by an earlier run', async () => {
+    setTauri(true);
+    vi.mocked(listen).mockResolvedValue(() => {});
+    vi.mocked(invoke).mockImplementation(async (cmd: string) =>
+      cmd === 'get_pending_update' ? info() : savedState,
+    );
+    await initUpdates();
+    expect(get(updateStore).available?.version).toBe('2.0.0');
+  });
+
   it('skipVersion calls skip_update_version with the version and hides the pill and modal', async () => {
     updateStore.update((s) => ({ ...s, available: info(), modalOpen: true }));
     vi.mocked(invoke).mockResolvedValue(undefined);

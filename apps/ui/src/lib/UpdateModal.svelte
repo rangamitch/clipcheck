@@ -17,7 +17,7 @@
   const error = $derived($updateStore.error);
   const installing = $derived($updateStore.installing);
   const progress = $derived($updateStore.progress);
-  /** A recording blocks the install: the only action is Close. */
+  /** A recording blocks a normal install; the user can end it and update, or close. */
   const blocked = $derived(error?.kind === 'recording');
 
   let primaryButton: HTMLButtonElement | undefined = $state();
@@ -96,8 +96,25 @@
 
       <div class="actions">
         {#if blocked}
-          <button type="button" class="primary" bind:this={primaryButton} onclick={closeUpdateModal}>
+          <button type="button" class="secondary" disabled={installing} onclick={closeUpdateModal}>
             Close
+          </button>
+          <button
+            type="button"
+            class="secondary"
+            disabled={installing}
+            onclick={() => void installNow()}
+          >
+            Try again
+          </button>
+          <button
+            type="button"
+            class="primary"
+            bind:this={primaryButton}
+            disabled={installing}
+            onclick={() => void installNow(true)}
+          >
+            Stop recording and update
           </button>
         {:else}
           <button

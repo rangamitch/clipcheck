@@ -153,8 +153,13 @@ export function checkForUpdate(manual: boolean): Promise<UpdateInfo | null> {
   return invoke<UpdateInfo | null>('check_for_update', { manual });
 }
 
-export function installUpdate(): Promise<void> {
-  return invoke<void>('install_update');
+export function installUpdate(stopRecording = false): Promise<void> {
+  return invoke<void>('install_update', { stopRecording });
+}
+
+/** The update found by an earlier check (this run or a previous one); no network access. */
+export function fetchPendingUpdate(): Promise<UpdateInfo | null> {
+  return invoke<UpdateInfo | null>('get_pending_update');
 }
 
 export function skipUpdateVersion(version: string): Promise<void> {
@@ -177,6 +182,13 @@ export async function initUpdates(): Promise<() => void> {
     updateStore.update((s) => ({ ...s, state }));
   } catch {
     // The pill and tab work without the saved state; they just lack the last-checked time.
+  }
+
+  try {
+    const pending = await fetchPendingUpdate();
+    if (pending) updateStore.update((s) => ({ ...s, available: s.available ?? pending }));
+  } catch {
+    // Without it the pill appears after the next background or manual check.
   }
 
   const unlisteners: UnlistenFn[] = [];
@@ -225,12 +237,13 @@ export async function checkNow(): Promise<UpdateInfo | null> {
 /**
  * Downloads, verifies and installs the update. On success the app exits, so this normally
  * never resolves into a visible state. Errors are classified into the store's `error`.
+ * With `stopRecording`, an active recording is saved and ended instead of blocking the update.
  */
-export async function installNow(): Promise<void> {
+export async function installNow(stopRecording = false): Promise<void> {
   if (!isTauriRuntime()) return;
   updateStore.update((s) => ({ ...s, installing: true, error: null, progress: null }));
   try {
-    await installUpdate();
+    await installUpdate(stopRecording);
     updateStore.update((s) => ({ ...s, installing: false }));
   } catch (e) {
     const raw = messageOf(e);
@@ -271,10 +284,11 @@ export async function skipVersion(): Promise<void> {
 
 /** Opens the update dialog (from the pill). */
 export function openUpdateModal(): void {
-  updateStore.update((s) => ({ ...s, modalOpen: true }));
+  // A "recording in progress" error is stale by the time the dialog is opened again.
+  updateStore.update((s) => ({ ...s, modalOpen: true, error: null }));
 }
 
 /** Closes the update dialog. Does not cancel an install in progress. */
 export function closeUpdateModal(): void {
-  updateStore.update((s) => ({ ...s, modalOpen: false }));
+  updateStore.update((s) => ({ ...s, modalOpen: false, error: null }));
 }

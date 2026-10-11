@@ -26,6 +26,20 @@ pub struct UpdateState {
     pub skipped_version: Option<String>,
     /// Version that was running before the last update was started from the app.
     pub last_installed_from: Option<String>,
+    /// Newest update found by the last check, so a restart still shows it. Cleared when a
+    /// check finds nothing newer.
+    pub pending: Option<PendingUpdate>,
+}
+
+/// An update that was found but not installed yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingUpdate {
+    /// Version of the update.
+    pub version: String,
+    /// Release notes from the manifest.
+    pub notes: String,
+    /// Publication date from the manifest (RFC 3339), if present.
+    pub pub_date: Option<String>,
 }
 
 /// Returns the data folder: `CLIPCHECK_DATA_DIR` when set, else `%APPDATA%\ClipCheck`.
@@ -135,6 +149,7 @@ mod tests {
             last_checked_unix_ms: Some(1_700_000_000_000),
             skipped_version: Some("0.3.0".into()),
             last_installed_from: None,
+            pending: None,
         };
         save_to(&path, &first).unwrap();
         assert_eq!(load_from(&path), first);

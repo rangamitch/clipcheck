@@ -9,9 +9,7 @@ use std::sync::OnceLock;
 
 use clipcheck_testkit::{AudioSpec, MediaSpec};
 use clipcheck_ui_lib::media::{serve, sidecar_path};
-use clipcheck_ui_lib::player::{
-    cache_dir_from, open_at, PlayerOpenDto,
-};
+use clipcheck_ui_lib::player::{cache_dir_from, open_at, PlayerOpenDto};
 use common_player::{hdr, make_db, must, pattern, Row};
 use tempfile::TempDir;
 

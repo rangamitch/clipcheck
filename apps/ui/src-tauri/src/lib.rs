@@ -132,6 +132,7 @@ pub fn run() {
             updater::install_update,
             updater::skip_update_version,
             updater::get_update_state,
+            updater::get_pending_update,
             ipc::daemon_connection_error
         ])
         .run(tauri::generate_context!())

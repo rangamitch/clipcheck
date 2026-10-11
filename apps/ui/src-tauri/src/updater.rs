@@ -25,10 +25,12 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
 use url::Url;
 
-use crate::cli::{classify_shutdown_reply, update_shutdown_command, ShutdownReply};
+use crate::cli::{
+    classify_shutdown_reply, forced_update_shutdown_command, update_shutdown_command, ShutdownReply,
+};
 use crate::closing::session_active_now;
 use crate::ipc::{timeout_for, DaemonClient};
-use crate::update_state::{self, UpdateState};
+use crate::update_state::{self, PendingUpdate, UpdateState};
 
 /// Manifest URL used when `updates.endpoint` is empty.
 ///
@@ -253,17 +255,61 @@ pub async fn check_for_update(
 /// On success the process exits (the installer takes over), so `Ok` is not normally seen.
 /// Errors are short codes or messages:
 /// - `"recording"`: a session is recording, or the daemon refused the shutdown. Nothing changed.
+///   With `stop_recording` the session is not refused: it is saved and ended right before the
+///   installer starts (the download runs while it keeps recording).
 /// - `"signature"`: the download did not verify. The old version is intact.
 /// - `"no-update"`: the manifest has no newer version.
 /// - anything else: a download, install or manifest error.
 #[tauri::command]
-pub async fn install_update(app: AppHandle) -> Result<(), String> {
+pub async fn install_update(app: AppHandle, stop_recording: Option<bool>) -> Result<(), String> {
     let runtime = Arc::clone(&*app.state::<Arc<UpdateRuntime>>());
     if runtime.installing.swap(true, Ordering::SeqCst) {
         return Err("already in progress".into());
     }
     let _flag = InstallFlag(runtime);
-    install_inner(&app).await
+    install_inner(&app, stop_recording.unwrap_or(false)).await
+}
+
+/// Returns the update found by an earlier check (this run or a previous one), if it is still
+/// newer than the running version and not skipped. Needs no network access.
+#[tauri::command]
+pub fn get_pending_update(app: AppHandle) -> Option<UpdateInfoDto> {
+    let state = update_state::load();
+    let pending = state.pending?;
+    let current = app.package_info().version.to_string();
+    if !is_newer(&pending.version, &current) {
+        return None;
+    }
+    Some(UpdateInfoDto {
+        skipped: state.skipped_version.as_deref() == Some(pending.version.as_str()),
+        version: pending.version,
+        current_version: current,
+        notes: pending.notes,
+        pub_date: pending.pub_date,
+    })
+}
+
+/// True when dotted numeric version `candidate` is newer than `current` (pre-release and
+/// build suffixes are ignored; anything unparsable is not newer).
+fn is_newer(candidate: &str, current: &str) -> bool {
+    fn parts(v: &str) -> Option<Vec<u64>> {
+        let core = v.trim().trim_start_matches('v').split(['-', '+']).next()?;
+        core.split('.').map(|p| p.parse().ok()).collect()
+    }
+    match (parts(candidate), parts(current)) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+
+/// Remembers (or forgets) the newest update a check found.
+fn record_pending(found: Option<&UpdateInfoDto>) {
+    let pending = found.map(|i| PendingUpdate {
+        version: i.version.clone(),
+        notes: i.notes.clone(),
+        pub_date: i.pub_date.clone(),
+    });
+    let _ = update_state::update(|s| s.pending = pending);
 }
 
 /// Remembers that the user chose to skip `version`. Background checks then stay quiet about it.
@@ -296,10 +342,12 @@ async fn run_check(app: &AppHandle, manual: bool) -> Result<Option<UpdateInfoDto
         .map_err(|e| format!("update check failed: {e}"))?;
     record_checked();
     let skipped = update_state::load().skipped_version;
-    Ok(found.map(|u| UpdateInfoDto::from_update(&u, skipped.as_deref())))
+    let info = found.map(|u| UpdateInfoDto::from_update(&u, skipped.as_deref()));
+    record_pending(info.as_ref());
+    Ok(info)
 }
 
-async fn install_inner(app: &AppHandle) -> Result<(), String> {
+async fn install_inner(app: &AppHandle, stop_recording: bool) -> Result<(), String> {
     let settings = load_settings(app.clone()).await;
     let endpoint = resolve_endpoint(&settings.endpoint)?;
     let updater = build_updater(app, endpoint)?;
@@ -310,7 +358,7 @@ async fn install_inner(app: &AppHandle) -> Result<(), String> {
         .ok_or_else(|| "no-update".to_owned())?;
 
     // Read-only check first, so nothing is downloaded while a session records.
-    if session_active_blocking(app).await {
+    if !stop_recording && session_active_blocking(app).await {
         return Err("recording".into());
     }
 
@@ -342,7 +390,7 @@ async fn install_inner(app: &AppHandle) -> Result<(), String> {
         .map_err(map_download_error)?;
 
     // Verified. Only now stop the daemon, so a failed download leaves recording running.
-    stop_daemon_for_update(app).await?;
+    stop_daemon_for_update(app, stop_recording).await?;
     let from = update.current_version.clone();
     let _ = update_state::update(|s| s.last_installed_from = Some(from));
 
@@ -366,12 +414,17 @@ fn map_download_error(error: UpdaterError) -> String {
 /// Asks the daemon to shut down for the update. A `busy` reply becomes `"recording"`.
 /// If the daemon does not answer (not running, or unresponsive), the update continues:
 /// the installer stops its own copy of the daemon.
-async fn stop_daemon_for_update(app: &AppHandle) -> Result<(), String> {
+async fn stop_daemon_for_update(app: &AppHandle, force: bool) -> Result<(), String> {
     let Some(client) = client_of(app) else {
         return Ok(());
     };
     let reply = tauri::async_runtime::spawn_blocking(move || {
-        client.request(update_shutdown_command(), SHUTDOWN_TIMEOUT)
+        let command = if force {
+            forced_update_shutdown_command()
+        } else {
+            update_shutdown_command()
+        };
+        client.request(command, SHUTDOWN_TIMEOUT)
     })
     .await;
     match reply {
@@ -529,6 +582,16 @@ mod tests {
             resolve_endpoint("  ").map(|u| u.to_string()),
             Ok(DEFAULT_UPDATE_ENDPOINT.to_owned())
         );
+    }
+
+    #[test]
+    fn newer_version_comparison() {
+        assert!(is_newer("0.3.2", "0.3.1"));
+        assert!(is_newer("0.10.0", "0.9.9"));
+        assert!(is_newer("v1.0.0", "0.9.9"));
+        assert!(!is_newer("0.3.1", "0.3.1"));
+        assert!(!is_newer("0.3.0", "0.3.1"));
+        assert!(!is_newer("junk", "0.3.1"));
     }
 
     #[test]
