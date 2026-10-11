@@ -136,6 +136,7 @@ pub fn make_config(
         session_auto_start,
         audio_tracks: Vec::new(),
         tuning: clipcheck_encode::tuning::EncoderTuning::default(),
+        no_border_capture: false,
     };
     (cfg, work, clips, sessions)
 }

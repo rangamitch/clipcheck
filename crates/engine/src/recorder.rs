@@ -138,6 +138,9 @@ pub struct RecorderConfig {
     /// Encoder rate control, speed, B-frames and GPU index. The default
     /// (`EncoderTuning::default()`) is the behaviour before tuning existed.
     pub tuning: EncoderTuning,
+    /// Use the no-border capture source (D64) when the game covers its monitor; falls back to
+    /// window capture otherwise.
+    pub no_border_capture: bool,
 }
 
 /// Identifies a clip job started by [`Recorder::clip`].

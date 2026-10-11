@@ -42,6 +42,7 @@ describe('video defaults', () => {
       gpu: 'auto',
       encoder_speed: 'balanced',
       b_frames: 2,
+      no_border_capture: false,
     });
   });
 

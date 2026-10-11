@@ -465,6 +465,7 @@ where
         session_auto_start: cfg.detection.auto_record && cfg.detection.record_sessions,
         audio_tracks: audio_tracks_of(&cfg.audio),
         tuning,
+        no_border_capture: video.no_border_capture,
     };
     let info = EncoderChoiceInfo {
         encoder_name: selection.encoder.encoder_name,

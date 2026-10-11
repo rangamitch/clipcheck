@@ -13,10 +13,31 @@
 
 mod blackgen;
 mod buffers;
+mod dda;
+pub mod dda_geom;
 mod gpu;
 mod wgc;
 
 pub use gpu::{GpuFrame, SharedTexture};
+
+/// Which source feeds the pacer. See docs/impl/no-border-capture.md (D64).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptureBackend {
+    /// Windows Graphics Capture of the window (the default; draws the capture border on Windows 10).
+    #[default]
+    Wgc,
+    /// Desktop Duplication of the window's monitor, cropped to the window: no capture border.
+    NoBorder {
+        /// Fail unless the window covers at least 95 % of its monitor (production passes true).
+        require_cover: bool,
+    },
+}
+
+/// How many times the no-border source has been entered in this process. Stays 0 unless a caller
+/// asks for [`CaptureBackend::NoBorder`]; tests use it to prove the opt-in gate.
+pub fn no_border_attempts() -> u64 {
+    dda::attempts()
+}
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -85,6 +106,12 @@ pub enum CaptureError {
     /// The capture thread exited before reporting its state.
     #[error("capture thread failed to start")]
     ThreadStart,
+    /// The opt-in no-border source cannot run here; the caller should use window capture.
+    #[error("no-border capture unavailable: {reason}")]
+    NoBorderUnavailable {
+        /// Why, in a sentence a user can read.
+        reason: String,
+    },
 }
 
 /// DXGI_ERROR_UNSUPPORTED: D3D11 has no hardware device on this machine.
@@ -135,6 +162,7 @@ pub struct WindowCapturer {
     stop: Arc<AtomicBool>,
     pacer: Option<JoinHandle<()>>,
     wgc: Option<wgc::WgcThread>,
+    dda: Option<dda::DdaThread>,
     errors: Arc<AtomicU64>,
 }
 
@@ -145,9 +173,20 @@ impl WindowCapturer {
         cfg: CaptureConfig,
         device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
     ) -> Result<(WindowCapturer, Receiver<GpuFrame>), CaptureError> {
+        Self::start_gpu_with(cfg, device, CaptureBackend::Wgc)
+    }
+
+    /// Like [`WindowCapturer::start_gpu`] with an explicit [`CaptureBackend`];
+    /// `CaptureBackend::Wgc` is exactly `start_gpu`.
+    pub fn start_gpu_with(
+        cfg: CaptureConfig,
+        device: &windows::Win32::Graphics::Direct3D11::ID3D11Device,
+        backend: CaptureBackend,
+    ) -> Result<(WindowCapturer, Receiver<GpuFrame>), CaptureError> {
         start_with(
             cfg,
             wgc::Source::Gpu(device.clone()),
+            backend,
             gpu_pixels,
             gpu_emit(),
         )
@@ -155,7 +194,13 @@ impl WindowCapturer {
 
     /// Starts capturing the window in `cfg`. Frames arrive on the returned receiver at `cfg.fps`.
     pub fn start(cfg: CaptureConfig) -> Result<(WindowCapturer, Receiver<Frame>), CaptureError> {
-        start_with(cfg, wgc::Source::Cpu, cpu_pixels, cpu_emit())
+        start_with(
+            cfg,
+            wgc::Source::Cpu,
+            CaptureBackend::Wgc,
+            cpu_pixels,
+            cpu_emit(),
+        )
     }
 
     /// Stops the pacer and the WGC session and waits for both threads to exit.
@@ -176,6 +221,7 @@ impl WindowCapturer {
 fn start_with<P: Clone + 'static, I: Send + 'static>(
     cfg: CaptureConfig,
     source: wgc::Source,
+    backend: CaptureBackend,
     pixels: fn(&Latest) -> Option<P>,
     emit: impl FnMut(Tick<P>, i64) -> I + Send + 'static,
 ) -> Result<(WindowCapturer, Receiver<I>), CaptureError> {
@@ -184,7 +230,35 @@ fn start_with<P: Clone + 'static, I: Send + 'static>(
     }
     let shared: Shared = Arc::new(Mutex::new(Latest::default()));
     let errors = Arc::new(AtomicU64::new(0));
-    let wgc = wgc::spawn(cfg.hwnd, cfg.fps, shared.clone(), errors.clone(), source)?;
+    // The no-border source is entered only for CaptureBackend::NoBorder; Wgc never touches `dda`.
+    let (wgc, dda) = match (backend, source) {
+        (CaptureBackend::Wgc, source) => (
+            Some(wgc::spawn(
+                cfg.hwnd,
+                cfg.fps,
+                shared.clone(),
+                errors.clone(),
+                source,
+            )?),
+            None,
+        ),
+        (CaptureBackend::NoBorder { require_cover }, wgc::Source::Gpu(device)) => (
+            None,
+            Some(dda::spawn(
+                cfg.hwnd,
+                cfg.fps,
+                shared.clone(),
+                errors.clone(),
+                device,
+                require_cover,
+            )?),
+        ),
+        (CaptureBackend::NoBorder { .. }, wgc::Source::Cpu) => {
+            return Err(CaptureError::NoBorderUnavailable {
+                reason: "CPU capture mode does not support it".into(),
+            })
+        }
+    };
 
     let (tx, rx) = mpsc::sync_channel::<I>(FRAME_QUEUE);
     let stop = Arc::new(AtomicBool::new(false));
@@ -204,7 +278,8 @@ fn start_with<P: Clone + 'static, I: Send + 'static>(
         WindowCapturer {
             stop,
             pacer: Some(pacer),
-            wgc: Some(wgc),
+            wgc,
+            dda,
             errors,
         },
         rx,
@@ -219,6 +294,9 @@ impl Drop for WindowCapturer {
         }
         if let Some(w) = self.wgc.take() {
             w.shutdown();
+        }
+        if let Some(d) = self.dda.take() {
+            d.shutdown();
         }
     }
 }

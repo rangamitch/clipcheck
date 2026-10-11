@@ -1466,3 +1466,28 @@ mod canvas_aspect_tester {
         assert_eq!(rc.canvas, (3840, 2160));
     }
 }
+
+// ------------------------------------------- no_border_capture pass-through
+
+#[test]
+fn no_border_capture_defaults_false_in_recorder_config() {
+    let cfg = Config::default();
+    assert!(!cfg.video.no_border_capture);
+    let (rc, _) = build(&cfg, &full_probe());
+    assert!(!rc.no_border_capture);
+}
+
+#[test]
+fn no_border_capture_is_passed_through_for_all_presets() {
+    for preset in [Preset::Low, Preset::Medium, Preset::High, Preset::Custom] {
+        for on in [false, true] {
+            let mut cfg = video_cfg(Codec::H264, preset, Resolution::Native, EncoderChoice::Auto);
+            cfg.video.no_border_capture = on;
+            let (rc, _) = build(&cfg, &full_probe());
+            assert_eq!(
+                rc.no_border_capture, on,
+                "no_border_capture for {preset:?} set to {on}"
+            );
+        }
+    }
+}

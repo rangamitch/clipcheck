@@ -58,6 +58,7 @@ fn config(env: &Env) -> RecorderConfig {
         session_auto_start: false,
         audio_tracks: Vec::new(),
         tuning: EncoderTuning::default(),
+        no_border_capture: false,
     }
 }
 

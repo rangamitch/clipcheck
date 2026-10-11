@@ -15,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use clipcheck_audio::{OUT_CHANNELS, OUT_RATE};
-use clipcheck_capture::{CaptureConfig, GpuFrame, WindowCapturer};
+use clipcheck_capture::{CaptureBackend, CaptureConfig, GpuFrame, WindowCapturer};
 use clipcheck_encode::native::{native_target, NativeEncoder, NativeParams};
 use clipcheck_encode::pipe::AudioTrackSpec;
 use clipcheck_encode::tuning::{EncoderTuning, RateMode, Speed};
@@ -104,6 +104,20 @@ pub fn start_native_capture(
     params: NativeParams,
     audio: AudioInputs,
 ) -> Result<NativeCapture, (io::Error, AudioInputs)> {
+    start_native_capture_with(hwnd, fps, params, audio, CaptureBackend::Wgc)
+}
+
+/// Like [`start_native_capture`], but with an explicit capture `backend`.
+///
+/// When a non-default `backend` cannot start, the window capture (`CaptureBackend::Wgc`) is
+/// used instead, so the recording still goes ahead.
+pub fn start_native_capture_with(
+    hwnd: isize,
+    fps: u32,
+    params: NativeParams,
+    audio: AudioInputs,
+    backend: CaptureBackend,
+) -> Result<NativeCapture, (io::Error, AudioInputs)> {
     let specs: Vec<AudioTrackSpec> = audio.iter().map(|(spec, _)| spec.clone()).collect();
     // Audio pts are counted from the encoder's start, like the wall-clock video. Blocks queued
     // before that predate the timeline; keeping them would shift audio ahead of video.
@@ -115,7 +129,18 @@ pub fn start_native_capture(
         Err(e) => return Err((e, audio)),
     };
     let device = encoder.device().clone();
-    let (capturer, frames) = match WindowCapturer::start_gpu(CaptureConfig { hwnd, fps }, &device) {
+    let cfg = CaptureConfig { hwnd, fps };
+    let started = match WindowCapturer::start_gpu_with(cfg, &device, backend) {
+        Ok(started) => Ok(started),
+        Err(e) if backend != CaptureBackend::Wgc => {
+            eprintln!(
+                "clipcheck capture: no-border capture unavailable ({e}); using window capture"
+            );
+            WindowCapturer::start_gpu_with(cfg, &device, CaptureBackend::Wgc)
+        }
+        Err(e) => Err(e),
+    };
+    let (capturer, frames) = match started {
         Ok(started) => started,
         Err(e) => {
             let _ = encoder.finish();

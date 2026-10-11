@@ -192,7 +192,7 @@ fn disable_border(session: &GraphicsCaptureSession) {
 pub(crate) fn note_error(errors: &AtomicU64, what: impl Display) {
     if errors.fetch_add(1, Ordering::Relaxed) == 0 {
         eprintln!(
-            "clipcheck capture: WGC callback error ({what}); further errors are counted silently"
+            "clipcheck capture: capture callback error ({what}); further errors are counted silently"
         );
     }
 }

@@ -37,6 +37,7 @@ export const VIDEO_DEFAULTS: Readonly<Record<string, string | number | boolean>>
   gpu: 'auto',
   encoder_speed: 'balanced',
   b_frames: 2,
+  no_border_capture: false,
 };
 
 /** The dotted draft paths and values that restore the Video section to its defaults. */

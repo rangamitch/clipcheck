@@ -90,6 +90,7 @@ export interface VideoConfig {
   gpu: string;
   encoder_speed: EncoderSpeed;
   b_frames: number;
+  no_border_capture: boolean;
 }
 
 /** `[audio.game]`: the captured game's audio. */

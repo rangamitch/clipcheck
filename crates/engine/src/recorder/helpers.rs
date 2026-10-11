@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Receiver;
 
 use clipcheck_buffer::ClipPlanError;
+#[cfg(windows)]
+use clipcheck_capture::CaptureBackend;
 use clipcheck_encode::pipe::AudioTrackSpec;
 
 use super::{ActiveSession, CaptureHandle, RecorderError, RecorderEvent};
@@ -18,7 +20,7 @@ use crate::tracker::CompletedSegment;
 
 use super::RecorderConfig;
 #[cfg(windows)]
-use crate::native_pipeline::{native_params, start_native_capture};
+use crate::native_pipeline::{native_params, start_native_capture_with};
 #[cfg(windows)]
 use crate::pipeline::RunningCapture;
 
@@ -98,7 +100,14 @@ pub(super) fn start_capture(
             cfg.encoder_name
         ))
     })?;
-    match start_native_capture(hwnd, cfg.fps, params, audio) {
+    let backend = if cfg.no_border_capture {
+        CaptureBackend::NoBorder {
+            require_cover: true,
+        }
+    } else {
+        CaptureBackend::Wgc
+    };
+    match start_native_capture_with(hwnd, cfg.fps, params, audio, backend) {
         Ok(native) => Ok(RunningCapture::from_native(native)),
         Err((e, _lanes)) => Err(io_err(e)),
     }

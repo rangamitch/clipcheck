@@ -665,6 +665,9 @@ pub struct Video {
     pub encoder_speed: EncoderSpeed,
     /// Consecutive B-frames, 0..=4.
     pub b_frames: u8,
+    /// Record without the Windows capture border (D64): duplicates the monitor and crops to the
+    /// game window. Off by default; used only when the game covers its monitor.
+    pub no_border_capture: bool,
 }
 
 impl Default for Video {
@@ -687,6 +690,7 @@ impl Default for Video {
             gpu: "auto".to_owned(),
             encoder_speed: EncoderSpeed::Balanced,
             b_frames: 2,
+            no_border_capture: false,
         }
     }
 }
@@ -1999,6 +2003,7 @@ cursor = true                   # draw the mouse cursor in captured frames
 gpu = "auto"                    # "auto" or the adapter name as the GPU list shows it
 encoder_speed = "balanced"      # "fastest" | "balanced" | "quality"
 b_frames = 2                    # 0..=4
+no_border_capture = false       # Windows 10: record without the capture border (records the screen area under the game)
 
 [audio]
 codec = "aac"                   # "aac" | "opus" (opus is rejected in v1)

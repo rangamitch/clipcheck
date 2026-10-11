@@ -38,7 +38,7 @@ Produce a constant-frame-rate stream of GPU-resident NV12 frames for exactly one
 | NVENC/AMF/QSV/x264 selection, rate control, encoder hwframes pool creation policy | `encode` (this doc only states the constraints it must satisfy) |
 | Audio capture, WASAPI, mixing | `audio` |
 | Segment ring buffer, session files, split logic | `buffer`, `session` |
-| Desktop / monitor capture, region capture | Not planned. Forbidden by brief. |
+| Desktop / monitor capture, region capture | Not planned. Forbidden by brief. Exception: the opt-in no-border source (5.16) duplicates a monitor but only emits the crop of the game window. |
 | Software cursor overlay, cursor zoom, click highlights | Post-v1 |
 | Game hook (DLL injection) implementation | v2 (sketch in 5.15 only) |
 | Preset-to-setting mapping (Low/Medium/High/Ultra) | `settings` doc; this doc owns the individual keys it maps onto |
@@ -909,6 +909,19 @@ STOP(flush)
  4  drop converter, textures, device (in that order)
  5  return CaptureSummary
 ```
+
+### 5.16 No-border capture (D64, opt-in, Windows 10)
+
+Problem: on Windows 10 WGC always draws the capture border (5.13). `video.no_border_capture` records
+via DXGI Desktop Duplication of the game window's monitor, cropped to the window client area.
+Full contract in `docs/impl/no-border-capture.md`.
+
+- Gating: off by default; only `CaptureBackend::NoBorder` enters `dda.rs`. The WGC path is unchanged.
+- Eligibility: the window must cover >= 95 % of its monitor (`dda_geom::covers_monitor`). Otherwise fall back to WGC.
+- Same-adapter rule: Desktop Duplication must run on the adapter that owns the output; if the encoder device is on another GPU, fall back.
+- Frames: the dda thread publishes cropped texture copies into the same `Latest`/`TextureRing` the pacer reads, so pacing, black-on-hidden and encoding are unchanged. Cursor-only updates are ignored; ACCESS_LOST rebuilds the duplication.
+- Known costs: overlays and notifications on top of the game are recorded; HDR or rotated outputs fall back; exclusive fullscreen is not promised to work.
+- Unverified: absence of the border on a Windows 10 machine.
 
 ### 5.15 v2 game-hook design sketch (not built in v1)
 
