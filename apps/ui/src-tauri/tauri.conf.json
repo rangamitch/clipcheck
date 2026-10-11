@@ -72,7 +72,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIwMDc4NkY2MTJFQkZDREUKUldUZS9Pc1M5b1lIc0tmU3BDWDFVbEs1WWFGUVB1ODRZNG1yMExZNmtOeGtzQUgrbmVsWmpWZksK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IENBQkMxNzhBQUZGNTlBNkEKUldScW12V3ZpaGU4eWhwRlBnaWp0eDZEMGxnNzc4dFdUcE9GdGVsbXhJRitVb0JrTTJVODFiL2UK",
       "endpoints": [
         "https://github.com/rangamitch/clipcheck/releases/latest/download/latest.json"
       ],

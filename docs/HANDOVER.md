@@ -189,9 +189,9 @@ merge pre-existing duplicate root rows; separate tester for the daemon library s
    (0 no daemon/not ours/ok, 3 recording, 4 error) against a real daemon (`clipcheck-ui.exe --daemon` + `--shutdown-daemon`
    with CLIPCHECK_PIPE_NAME/DATA_DIR), fake local update endpoint (debug builds allow http://127.0.0.1; sign with the dev key:
    `npx tauri signer sign -f <scratch>\dev-update.key <file>`; serve with node, not python).
-4. DEV updater key: `installer/DEV-UPDATER-KEY.md` — the public key in `tauri.conf.json` is a development key (private half in a
-   scratch dir, not in the repo). The OWNER must run `scripts/release/gen-update-keys.ps1`, replace `plugins.updater.pubkey`,
-   set secrets. Confirm `DEFAULT_UPDATE_ENDPOINT` in `updater.rs` (repo name) .
+4. Updater key: `tauri.conf.json` holds the production public key (CABC178AAFF59A6A); the private key lives in the owner's
+   `%USERPROFILE%\.clipcheck\` and the `release` environment secrets. Local fake-endpoint tests need a throwaway key whose
+   pubkey is swapped into that test build only; never commit it.
 
 **C. Installer testing (never executed).** Separate tester chain: build `npx tauri build --bundles nsis` (3.7 MB), silent install into a
 TEMP dir (`/S /D=<tmp>`) with `CLIPCHECK_PIPE_NAME`/`CLIPCHECK_DATA_DIR` pointing at test values, verify files + `licenses\`,

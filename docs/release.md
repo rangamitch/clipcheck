@@ -166,6 +166,5 @@ Each script accepts `--help` (PowerShell scripts: `-Help`).
 
 - The release build uses the `release` profile from the root `Cargo.toml` (`lto = "thin"`, `strip = true`).
   No `dist` profile exists yet, so no PDB symbols zip is produced.
-- `apps/ui/src-tauri/tauri.conf.json` already has the updater `pubkey` and `endpoints`, but the `pubkey` is the
-  DEV key (see `installer/DEV-UPDATER-KEY.md`; its private half is kept outside the repo). It must be replaced
-  with the production key before a public release.
+- `apps/ui/src-tauri/tauri.conf.json` carries the production updater `pubkey` (key id CABC178AAFF59A6A). Its private
+  half lives only in `%USERPROFILE%\.clipcheck\updater.key` and the `release` environment secrets.
