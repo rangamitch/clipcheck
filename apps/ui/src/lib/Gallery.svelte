@@ -26,6 +26,7 @@
   import { thumbUrl } from './thumbs';
   import AppIcon from './settings/fields/AppIcon.svelte';
   import RecordingMenu from './RecordingMenu.svelte';
+  import { deleteRecording } from './recordingActions';
 
   /** Result of a rename or delete made from a card's menu. */
   type MenuChange =
@@ -307,6 +308,59 @@
     }
   }
 
+  /** Select mode: cards toggle a checkmark instead of opening; the bar offers bulk delete. */
+  let selecting = $state(false);
+  let selected = $state<Set<string>>(new Set());
+  let confirmingBulk = $state(false);
+  let bulkBusy = $state(false);
+  let bulkError = $state<string | null>(null);
+
+  function toggleSelecting(): void {
+    selecting = !selecting;
+    selected = new Set();
+    confirmingBulk = false;
+    bulkError = null;
+  }
+
+  function toggleSelected(id: string): void {
+    const next = new Set(selected);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    selected = next;
+    confirmingBulk = false;
+  }
+
+  /** Selects every loaded recording, or clears the selection when all are already selected. */
+  function toggleSelectAll(): void {
+    selected =
+      selected.size === items.length ? new Set() : new Set(items.map((r) => r.id));
+    confirmingBulk = false;
+  }
+
+  /** Deletes the selected recordings one by one; failures stay selected and are reported. */
+  async function deleteSelected(): Promise<void> {
+    bulkBusy = true;
+    bulkError = null;
+    const failed = new Set<string>();
+    let lastMessage = '';
+    for (const id of [...selected]) {
+      try {
+        await deleteRecording(id);
+        items = items.filter((r) => r.id !== id);
+      } catch (e) {
+        failed.add(id);
+        lastMessage = e instanceof Error ? e.message : String(e);
+      }
+    }
+    selected = failed;
+    confirmingBulk = false;
+    bulkBusy = false;
+    if (failed.size > 0) {
+      bulkError = `${failed.size} could not be deleted: ${lastMessage}`;
+    }
+    void refreshStats();
+  }
+
   function onSearchInput(value: string): void {
     text = value;
     searchDebounce.call();
@@ -470,7 +524,46 @@
     >
       Favorites
     </button>
+    <button
+      type="button"
+      class="control toggle"
+      aria-pressed={selecting}
+      class:active={selecting}
+      onclick={toggleSelecting}
+    >
+      Select
+    </button>
   </header>
+
+  {#if selecting}
+    <div class="selectbar" role="toolbar" aria-label="Selection">
+      <button type="button" class="control" onclick={toggleSelectAll} disabled={items.length === 0 || bulkBusy}>
+        {selected.size === items.length && items.length > 0 ? 'Select none' : 'Select all'}
+      </button>
+      <span class="dim">{selected.size} selected</span>
+      {#if confirmingBulk}
+        <span>Delete {selected.size} recording{selected.size === 1 ? '' : 's'}? They go to the Recycle Bin.</span>
+        <button type="button" class="control danger" onclick={deleteSelected} disabled={bulkBusy}>
+          {bulkBusy ? 'Deleting...' : 'Confirm delete'}
+        </button>
+        <button type="button" class="control" onclick={() => (confirmingBulk = false)} disabled={bulkBusy}>
+          Cancel
+        </button>
+      {:else}
+        <button
+          type="button"
+          class="control danger"
+          disabled={selected.size === 0 || bulkBusy}
+          onclick={() => (confirmingBulk = true)}
+        >
+          Delete selected
+        </button>
+      {/if}
+      {#if bulkError}
+        <span class="error-text" role="alert">{bulkError}</span>
+      {/if}
+    </div>
+  {/if}
 
   <div class="subbar">
     {#if stats}
@@ -498,15 +591,26 @@
             <ul class="grid">
               {#each page as r (r.id)}
                 {@const ready = r.status === 'ready'}
-                <li class="card" oncontextmenu={(e) => onContextMenu(e, r.id)}>
+                <li
+                  class="card"
+                  class:picked={selecting && selected.has(r.id)}
+                  class:selecting
+                  oncontextmenu={(e) => onContextMenu(e, r.id)}
+                >
                   <button
                     type="button"
                     class="open"
-                    disabled={!ready}
-                    onpointerenter={() => ready && warmRecording(r.id)}
-                    onfocus={() => ready && warmRecording(r.id)}
-                    onclick={() => openRecording(r)}
+                    disabled={!ready && !selecting}
+                    aria-pressed={selecting ? selected.has(r.id) : undefined}
+                    onpointerenter={() => ready && !selecting && warmRecording(r.id)}
+                    onfocus={() => ready && !selecting && warmRecording(r.id)}
+                    onclick={() => (selecting ? toggleSelected(r.id) : openRecording(r))}
                   >
+                    {#if selecting}
+                      <span class="check" class:on={selected.has(r.id)} aria-hidden="true">
+                        {selected.has(r.id) ? '✓' : ''}
+                      </span>
+                    {/if}
                     <span class="thumb" aria-hidden="true">
                       {#if ready && !brokenPosters[r.id]}
                         <img
@@ -656,6 +760,61 @@
 
   .toggle[aria-pressed='false'] {
     color: var(--text-dim);
+  }
+
+  .selectbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    padding: 8px 16px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .danger {
+    color: var(--danger);
+    border-color: var(--danger);
+  }
+
+  .danger:disabled,
+  .selectbar .control:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .error-text {
+    color: var(--danger);
+  }
+
+  .card.picked {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent);
+  }
+
+  .card.selecting .menu-slot {
+    display: none;
+  }
+
+  .check {
+    position: absolute;
+    z-index: 3;
+    top: 6px;
+    right: 6px;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px solid #fff;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    font-size: 14px;
+  }
+
+  .check.on {
+    background: var(--accent);
   }
 
   .subbar {
