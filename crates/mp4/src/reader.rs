@@ -168,6 +168,9 @@ pub fn read_movie_from<R: Read + Seek>(mut r: R) -> Result<Movie, Mp4Error> {
 
     let pending = pending.ok_or_else(|| bad("no moov box"))?;
     let mut tracks = pending.tracks;
+    // Files written by ClipCheck place the default (first) audio track last in the moov; track
+    // ids are in logical order, so sort by id to give callers the logical order (Mix first).
+    tracks.sort_by_key(|t| t.id);
     for t in &mut tracks {
         t.samples.retain(|s| {
             s.offset

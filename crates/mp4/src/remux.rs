@@ -717,10 +717,21 @@ fn fourcc(s: &str) -> [u8; 4] {
 fn build_moov(tracks: &[OutTrack], co64: bool) -> Result<Vec<u8>, Mp4Error> {
     let mut longest_ms = 0u64;
     let mut body = Vec::new();
+    // Windows (Media Foundation, so Photos) plays the LAST audio trak by default. Track ids keep
+    // the input order (Mix is the first audio track) but the first audio trak is written last.
+    let mut first_audio: Option<Vec<u8>> = None;
     for (i, tr) in tracks.iter().enumerate() {
         let id = count(i + 1)?;
         longest_ms = longest_ms.max(track_ms(tr));
-        body.extend_from_slice(&trak(tr, id, co64)?);
+        let bytes = trak(tr, id, co64)?;
+        if first_audio.is_none() && matches!(tr.kind, TrackKind::Audio { .. }) {
+            first_audio = Some(bytes);
+        } else {
+            body.extend_from_slice(&bytes);
+        }
+    }
+    if let Some(bytes) = first_audio {
+        body.extend_from_slice(&bytes);
     }
     let movie_ms = u32::try_from(longest_ms).map_err(|_| too_long())?;
     let mut moov_body = mvhd(movie_ms, count(tracks.len() + 1)?);

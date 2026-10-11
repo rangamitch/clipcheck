@@ -260,9 +260,12 @@ pub fn write_init(spec: &InitSpec) -> Vec<u8> {
     let audio_count = u32::try_from(spec.audio.len()).unwrap_or(u32::MAX - 2);
     let mut moov_p = mvhd(audio_count + 2);
     moov_p.extend_from_slice(&trak_video(&spec.video));
-    for (i, a) in spec.audio.iter().enumerate() {
+    // Windows (Media Foundation, so Photos) plays the LAST audio trak by default. Track ids stay
+    // in order (Mix = 2) but the first audio track (Mix) is written last so it is the default.
+    let n = spec.audio.len();
+    for i in (1..n).chain(0..n.min(1)) {
         let track_id = u32::try_from(i).unwrap_or(u32::MAX - 2).saturating_add(2);
-        moov_p.extend_from_slice(&trak_audio(a, track_id));
+        moov_p.extend_from_slice(&trak_audio(&spec.audio[i], track_id));
     }
     let mut mvex_p = trex(1);
     for i in 0..spec.audio.len() {
