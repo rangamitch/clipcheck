@@ -322,6 +322,81 @@
     bulkError = null;
   }
 
+  /** Drag-select: a rubber band over the cards adds every card it touches to the selection. */
+  const DRAG_THRESHOLD_PX = 5;
+  /** Band corners in scroll-content coordinates, so wheel scrolling mid-drag keeps the anchor. */
+  let band = $state<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
+  let dragStart: { x: number; y: number; base: Set<string>; pointerId: number } | null = null;
+  /** Set when a drag ends so the click it would produce does not toggle a card. */
+  let suppressClick = false;
+  let lastClient = { x: 0, y: 0 };
+
+  function toContent(clientX: number, clientY: number): { x: number; y: number } {
+    const r = shellEl!.getBoundingClientRect();
+    return { x: clientX - r.left + shellEl!.scrollLeft, y: clientY - r.top + shellEl!.scrollTop };
+  }
+
+  function onShellPointerDown(e: PointerEvent): void {
+    if (!selecting || e.button !== 0 || !shellEl || bulkBusy) return;
+    const t = e.target as Element;
+    if (!t.closest('main')) return;
+    // Other buttons in the list area (Load more) keep their normal behavior.
+    if (t.closest('button') && !t.closest('.card')) return;
+    const p = toContent(e.clientX, e.clientY);
+    dragStart = { x: p.x, y: p.y, base: new Set(selected), pointerId: e.pointerId };
+    lastClient = { x: e.clientX, y: e.clientY };
+    // Stops text selection and native image dragging; the click still fires.
+    e.preventDefault();
+  }
+
+  function updateBand(): void {
+    if (!dragStart || !shellEl) return;
+    const p = toContent(lastClient.x, lastClient.y);
+    band = { x1: dragStart.x, y1: dragStart.y, x2: p.x, y2: p.y };
+    const left = Math.min(band.x1, band.x2);
+    const right = Math.max(band.x1, band.x2);
+    const top = Math.min(band.y1, band.y2);
+    const bottom = Math.max(band.y1, band.y2);
+    const origin = shellEl.getBoundingClientRect();
+    const next = new Set(dragStart.base);
+    for (const el of shellEl.querySelectorAll<HTMLElement>('li.card[data-rid]')) {
+      const r = el.getBoundingClientRect();
+      const cl = r.left - origin.left + shellEl.scrollLeft;
+      const ct = r.top - origin.top + shellEl.scrollTop;
+      if (cl < right && cl + r.width > left && ct < bottom && ct + r.height > top) {
+        next.add(el.dataset.rid!);
+      }
+    }
+    selected = next;
+    confirmingBulk = false;
+  }
+
+  function onShellPointerMove(e: PointerEvent): void {
+    if (!dragStart) return;
+    lastClient = { x: e.clientX, y: e.clientY };
+    if (!band) {
+      const p = toContent(e.clientX, e.clientY);
+      if (Math.hypot(p.x - dragStart.x, p.y - dragStart.y) < DRAG_THRESHOLD_PX) return;
+      shellEl?.setPointerCapture(dragStart.pointerId);
+    }
+    updateBand();
+  }
+
+  function endDrag(): void {
+    if (band) {
+      suppressClick = true;
+      setTimeout(() => (suppressClick = false), 0);
+    }
+    dragStart = null;
+    band = null;
+  }
+
+  function onCardClick(r: RecordingDto): void {
+    if (suppressClick) return;
+    if (selecting) toggleSelected(r.id);
+    else openRecording(r);
+  }
+
   function toggleSelected(id: string): void {
     const next = new Set(selected);
     if (next.has(id)) next.delete(id);
@@ -472,7 +547,25 @@
   });
 </script>
 
-<div class="shell" bind:this={shellEl}>
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div
+  class="shell"
+  class:selecting
+  bind:this={shellEl}
+  onpointerdown={onShellPointerDown}
+  onpointermove={onShellPointerMove}
+  onpointerup={endDrag}
+  onpointercancel={endDrag}
+>
+  {#if band}
+    <div
+      class="band"
+      style="left: {Math.min(band.x1, band.x2)}px; top: {Math.min(band.y1, band.y2)}px; width: {Math.abs(
+        band.x2 - band.x1,
+      )}px; height: {Math.abs(band.y2 - band.y1)}px"
+      aria-hidden="true"
+    ></div>
+  {/if}
   <header class="topbar">
     <input
       class="search"
@@ -595,6 +688,7 @@
                   class="card"
                   class:picked={selecting && selected.has(r.id)}
                   class:selecting
+                  data-rid={r.id}
                   oncontextmenu={(e) => onContextMenu(e, r.id)}
                 >
                   <button
@@ -604,7 +698,7 @@
                     aria-pressed={selecting ? selected.has(r.id) : undefined}
                     onpointerenter={() => ready && !selecting && warmRecording(r.id)}
                     onfocus={() => ready && !selecting && warmRecording(r.id)}
-                    onclick={() => (selecting ? toggleSelected(r.id) : openRecording(r))}
+                    onclick={() => onCardClick(r)}
                   >
                     {#if selecting}
                       <span class="check" class:on={selected.has(r.id)} aria-hidden="true">
@@ -690,7 +784,24 @@
 </div>
 
 <style>
+  .shell.selecting {
+    user-select: none;
+  }
+
+  .shell.selecting img {
+    -webkit-user-drag: none;
+  }
+
+  .band {
+    position: absolute;
+    z-index: 4;
+    pointer-events: none;
+    background: color-mix(in srgb, var(--accent) 25%, transparent);
+    border: 1px solid var(--accent);
+  }
+
   .shell {
+    position: relative;
     flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
