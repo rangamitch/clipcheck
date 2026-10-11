@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { getVersion } from '@tauri-apps/api/app';
   import { formatRelativeDate } from '../../format';
-  import { checkNow, updateStore, type UpdateInfo } from '../../updates';
+  import { checkNow, openUpdateModal, updateStore, type UpdateInfo } from '../../updates';
   import { isTauriRuntime } from '../../window';
   import FieldRow from '../fields/FieldRow.svelte';
   import NumberField from '../fields/NumberField.svelte';
@@ -60,6 +60,8 @@
     try {
       const info = await checkNow();
       result = info ? { kind: 'update', info } : { kind: 'up-to-date' };
+      // A manual check that finds an update goes straight to the update prompt.
+      if (info) openUpdateModal();
     } catch (e) {
       result = { kind: 'error', message: e instanceof Error ? e.message : String(e) };
     } finally {
@@ -85,9 +87,16 @@
 <FieldRow label="Check for updates now" path="updates.check_now" help="Contacts the update server once. Works even when automatic checks are off.">
   {#snippet children()}
     <div class="check">
-      <button type="button" class="check-button" disabled={checking} onclick={() => void onCheckNow()}>
-        {checking ? 'Checking...' : 'Check now'}
-      </button>
+      <div class="buttons">
+        <button type="button" class="check-button" disabled={checking} onclick={() => void onCheckNow()}>
+          {checking ? 'Checking...' : 'Check now'}
+        </button>
+        {#if $updateStore.available}
+          <button type="button" class="update-button" onclick={openUpdateModal}>
+            Update to {$updateStore.available.version}
+          </button>
+        {/if}
+      </div>
       {#if resultText}
         <p class="result" role="status">{resultText}</p>
       {/if}
@@ -144,6 +153,27 @@
     flex-direction: column;
     align-items: flex-start;
     gap: 8px;
+  }
+
+  .buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .update-button {
+    padding: 7px 14px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius);
+    background: var(--accent);
+    color: #fff;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .update-button:hover {
+    filter: brightness(1.1);
   }
 
   .check-button {

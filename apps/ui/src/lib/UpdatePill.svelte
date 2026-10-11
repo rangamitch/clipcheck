@@ -15,10 +15,10 @@
   <button
     type="button"
     class="pill"
-    title="Open update details"
+    title="Version {$updateStore.available?.version} is ready. Open update details"
     onclick={openUpdateModal}
   >
-    ↑ Update {$updateStore.available?.version}
+    ↑ New Update Available
   </button>
 {/if}
 
