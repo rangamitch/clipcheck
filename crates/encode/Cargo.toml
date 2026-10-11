@@ -1,0 +1,27 @@
+[package]
+name = "clipcheck-encode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+clipcheck-aacenc = { path = "../aacenc" }
+clipcheck-gpuconv = { path = "../gpuconv" }
+clipcheck-hwenc = { path = "../hwenc" }
+clipcheck-mp4 = { path = "../mp4" }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }
+
+[dev-dependencies]
+clipcheck-testkit = { path = "../testkit" }
+clipcheck-mfdec = { path = "../mfdec" }
+tempfile = { workspace = true }

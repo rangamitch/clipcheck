@@ -1,0 +1,42 @@
+// Resource script for clipcheckd.exe.
+//
+// This is a TEMPLATE. build.rs substitutes the @...@ placeholders with absolute
+// paths and the crate version, writes the result to OUT_DIR, and compiles it.
+// Relative paths are deliberately avoided because rc.exe resolves them against
+// the working directory of whichever tool invokes it.
+
+// Icon group: resource id 1 is what Explorer and the tray pick up as the exe icon.
+1 ICON "@ICON@"
+
+// Application manifest: RT_MANIFEST (24), id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID.
+1 24 "@MANIFEST@"
+
+// Version information (VS_VERSION_INFO = 1, VOS_NT_WINDOWS32 = 0x40004, VFT_APP = 1).
+1 VERSIONINFO
+ FILEVERSION @VERSION_COMMA@
+ PRODUCTVERSION @VERSION_COMMA@
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0409 = English (United States), 04b0 = Unicode.
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "ClipCheck"
+            VALUE "FileDescription", "ClipCheck Recorder"
+            VALUE "FileVersion", "@VERSION_STR@"
+            VALUE "InternalName", "clipcheckd"
+            VALUE "OriginalFilename", "clipcheckd.exe"
+            VALUE "ProductName", "ClipCheck"
+            VALUE "ProductVersion", "@VERSION_STR@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

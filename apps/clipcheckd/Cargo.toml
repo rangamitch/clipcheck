@@ -1,0 +1,50 @@
+[package]
+name = "clipcheckd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "clipcheckd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clipcheckd"
+path = "src/main.rs"
+
+[dependencies]
+clipcheck-util = { path = "../../crates/util" }
+clipcheck-audio = { path = "../../crates/audio" }
+clipcheck-core = { path = "../../crates/core" }
+clipcheck-detect = { path = "../../crates/detect" }
+clipcheck-engine = { path = "../../crates/engine" }
+clipcheck-encode = { path = "../../crates/encode" }
+clipcheck-hotkeys = { path = "../../crates/hotkeys" }
+clipcheck-ipc = { path = "../../crates/ipc" }
+clipcheck-library = { path = "../../crates/library" }
+base64 = "0.22"
+png = "0.17"
+serde_json = { workspace = true }
+ulid = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+clipcheck-testkit = { path = "../../crates/testkit" }
+tempfile = { workspace = true }
+
+[build-dependencies]
+embed-resource = "2"

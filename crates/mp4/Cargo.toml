@@ -1,0 +1,13 @@
+[package]
+name = "clipcheck-mp4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+clipcheck-testkit = { path = "../testkit" }
+clipcheck-mfdec = { path = "../mfdec" }
+tempfile = { workspace = true }

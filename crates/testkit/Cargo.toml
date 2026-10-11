@@ -1,0 +1,20 @@
+[package]
+name = "clipcheck-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Dev-only: generates small deterministic test media natively (no FFmpeg)."
+
+[dependencies]
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+clipcheck-aacenc = { path = "../aacenc" }
+clipcheck-hwenc = { path = "../hwenc" }
+clipcheck-mp4 = { path = "../mp4" }
+
+[dev-dependencies]
+clipcheck-mp4 = { path = "../mp4" }
+clipcheck-mfdec = { path = "../mfdec" }

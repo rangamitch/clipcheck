@@ -1,0 +1,258 @@
+# Release pipeline. Triggered by a version tag (or manually for an existing tag). It writes
+# THIRD-PARTY-NOTICES before the installer is built so the installer ships it, builds the NSIS installer,
+# signs the updater artifact, optionally Authenticode-signs the installer, generates latest.json and
+# SHA256SUMS, and creates a DRAFT GitHub release. A person publishes the draft after checking it.
+# No FFmpeg anywhere (D58, D62).
+#
+# Secrets and variables used (all in the protected "release" environment):
+#   TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD   (required; updater signature)
+#   WINDOWS_CERTIFICATE, WINDOWS_CERTIFICATE_PASSWORD               (optional; Authenticode)
+#   RELEASES_TOKEN                                                  (only when RELEASE_REPO is another repo)
+#   vars.RELEASE_REPO                                               (optional; default: this repository)
+# See docs/release.md.
+
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release, e.g. v0.2.0 (the tagged commit must be on main)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: build and stage a draft release
+    runs-on: windows-latest
+    environment: release
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+      RELEASE_REPO: ${{ vars.RELEASE_REPO || github.repository }}
+      GITHUB_TOKEN_VALUE: ${{ github.token }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'push' && github.ref || format('refs/tags/{0}', inputs.tag) }}
+
+      - name: Validate the tag and that it is on main
+        run: |
+          set -euo pipefail
+          if ! [[ "$TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?$ ]]; then
+            echo "error: tag '$TAG' is not of the form vX.Y.Z"
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "error: $TAG does not point at a commit on main; refusing to release it"
+            exit 1
+          fi
+          echo "APP_VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - name: Check that all version sources match the tag
+        run: node scripts/release/check-versions.mjs --tag "$TAG"
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/ui/src-tauri -> target
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+
+      - name: Build the frontend
+        working-directory: apps/ui
+        run: |
+          npm ci
+          npm run build
+
+      # Written before the installer is built: licenses/* is bundled into the installer.
+      - name: Write THIRD-PARTY-NOTICES
+        run: |
+          set -euo pipefail
+          node scripts/release/write-notices.mjs --strict
+          mkdir -p dist/release
+          cp licenses/THIRD-PARTY-NOTICES.txt dist/release/THIRD-PARTY-NOTICES.txt
+
+      # The updater signature is produced by the Tauri bundler when createUpdaterArtifacts is on.
+      # It is passed here so the release does not depend on the local tauri.conf.json value.
+      - name: Build the NSIS installer
+        working-directory: apps/ui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":true}}'
+
+      - name: Detect optional Authenticode certificate
+        id: sign
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+        run: |
+          if [ -n "$WINDOWS_CERTIFICATE" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "No Authenticode certificate configured: the installer will be unsigned (SmartScreen warns)."
+          fi
+
+      - name: Authenticode-sign and verify the installer
+        if: steps.sign.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Get-ChildItem -Path 'apps/ui/src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'installer not found' }
+          $kit = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $signtool = Get-ChildItem -Path $kit -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found on the runner' }
+          $pfx = Join-Path $env:RUNNER_TEMP 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          try {
+            & $signtool.FullName sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 $setup.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool sign failed (exit $LASTEXITCODE)" }
+            & $signtool.FullName verify /pa /v $setup.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed (exit $LASTEXITCODE)" }
+          }
+          finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      # Authenticode signing changes the installer bytes, so the updater signature is always
+      # recomputed over the final file.
+      - name: Create the updater signature for the final installer
+        working-directory: apps/ui
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          setups=(src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if [ "${#setups[@]}" -ne 1 ]; then
+            echo "error: expected exactly one installer, found ${#setups[@]}"
+            exit 1
+          fi
+          npx tauri signer sign -f "$TAURI_SIGNING_PRIVATE_KEY" -p "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" "${setups[0]}"
+          test -s "${setups[0]}.sig"
+
+      - name: Stage the installer and check its size budget
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundle=apps/ui/src-tauri/target/release/bundle/nsis
+          setups=("$bundle"/*-setup.exe)
+          if [ "${#setups[@]}" -ne 1 ]; then
+            echo "error: expected exactly one installer in $bundle, found ${#setups[@]}"
+            exit 1
+          fi
+          installer="$(basename "${setups[0]}")"
+          expected="ClipCheck_${APP_VERSION}_x64-setup.exe"
+          if [ "$installer" != "$expected" ]; then
+            echo "error: installer is $installer, expected $expected"
+            exit 1
+          fi
+          mkdir -p dist/release
+          cp "${setups[0]}" "dist/release/$installer"
+          cp "${setups[0]}.sig" "dist/release/$installer.sig"
+          echo "INSTALLER=$installer" >> "$GITHUB_ENV"
+          node scripts/release/size-budget.mjs --file "dist/release/$installer" --max-mb 30
+
+      - name: Generate release notes
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          notes=dist/RELEASE_NOTES.md
+          if [ -f "docs/release-notes/$TAG.md" ]; then
+            cp "docs/release-notes/$TAG.md" "$notes"
+          elif [ "$(git cat-file -t "refs/tags/$TAG")" = "tag" ] && \
+               [ -n "$(git for-each-ref --format='%(contents)' "refs/tags/$TAG" | tr -d '[:space:]')" ]; then
+            git for-each-ref --format='%(contents)' "refs/tags/$TAG" > "$notes"
+          else
+            prev=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+            if [ -n "$prev" ]; then range="$prev..$TAG"; else range="$TAG"; fi
+            git log --no-merges --pretty=format:'- %s (%h)' "$range" > "$notes" || true
+            [ -s "$notes" ] || echo "No changes recorded." > "$notes"
+          fi
+
+      - name: Generate latest.json
+        run: |
+          set -euo pipefail
+          node scripts/release/make-latest-json.mjs \
+            --version "$APP_VERSION" \
+            --notes-file dist/RELEASE_NOTES.md \
+            --installer "dist/release/$INSTALLER" \
+            --sig-file "dist/release/$INSTALLER.sig" \
+            --repo "$RELEASE_REPO" \
+            --out dist/release/latest.json
+
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist/release
+          LC_ALL=C ls -1 | LC_ALL=C sort | grep -v '^SHA256SUMS$' | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Keep the staged files if the publish step fails
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ env.TAG }}
+          path: dist/release/
+          retention-days: 14
+
+      - name: Create the draft GitHub release
+        env:
+          RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_REPO" = "$GITHUB_REPOSITORY" ]; then
+            token="$GITHUB_TOKEN_VALUE"
+          else
+            token="$RELEASES_TOKEN"
+          fi
+          export GH_TOKEN="$token"
+          shopt -s nullglob
+          files=(dist/release/*)
+          if gh release view "$TAG" --repo "$RELEASE_REPO" >/dev/null 2>&1; then
+            is_draft=$(gh release view "$TAG" --repo "$RELEASE_REPO" --json isDraft --jq .isDraft)
+            if [ "$is_draft" != "true" ]; then
+              echo "error: $TAG is already published in $RELEASE_REPO; refusing to change it"
+              exit 1
+            fi
+            echo "Updating the existing draft $TAG in $RELEASE_REPO"
+            gh release upload "$TAG" "${files[@]}" --repo "$RELEASE_REPO" --clobber
+          else
+            gh release create "$TAG" "${files[@]}" --repo "$RELEASE_REPO" --draft \
+              --title "ClipCheck $TAG" --notes-file dist/RELEASE_NOTES.md
+          fi
+          echo "Draft created or updated in $RELEASE_REPO. Publish it by hand after checking it."

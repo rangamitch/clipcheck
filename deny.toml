@@ -1,0 +1,55 @@
+# cargo-deny configuration (cargo-deny 0.16+ config format).
+# Run: cargo deny check        (root workspace)
+#      cargo deny --manifest-path apps/ui/src-tauri/Cargo.toml check   (Tauri shell, separate lockfile)
+
+[graph]
+# Only the platform ClipCheck ships for; keeps unrelated target-specific crates out of the report.
+targets = ["x86_64-pc-windows-msvc"]
+all-features = false
+no-default-features = false
+
+[advisories]
+version = 2
+# Vulnerability advisories are always errors in cargo-deny 0.16+ (no config needed).
+# Unmaintained crates are reported as warnings for the workspace's own dependency graph.
+unmaintained = "workspace"
+yanked = "warn"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive allow-list for an Apache-2.0 application (D61): no GPL/LGPL/AGPL anywhere.
+# MPL-2.0 is allowed only for unmodified upstream crates (cssparser, selectors, dtoa-short, option-ext).
+allow = [
+    "Apache-2.0",         # ClipCheck itself (workspace members are checked too) and many dependencies
+    "MIT",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla root certificate data); permissive, no copyleft terms
+]
+# "OpenSSL" is deliberately NOT allowed: the old OpenSSL license has an advertising clause. `ring` 0.17
+# is "Apache-2.0 AND ISC" and no other dependency uses it (see docs/LICENSING.md).
+confidence-threshold = 0.8
+
+[bans]
+# Duplicate versions are common in the Tauri/Windows dependency tree; report, do not fail.
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

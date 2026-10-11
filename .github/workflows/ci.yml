@@ -1,0 +1,94 @@
+# CI for pull requests and main. Runs on hosted Windows runners.
+#
+# Not run here (cannot work on hosted runners): the desktop, GPU, audio and capture suites
+# (clipcheck-capture, clipcheck-audio device tests, clipcheck-encode with NVENC, clipcheck-hotkeys,
+# and the apps/ui/src-tauri integration tests that need a WebView2 window). Those run on the dev
+# machine via scripts/test-all.sh. CI only compiles them (`cargo test --workspace --no-run`).
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    name: fmt, clippy, tests, UI, release checks
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable, clippy and rustfmt)
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/ui/package-lock.json
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Headless crates only.
+      - name: Headless tests
+        run: >-
+          cargo test -p clipcheck-core -p clipcheck-ipc -p clipcheck-session
+          -p clipcheck-library -p clipcheck-clipedit
+        env:
+          CI: "1"
+
+      - name: Compile every workspace test target
+        run: cargo test --workspace --no-run
+
+      - name: Frontend install, build and tests
+        working-directory: apps/ui
+        run: |
+          npm ci
+          npm run build
+          npx vitest run
+
+      # The Tauri shell is its own workspace (excluded from the root), so the steps above never
+      # compile it. Checking it here needs the frontend build output in apps/ui/dist.
+      - name: Compile the Tauri shell
+        run: cargo check --manifest-path apps/ui/src-tauri/Cargo.toml
+
+      - name: Version consistency
+        run: node scripts/release/check-versions.mjs
+
+      - name: Release script unit tests
+        run: node --test "scripts/release/*.test.mjs"
+
+      - name: Install cargo-deny (prebuilt binary)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Dependency policy (licenses, advisories, sources)
+        run: |
+          cargo deny check
+          cargo deny --manifest-path apps/ui/src-tauri/Cargo.toml check

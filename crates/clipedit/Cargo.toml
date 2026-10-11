@@ -1,0 +1,18 @@
+[package]
+name = "clipcheck-clipedit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clipcheck-util = { path = "../util" }
+clipcheck-mp4 = { path = "../mp4" }
+
+[target.'cfg(windows)'.dependencies]
+clipcheck-gpuconv = { path = "../gpuconv" }
+clipcheck-hwenc = { path = "../hwenc" }
+clipcheck-mfdec = { path = "../mfdec" }
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D11"] }
+
+[dev-dependencies]
+clipcheck-testkit = { path = "../testkit" }

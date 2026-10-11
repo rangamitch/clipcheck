@@ -1,0 +1,18 @@
+[package]
+name = "clipcheck-buffer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+clipcheck-util = { path = "../util" }
+clipcheck-core = { path = "../core" }
+clipcheck-mp4 = { path = "../mp4" }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+clipcheck-testkit = { path = "../testkit" }
+tempfile = { workspace = true }
