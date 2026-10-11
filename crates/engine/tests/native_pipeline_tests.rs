@@ -741,8 +741,15 @@ fn native_pipeline_records_segments_with_audio() {
         (v_dur - 7.0).abs() <= 0.6,
         "joined video duration {v_dur:.3} not 7.0 +- 0.6"
     );
+    // Video runs on the wall clock and ends at the last frame the capture delivered (WGC only
+    // delivers on change, and stopping the capture takes a few frame intervals), while audio
+    // runs to the stop moment in whole 1024-sample AAC frames. Measured over 20 runs, audio
+    // exceeds video by 0.22-0.26 s, a stable offset rather than drift. Allowed: one capture
+    // frame + one AAC frame + 0.35 s of capture start/stop latency (about 0.41 s), which still
+    // catches a real desync (a lane running to a different clock drifts by seconds).
+    let av_tolerance = 1.0 / 30.0 + 1024.0 / 48_000.0 + 0.35;
     assert!(
-        (a_dur - v_dur).abs() < 0.25,
+        (a_dur - v_dur).abs() < av_tolerance,
         "A/V duration mismatch: audio {a_dur:.3} vs video {v_dur:.3}"
     );
     assert!(

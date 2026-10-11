@@ -594,9 +594,10 @@ fn run_cancel_mid_copy_removes_partial_and_keeps_earlier_files() {
     let dest = t.path().join("dest");
     make_clip(&src.join("Small").join("s.mp4"), 1);
     let small_bytes = fs::metadata(src.join("Small").join("s.mp4")).unwrap().len();
-    // Spec suggested 64 MiB. 256 MiB is used so the copy outlasts the 100 ms
-    // progress throttle, which is what lets the callback see bytes_done > 0.
-    let big_size = 256 * MIB;
+    // Cancellation is driven by the unthrottled first progress call for big.mp4
+    // (sent before any bytes are copied, made unthrottled by the sleep in register), so the size only needs
+    // to be a few chunks.
+    let big_size = 16 * MIB;
     write_file(&src.join("Big").join("big.mp4"), &vec![0u8; big_size]);
 
     let plan = plan_of(&req(
@@ -611,10 +612,13 @@ fn run_cancel_mid_copy_removes_partial_and_keeps_earlier_files() {
     let mut registered = Vec::new();
     let mut register = |d: &Path, _g: &str, _i: &MediaInfo, _m: i64| {
         registered.push(d.to_path_buf());
+        // Outlast the 100 ms progress throttle so the next file's first progress call
+        // (sent before any bytes are copied) is delivered. Sleeping never returns early.
+        std::thread::sleep(std::time::Duration::from_millis(250));
         Ok::<String, String>("id".to_string())
     };
     let mut progress = |p: &ImportProgress| {
-        if p.current_name == "big.mp4" && p.bytes_done > small_bytes {
+        if p.current_name == "big.mp4" && p.bytes_done >= small_bytes {
             cancel.store(true, Ordering::SeqCst);
         }
     };

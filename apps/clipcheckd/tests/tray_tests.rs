@@ -316,9 +316,20 @@ mod integration {
         );
 
         fs::remove_file(&marker).expect("remove marker");
-        post(hwnd, CALLBACK_MESSAGE, 0, WM_LBUTTONDBLCLK);
+        // The tray debounces repeated open requests (1.5 s), so the first click above would
+        // swallow an immediate double click. Keep posting it until the debounce window has
+        // passed; the marker can only appear if WM_LBUTTONDBLCLK itself opens the UI.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut opened = false;
+        while std::time::Instant::now() < deadline {
+            post(hwnd, CALLBACK_MESSAGE, 0, WM_LBUTTONDBLCLK);
+            if wait_for_file(&marker, Duration::from_millis(400)) {
+                opened = true;
+                break;
+            }
+        }
         assert!(
-            wait_for_file(&marker, Duration::from_secs(10)),
+            opened,
             "WM_LBUTTONDBLCLK did not open the UI (marker missing after 10 s)"
         );
     }

@@ -23,6 +23,11 @@ pub(crate) const SUSPEND_TIMEOUT_MS: u64 = 60_000;
 /// `LLKHF_ALTDOWN`: set on a key event while Alt is held.
 const LLKHF_ALTDOWN: u32 = 0x20;
 
+/// `LLKHF_INJECTED`: the event came from `SendInput` or another injector. Windows
+/// does not reliably set `LLKHF_ALTDOWN` on injected events, so a missing flag
+/// there must not clear a held Alt.
+const LLKHF_INJECTED: u32 = 0x10;
+
 const VK_SHIFT: u32 = 0x10;
 const VK_CONTROL: u32 = 0x11;
 const VK_MENU: u32 = 0x12;
@@ -230,7 +235,7 @@ impl HookState {
             if self.mods & ALT_BITS == 0 {
                 self.mods |= L_ALT;
             }
-        } else {
+        } else if flags & LLKHF_INJECTED == 0 {
             self.mods &= !ALT_BITS;
         }
     }
@@ -340,6 +345,13 @@ mod tests {
             ids(&s.on_key(F9, true, ALT_FLAG, 5)),
             vec![(1, PressKind::Tap)]
         );
+    }
+
+    #[test]
+    fn injected_event_without_altdown_flag_keeps_alt_held() {
+        let mut s = tap(chord("Alt+F9"));
+        s.on_key(VK_LMENU, true, 0x10, 0);
+        assert_eq!(ids(&s.on_key(F9, true, 0x10, 5)), vec![(1, PressKind::Tap)]);
     }
 
     #[test]

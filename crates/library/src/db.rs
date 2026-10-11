@@ -517,6 +517,21 @@ impl Library {
         Ok(())
     }
 
+    /// Attaches a row to a session: sets `session_id` and `part_index` only where they are
+    /// still unset. Used when a library scan registered a file before the recorder did.
+    pub fn attach_session_if_unset(
+        &self,
+        id: &str,
+        session_id: &str,
+        part_index: Option<u32>,
+    ) -> Result<(), LibError> {
+        self.conn.execute(
+            "UPDATE recordings SET session_id = ?2, part_index = ?3              WHERE id = ?1 AND session_id IS NULL",
+            params![id, session_id, part_index.map(i64::from)],
+        )?;
+        Ok(())
+    }
+
     /// Deletes a recording row (and its FTS entry; tags, tracks and thumbnails cascade).
     /// Database side only: file deletion is the caller's job.
     pub fn delete_recording_record(&self, id: &str) -> Result<(), LibError> {

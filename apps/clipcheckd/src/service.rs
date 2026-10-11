@@ -1642,23 +1642,46 @@ impl Core {
             find_registered(&library, root, path).map_err(|e| e.to_string())?
         };
         if let Some(id) = existing {
+            self.attach_session(&id, session_id.as_deref(), part_index)?;
             return Ok(id);
         }
         let prepared = prepare_recording(&thumbs, root, path).map_err(|e| e.to_string())?;
+        let id = {
+            let library = self.library.lock().unwrap_or_else(|e| e.into_inner());
+            commit_prepared(
+                &library,
+                prepared,
+                RegisterMeta {
+                    kind,
+                    game,
+                    session_id: session_id.clone(),
+                    part_index,
+                    created_ms: now_ms(),
+                },
+                RecordingSource::Recorded,
+            )
+            .map_err(|e| e.to_string())?
+        };
+        // A library scan may have added the file first (commit_prepared then returns that
+        // row untouched), so make sure the row still carries its session membership.
+        self.attach_session(&id, session_id.as_deref(), part_index)?;
+        Ok(id)
+    }
+
+    /// Sets the session id and part index on a row that has none yet.
+    fn attach_session(
+        &self,
+        id: &str,
+        session_id: Option<&str>,
+        part_index: Option<u32>,
+    ) -> Result<(), String> {
+        let Some(session) = session_id else {
+            return Ok(());
+        };
         let library = self.library.lock().unwrap_or_else(|e| e.into_inner());
-        commit_prepared(
-            &library,
-            prepared,
-            RegisterMeta {
-                kind,
-                game,
-                session_id,
-                part_index,
-                created_ms: now_ms(),
-            },
-            RecordingSource::Recorded,
-        )
-        .map_err(|e| e.to_string())
+        library
+            .attach_session_if_unset(id, session, part_index)
+            .map_err(|e| e.to_string())
     }
 
     /// Duration stored on a registered recording row. `None` when the row is
