@@ -507,6 +507,78 @@ impl AudioSlot {
     }
 }
 
+/// Stream `stream` (0-based among the file's audio tracks in trak order) as a (file, stream) pair
+/// Media Foundation decodes unambiguously. For an MP4/MOV/M4V with several audio tracks the track
+/// is losslessly remuxed into its own single-track file in the temp dir (reused when present) and
+/// stream 0 of that file is returned, so the result never depends on how MF orders or exposes
+/// multi-track MP4s. Anything else (or any failure) falls back to the original file and stream.
+fn isolate_audio_stream(path: &Path, stream: u32) -> (PathBuf, u32) {
+    use std::hash::{Hash, Hasher};
+    let fallback = || (path.to_path_buf(), stream);
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(ext.as_str(), "mp4" | "m4v" | "mov") {
+        return fallback();
+    }
+    let Ok(movie) = clipcheck_mp4::reader::read_movie(path) else {
+        return fallback();
+    };
+    let audio: Vec<usize> = movie
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.is_audio())
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&track) = audio.get(stream as usize) else {
+        return fallback();
+    };
+    if audio.len() < 2 {
+        return fallback();
+    }
+    let Ok(meta) = std::fs::metadata(path) else {
+        return fallback();
+    };
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut h);
+    let dir = std::env::temp_dir().join("clipcheck-audio-streams");
+    let out = dir.join(format!(
+        "{:016x}-{}-{mtime}-{stream}.m4a",
+        h.finish(),
+        meta.len()
+    ));
+    if std::fs::metadata(&out)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+    {
+        return (out, 0);
+    }
+    if std::fs::create_dir_all(&dir).is_err() {
+        return fallback();
+    }
+    let tmp = out.with_extension("part.m4a");
+    let opts = clipcheck_mp4::remux::RemuxOptions {
+        start_secs: 0.0,
+        end_secs: None,
+        tracks: clipcheck_mp4::remux::TrackSelect::Only(vec![track]),
+        faststart: true,
+    };
+    if clipcheck_mp4::remux::concat_remux(&[path.to_path_buf()], &tmp, &opts).is_ok()
+        && std::fs::rename(&tmp, &out).is_ok()
+    {
+        return (out, 0);
+    }
+    let _ = std::fs::remove_file(&tmp);
+    fallback()
+}
+
 /// Decodes audio with `clipcheck_mfdec::audio::AudioDecoder`, resamples to the requested rate and
 /// converts to stereo f32 (linear resampling; mono is duplicated, more than two channels keep the
 /// first two). Keeps at most 4 decoders open. Forward reads are contiguous; a read that goes back
@@ -546,7 +618,8 @@ impl MfAudioProvider {
         if self.bad.contains(&(media_id.to_string(), stream)) {
             return None;
         }
-        let dec = match AudioDecoder::open(path, stream) {
+        let (src, src_stream) = isolate_audio_stream(path, stream);
+        let dec = match AudioDecoder::open(&src, src_stream) {
             Ok(d) => d,
             Err(_) => {
                 self.bad.insert((media_id.to_string(), stream));

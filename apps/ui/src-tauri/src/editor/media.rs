@@ -653,8 +653,9 @@ fn compute_peaks(
         return Ok((done, true));
     }
     count_compute(cache_file)?;
-    let (peaks, _secs) =
-        clipcheck_mfdec::audio::decode_peaks(path, stream, buckets).map_err(|e| e.to_string())?;
+    let (src, src_stream) = decode_source_locked(path, stream);
+    let (peaks, _secs) = clipcheck_mfdec::audio::decode_peaks(&src, src_stream, buckets)
+        .map_err(|e| e.to_string())?;
     peaks_mem_put(cache_file, peaks.clone());
     if let Err(e) = write_peaks(cache_file, &peaks) {
         eprintln!(
@@ -901,6 +902,30 @@ fn media_url_for(media: &MediaRef) -> Result<String, String> {
 /// reused. Runs under `HeavyIo`, which serialises heavy jobs, so concurrent requests for the same
 /// stream wait for the first one and then find its output in the cache.
 fn extract_audio_stream(path: &Path, stream: u32) -> Result<PathBuf, String> {
+    let _heavy = HeavyIo::enter();
+    extract_audio_stream_locked(path, stream)
+}
+
+/// Where audio stream `stream` of `path` can be decoded unambiguously by Media Foundation: for an
+/// MP4/MOV/M4V with several audio tracks, its single-track extraction (stream 0 of that file),
+/// so the decoded data is exactly the track the editor plays and never depends on how MF orders or
+/// exposes multi-track MP4s; otherwise the file itself. Caller must hold `HeavyIo`.
+fn decode_source_locked(path: &Path, stream: u32) -> (PathBuf, u32) {
+    if matches!(ext_lower(path).as_str(), "mp4" | "m4v" | "mov") {
+        let multi = clipcheck_mp4::reader::read_movie(path)
+            .map(|m| m.tracks.iter().filter(|t| t.is_audio()).count() > 1)
+            .unwrap_or(false);
+        if multi {
+            if let Ok(single) = extract_audio_stream_locked(path, stream) {
+                return (single, 0);
+            }
+        }
+    }
+    (path.to_path_buf(), stream)
+}
+
+/// `extract_audio_stream` for callers already holding the `HeavyIo` lock (it is not reentrant).
+fn extract_audio_stream_locked(path: &Path, stream: u32) -> Result<PathBuf, String> {
     if !matches!(ext_lower(path).as_str(), "mp4" | "m4v" | "mov") {
         return Err("audio track extraction needs an MP4 file".to_string());
     }
@@ -910,11 +935,6 @@ fn extract_audio_stream(path: &Path, stream: u32) -> Result<PathBuf, String> {
             .join("audio")
             .join(format!("{}-{}-{stream}.m4a", meta.len(), mtime_ms(&meta)));
     let cached = || fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false);
-    if cached() {
-        return Ok(out);
-    }
-    let _heavy = HeavyIo::enter();
-    // Another request may have written the file while this one waited for the lock.
     if cached() {
         return Ok(out);
     }
@@ -951,7 +971,11 @@ fn measure_loudness(
     src_in: Tick,
     src_len: Tick,
 ) -> Result<LoudnessReport, String> {
-    let mut dec = AudioDecoder::open(path, stream).map_err(|e| e.to_string())?;
+    let (src, src_stream) = {
+        let _heavy = HeavyIo::enter();
+        decode_source_locked(path, stream)
+    };
+    let mut dec = AudioDecoder::open(&src, src_stream).map_err(|e| e.to_string())?;
     let rate = dec.sample_rate().max(1);
     let channels = dec.channels().max(1) as usize;
     let start_secs = src_in.as_secs_f64().max(0.0);
