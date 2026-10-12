@@ -108,6 +108,8 @@ export interface MicAudioConfig {
   gate_db: number;
   /** Records push to talk as its own track (needs separate tracks and PTT mode). */
   ptt_separate_track: boolean;
+  /** Push to talk only: true = the Mix track records the push-to-talk mic; false = Mix keeps the open mic. */
+  ptt_mix_gated: boolean;
   /** Keeps the mic open this many ms after the key is released, 0..=2000. */
   ptt_release_ms: number;
 }

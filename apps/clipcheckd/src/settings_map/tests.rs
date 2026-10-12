@@ -1708,3 +1708,42 @@ fn recorder_config_gates_mic_when_push_to_talk_key_is_bound() {
         "Microphone track stays open"
     );
 }
+
+#[test]
+fn gating_ptt_mix_not_gated_keeps_mix_open_without_mute_key() {
+    let mut audio = mic_only_audio(true);
+    audio.mic.ptt_mix_gated = false;
+    let tracks = audio_tracks_gated(&audio, gating(false, true));
+    let titles: Vec<&str> = tracks.iter().map(|t| t.title.as_str()).collect();
+    assert_eq!(titles, ["Mix", "Microphone", "Push to talk"]);
+    assert_eq!(tracks[0].sources[0].kind, mic_kind(None), "Mix stays open");
+    assert_eq!(tracks[1].sources[0].kind, mic_kind(None));
+    assert_eq!(tracks[2].sources[0].kind, gated_mic_kind(None));
+}
+
+#[test]
+fn gating_ptt_mix_not_gated_still_obeys_the_mute_key() {
+    let mut audio = mic_only_audio(true);
+    audio.mic.ptt_mix_gated = false;
+    let tracks = audio_tracks_gated(&audio, gating(true, true));
+    let muted = AudioSourceKind::MicrophoneMuted { device: None };
+    assert_eq!(tracks[0].sources[0].kind, muted, "Mix: mute only");
+    assert_eq!(tracks[1].sources[0].kind, muted);
+    assert_eq!(tracks[2].sources[0].kind, gated_mic_kind(None));
+}
+
+#[test]
+fn gating_ptt_mix_gated_default_gates_the_mix() {
+    let audio = mic_only_audio(true);
+    assert!(audio.mic.ptt_mix_gated);
+    let tracks = audio_tracks_gated(&audio, gating(false, true));
+    assert_eq!(tracks[0].sources[0].kind, gated_mic_kind(None));
+}
+
+#[test]
+fn gating_ptt_mix_option_without_push_to_talk_changes_nothing() {
+    let mut audio = mic_only_audio(false);
+    audio.mic.ptt_mix_gated = false;
+    let tracks = audio_tracks_gated(&audio, gating(true, false));
+    assert_eq!(tracks[0].sources[0].kind, gated_mic_kind(None));
+}

@@ -14,6 +14,7 @@ function plan(over: Partial<TrackPlanInput> = {}, ptt = false): TrackPlanInput {
       gate_enabled: false,
       gate_db: -50,
       ptt_separate_track: ptt,
+      ptt_mix_gated: true,
       ptt_release_ms: 250,
     },
     other_apps: { enabled: false, gain_db: 0 },
@@ -67,7 +68,7 @@ describe('trackPlanPreview with push-to-talk on its own track', () => {
     const p = trackPlanPreview(
       plan(
         {
-          mic: { enabled: false, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50, ptt_separate_track: true, ptt_release_ms: 250 },
+          mic: { enabled: false, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50, ptt_separate_track: true, ptt_mix_gated: true, ptt_release_ms: 250 },
         },
         true,
       ),

@@ -386,3 +386,14 @@ fn gain_for_mic_ptt_equals_mic_gain() {
         "MicPtt gain matches Mic gain"
     );
 }
+
+#[test]
+fn ptt_mix_gated_defaults_true_and_round_trips() {
+    let mut c = Config::default();
+    assert!(c.audio.mic.ptt_mix_gated);
+    c.audio.mic.ptt_mix_gated = false;
+    let text = toml::to_string(&c).expect("serialize");
+    assert!(text.contains("ptt_mix_gated = false"), "{text}");
+    let back: Config = toml::from_str(&text).expect("parse");
+    assert!(!back.audio.mic.ptt_mix_gated);
+}

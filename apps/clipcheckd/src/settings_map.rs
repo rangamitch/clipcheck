@@ -327,7 +327,11 @@ fn mic_gate_of(
     match source {
         // With a separate push-to-talk track, the standalone Microphone track ignores push to
         // talk (always open) but a toggle mute still silences it.
-        SourceRef::Mic if gating.ptt && audio.mic.ptt_separate_track && track_index > 0 => {
+        SourceRef::Mic
+            if gating.ptt
+                && ((audio.mic.ptt_separate_track && track_index > 0)
+                    || (track_index == 0 && !audio.mic.ptt_mix_gated)) =>
+        {
             if gating.mute_key {
                 EdgeGate::MuteOnly
             } else {

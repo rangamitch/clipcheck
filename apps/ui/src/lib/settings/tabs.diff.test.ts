@@ -34,7 +34,7 @@ function savedDoc(): ConfigDoc {
       separate_tracks: true,
       output_device: 'default',
       game: { enabled: true, gain_db: 0 },
-      mic: { enabled: true, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50, ptt_separate_track: false, ptt_release_ms: 250 },
+      mic: { enabled: true, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50, ptt_separate_track: false, ptt_mix_gated: true, ptt_release_ms: 250 },
       other_apps: { enabled: false, gain_db: 0 },
       apps: [{ exe: 'discord.exe', name: 'Discord', enabled: true, gain_db: 0 }],
     } as ConfigDoc['audio'],
@@ -123,6 +123,12 @@ describe('Audio tab: mic, game and track leaves send only the changed leaf', () 
     const saved = savedDoc();
     const draft = setPath(draftOf(saved), 'audio.game.gain_db', -6);
     expect(diffPatch(saved, draft)).toEqual({ audio: { game: { gain_db: -6 } } });
+  });
+
+  it('turning off push to talk applies to the Mix track sends only that leaf', () => {
+    const saved = savedDoc();
+    const draft = setPath(draftOf(saved), 'audio.mic.ptt_mix_gated', false);
+    expect(diffPatch(saved, draft)).toEqual({ audio: { mic: { ptt_mix_gated: false } } });
   });
 
   it('turning separate tracks off sends only that flag', () => {

@@ -879,6 +879,10 @@ pub struct MicAudio {
     /// "Microphone" track. The Mix track gets the push-to-talk version. Needs
     /// `audio.separate_tracks`.
     pub ptt_separate_track: bool,
+    /// Push-to-talk only: the Mix track gets the push-to-talk version of the mic (default). When
+    /// false the Mix track carries the normal always-open mic (a mute key still silences it) and
+    /// only the gated tracks follow push to talk.
+    pub ptt_mix_gated: bool,
     /// Push-to-talk only: how long the mic stays open after the key is released, in
     /// milliseconds, 0..=2000.
     pub ptt_release_ms: u32,
@@ -893,6 +897,7 @@ impl Default for MicAudio {
             gate_enabled: false,
             gate_db: -50.0,
             ptt_separate_track: false,
+            ptt_mix_gated: true,
             ptt_release_ms: 250,
         }
     }
@@ -2052,6 +2057,7 @@ gain_db = 0.0                   # -60.0..=12.0
 gate_enabled = false            # noise gate
 gate_db = -50.0                 # -100.0..=-20.0
 ptt_separate_track = false      # push to talk only: also record a "Push to talk" track; "Microphone" stays always open
+ptt_mix_gated = true            # push to talk only: false = the Mix track keeps the normal always-open mic
 ptt_release_ms = 250            # push to talk only: mic stays open this long after release, 0..=2000
 
 [audio.other_apps]

@@ -537,6 +537,24 @@
         />
       </div>
 
+      <div class="toggle-row">
+        <div class="toggle-text">
+          <span class="toggle-label" id="audio-ptt-mix-label">Push to talk applies to the Mix track</span>
+          <p class="help" id="audio-ptt-mix-help">
+            On: the Mix track only has your voice while a push-to-talk key is held. Off: the Mix track keeps your
+            microphone open all the time (use this if you want the Mix to have your normal mic and only the Push to
+            talk track gated).
+          </p>
+        </div>
+        <Toggle
+          checked={audio.mic.ptt_mix_gated}
+          labelId="audio-ptt-mix-label"
+          describedBy="audio-ptt-mix-help"
+          disabled={disabled}
+          onchange={(v) => setPath('audio.mic.ptt_mix_gated', v)}
+        />
+      </div>
+
       <FieldRow
         label="Keep mic open after release"
         path="audio.mic.ptt_release_ms"
