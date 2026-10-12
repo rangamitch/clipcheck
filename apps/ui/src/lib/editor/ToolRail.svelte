@@ -4,7 +4,7 @@
   /** Tool buttons shown in the rail, top to bottom. */
   const TOOLS: { id: EditorTool; label: string; key: string }[] = [
     { id: 'select', label: 'Selection tool', key: 'V' },
-    { id: 'razor', label: 'Razor tool', key: 'C' },
+    { id: 'razor', label: 'Cut tool', key: 'C' },
     { id: 'hand', label: 'Hand tool', key: 'H' },
     { id: 'zoom', label: 'Zoom tool', key: 'Z' },
   ];
@@ -28,9 +28,10 @@
           </svg>
         {:else if t.id === 'razor'}
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
-            <path d="M4 20L20 4" />
-            <path d="M10.5 9.5l4 4" />
-            <circle cx="6" cy="18" r="2" />
+            <circle cx="6" cy="18" r="2.5" stroke-width="1.8" />
+            <circle cx="6" cy="6" r="2.5" stroke-width="1.8" />
+            <path d="M8 7.5L20 18" stroke-width="1.8" />
+            <path d="M8 16.5L20 6" stroke-width="1.8" />
           </svg>
         {:else if t.id === 'hand'}
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">

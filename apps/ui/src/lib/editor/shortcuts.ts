@@ -229,7 +229,7 @@ export const SHORTCUT_HELP: readonly ShortcutHelp[] = [
   { action: ACTIONS.redo, keys: 'Ctrl+Y / Ctrl+Shift+Z', label: 'Redo', group: 'Editing' },
 
   { action: ACTIONS.tool_select, keys: 'V', label: 'Selection tool', group: 'Tools' },
-  { action: ACTIONS.tool_razor, keys: 'C', label: 'Razor tool', group: 'Tools' },
+  { action: ACTIONS.tool_razor, keys: 'C', label: 'Cut tool', group: 'Tools' },
   { action: ACTIONS.tool_hand, keys: 'H', label: 'Hand tool', group: 'Tools' },
   { action: ACTIONS.tool_zoom, keys: 'Z', label: 'Zoom tool', group: 'Tools' },
 

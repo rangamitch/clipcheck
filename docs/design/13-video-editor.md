@@ -166,7 +166,7 @@ IDs are stable; each becomes a test target. "Where" says the layer that owns it.
 | F-TL-4 | Selection tool (V): click, Shift/Ctrl multi-select, marquee select, select-all (Ctrl+A), select track forward (A), select clips at playhead | P0 | M |
 | F-TL-5 | Move clips by drag within and across tracks (type-compatible only); collision = reject or push depending on mode; multi-clip move keeps relative offsets | P0 | L |
 | F-TL-6 | **Trim edges** by dragging clip start/end (respects source bounds); **ripple trim** (modifier) closes/opens the gap and shifts everything after; **roll trim** (edit-point between two adjacent clips) | P0 | L |
-| F-TL-7 | **Split at playhead** (`Ctrl+K` / `S`): splits selected clips, or all unlocked tracks if none selected; Razor tool (`C`) splits where clicked | P0 | M |
+| F-TL-7 | **Split at playhead** (`Ctrl+K` / `S`): splits selected clips, or all unlocked tracks if none selected; Cut tool (`C`) splits where clicked | P0 | M |
 | F-TL-8 | Delete (gap remains) and **Ripple delete** (`Shift+Delete`, closes gap); delete gap (right-click) | P0 | M |
 | F-TL-9 | Duplicate (Alt-drag or Ctrl+D), copy/cut/paste at playhead (Ctrl+C/X/V), paste onto selected track | P0 | M |
 | F-TL-10 | **Snapping** (toggle `N`): to playhead, clip edges, markers, in/out, 0; visible snap guide; snap threshold 8 px; hold Alt to disable temporarily | P0 | M |
@@ -274,7 +274,7 @@ IDs are stable; each becomes a test target. "Where" says the layer that owns it.
 |---|---|---|---|
 | F-UX-1 | Layout: left media bin / middle preview / right inspector / bottom timeline; resizable splitters, remembered; panels collapsible | P0 | L |
 | F-UX-2 | Inspector shows properties of the selection (clip, track, group, project) with numeric inputs and reset buttons | P0 | L |
-| F-UX-3 | Tools: Select (V), Razor (C), Hand (H), Zoom (Z); on-screen toolbar mirrors keys | P0 | S |
+| F-UX-3 | Tools: Select (V), Cut (C, internal tool id `razor`), Hand (H), Zoom (Z); on-screen toolbar mirrors keys | P0 | S |
 | F-UX-4 | Context menus on clips, tracks, gaps, ruler, media | P0 | M |
 | F-UX-5 | Full keyboard map (§6), shown in a Shortcuts overlay (`?`) | P0 | M |
 | F-UX-6 | Unsaved-changes guard on close/navigate; autosave status indicator | P0 | S |
@@ -339,7 +339,7 @@ See §8 for the full dialog, presets and location rules. Summary of capabilities
 | ← / → | Frame back / forward | Ctrl+E | Open Export dialog |
 | Shift+← / → | ±1 s | Ctrl+Shift+S | Export still frame |
 | ↑ / ↓ | Previous / next edit point | Ctrl+K or S | Split at playhead |
-| Home / End | Start / end of timeline | C | Razor tool |
+| Home / End | Start / end of timeline | C | Cut tool |
 | V | Selection tool | H / Z | Hand / Zoom tool |
 | I / O | Set in / out point | Alt+X | Clear in/out |
 | M | Add marker | Delete | Delete (leaves gap) |
@@ -473,7 +473,7 @@ Each wave ends with the full verification suite (CLAUDE.md rule 5) and a commit.
 | **E1 Model** | `timeline` crate: model, JSON, ops (split/trim/move/ripple/delete/group/link/speed), snapping, undo/redo, render-plan derivation, golden vectors | `crates/timeline/*` | ≥ 150 unit tests incl. property tests (no overlaps, undo∘do = id) |
 | **E2 Audio engine** | Spike first: confirm Media Foundation decodes MP3, WAV, M4A and FLAC on the dev machine and record the result in D-notes (Vorbis expected to need an OS extension, so out of scope). Then `mfdec::AudioDecoder`, peaks, resample, mixer (gain/pan/fade/envelope/limiter/LUFS), speed | `mfdec`, `render::audio` | PCM golden tests; waveform job ready |
 | **E3 Export MVP** | `render` video path: decode → compose (fit/fill/crop/transform) → encode → mux; export job manager, progress, cancel, pause-while-recording, register via IPC, atomic output, location rules | `render`, `gpuconv`, `hwenc`, `apps/ui/src-tauri/src/export.rs` | Cuts-only 3-clip project exports; A/V sync ≤ 40 ms; plays in WebView2 |
-| **E4 Editor UI core (parallel with E3)** | Shell, media bin, timeline canvas, ruler, select/razor, trim, split, delete, ripple, snap, undo/redo, save/load/autosave | `apps/ui/src/lib/editor/*` | Edit and save/reopen a project |
+| **E4 Editor UI core (parallel with E3)** | Shell, media bin, timeline canvas, ruler, select/cut, trim, split, delete, ripple, snap, undo/redo, save/load/autosave | `apps/ui/src/lib/editor/*` | Edit and save/reopen a project |
 | **E5 Preview** | Program/source monitor, `<video>` pool scheduler, Web Audio timeline mixer, meters, shuttle, waveforms, filmstrips | `editor/preview*`, `mixer` generalisation | 3-clip timeline plays in sync; golden gain-table parity with Rust |
 | **E6 Groups, audio UI, inspector** | Group/ungroup, A/V link, detach audio, per-clip/track/master volume, fades, envelope, normalise, inspector | UI + `timeline` | All F-GRP and F-AUD P0 pass |
 | **E7 Export dialog + presets** | Dialog, presets, target-size solver, estimate, queue, pill, post-export actions, audio layout | UI + `render` | Discord ≤ 10 MB preset lands under 10 MB on the corpus |
