@@ -250,6 +250,11 @@ export function requestThumbs(project: Project, mediaId: string, onchange: () =>
   editorApi
     .thumbnails(mediaId, timesMs, THUMB_HEIGHT)
     .then((urls) => {
+      // An empty reply means the request was dropped (project closed meanwhile): forget the entry so the next draw asks again.
+      if (urls.length === 0 && count > 0) {
+        entries.delete(mediaId);
+        return;
+      }
       const frames: (HTMLImageElement | null)[] = [];
       for (let i = 0; i < count; i += 1) {
         const url = urls[i];

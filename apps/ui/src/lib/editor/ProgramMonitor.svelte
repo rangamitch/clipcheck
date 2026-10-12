@@ -584,8 +584,13 @@
     const p = $playing;
     const r = $shuttleRate;
     if (e === null) return;
-    if (p) e.play(r);
-    else e.pause();
+    if (p) {
+      e.play(r);
+      // play() returns early (reverse at the start of the plan, or no plan): do not leave the store playing.
+      if (!e.isPlaying()) playing.set(false);
+    } else {
+      e.pause();
+    }
   });
 
   // Store moves that did not come from the engine seek it. Echoes within one frame are ignored.

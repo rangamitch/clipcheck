@@ -48,6 +48,18 @@ export const selection = writable<string[]>([]);
 export const playhead = writable<Tick>(0);
 /** True while playback runs. */
 export const playing = writable<boolean>(false);
+
+/** Shuttle speed of J/L (negative = reverse). Read by the program monitor. */
+export const shuttleRate = writable<number>(1);
+
+/** When on, play starts at the work area in point and stops are kept inside the work area. */
+export const loopInOut = writable<boolean>(false);
+
+/**
+ * Bumped whenever the open session changes (open or close). Late replies from a previous session
+ * compare against it and must not overwrite the current snapshot.
+ */
+let sessionEpoch = 0;
 /** True while the playhead is dragged. The program monitor then only follows with its picture. */
 export const scrubbing = writable<boolean>(false);
 /** Preview diagnostics, refreshed about once per second while playing (see preview/engine.ts). */
@@ -203,6 +215,7 @@ function clampScrollAt(px: number, zoom: number): number {
  * scroll are restored from `s.project.ui_state`.
  */
 export function openSnapshot(s: EditorSnapshot): void {
+	sessionEpoch += 1;
 	snapshot.set(s);
 	selection.set([]);
 	const ui = s.project.ui_state;
@@ -214,12 +227,15 @@ export function openSnapshot(s: EditorSnapshot): void {
 
 /** Stops autosave and state persistence, then resets every store to its default. */
 export function closeEditor(): void {
+	sessionEpoch += 1;
 	stopAutosave();
 	snapshot.set(null);
 	selection.set([]);
 	playhead.set(0);
 	playing.set(false);
 	scrubbing.set(false);
+	shuttleRate.set(1);
+	loopInOut.set(false);
 	previewStats.set({ paintFps: 0, videoFps: 0, dropped: 0 });
 	tool.set('select');
 	pxPerSec.set(DEFAULT_PX_PER_SEC);
@@ -285,12 +301,15 @@ export function dispatchWith(build: (p: Project) => Command | null): Promise<App
 	return enqueue(async (): Promise<ApplyReply | null> => {
 		const current = get(snapshot);
 		if (current === null) return null;
+		const epoch = sessionEpoch;
 		try {
 			const cmd = build(current.project);
 			if (cmd === null) return null;
 			const reply = await editorApi.apply(cmd);
-			snapshot.set(reply.snapshot);
-			selection.update((ids) => pruneSelection(reply.snapshot.project, ids));
+			if (epoch === sessionEpoch) {
+				snapshot.set(reply.snapshot);
+				selection.update((ids) => pruneSelection(reply.snapshot.project, ids));
+			}
 			return reply;
 		} catch (e) {
 			reportError(e);
@@ -303,10 +322,13 @@ export function dispatchWith(build: (p: Project) => Command | null): Promise<App
 export function undo(): Promise<void> {
 	return enqueue(async (): Promise<void> => {
 		if (get(snapshot) === null) return;
+		const epoch = sessionEpoch;
 		try {
 			const s = await editorApi.undo();
-			snapshot.set(s);
-			selection.update((ids) => pruneSelection(s.project, ids));
+			if (epoch === sessionEpoch) {
+				snapshot.set(s);
+				selection.update((ids) => pruneSelection(s.project, ids));
+			}
 		} catch (e) {
 			reportError(e);
 		}
@@ -317,10 +339,13 @@ export function undo(): Promise<void> {
 export function redo(): Promise<void> {
 	return enqueue(async (): Promise<void> => {
 		if (get(snapshot) === null) return;
+		const epoch = sessionEpoch;
 		try {
 			const s = await editorApi.redo();
-			snapshot.set(s);
-			selection.update((ids) => pruneSelection(s.project, ids));
+			if (epoch === sessionEpoch) {
+				snapshot.set(s);
+				selection.update((ids) => pruneSelection(s.project, ids));
+			}
 		} catch (e) {
 			reportError(e);
 		}

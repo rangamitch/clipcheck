@@ -21,6 +21,8 @@ import {
   dispatch,
   dispatchWith,
   exportJobs,
+  loopInOut,
+  shuttleRate,
   expandWithGroups,
   isBusy,
   openSnapshot,
@@ -1247,5 +1249,87 @@ describe('binDrag store', () => {
     binDrag.set({ mediaId: 'm9', durationTicks: sec(4) });
     closeEditor();
     expect(get(binDrag)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+describe('late replies from a previous session', () => {
+  /** A promise the test resolves by hand, so the reply can arrive after the session changed. */
+  function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
+    let resolve: (v: T) => void = () => undefined;
+    const promise = new Promise<T>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  it('an edit reply that arrives after closeEditor does not reopen the snapshot', async () => {
+    const p = selectionFixture();
+    openSnapshot(snapshotOf(p));
+    const late = deferred<ApplyReply>();
+    api.apply.mockReturnValueOnce(late.promise);
+
+    const pending = dispatch({ type: 'copy_clips', ids: ['c1'] });
+    await vi.waitFor(() => expect(api.apply).toHaveBeenCalled());
+    closeEditor();
+    late.resolve(replyOf(p));
+    await pending;
+
+    expect(get(snapshot)).toBeNull();
+  });
+
+  it('an edit reply from project A does not overwrite project B opened meanwhile', async () => {
+    const a = selectionFixture();
+    openSnapshot(snapshotOf(a));
+    const late = deferred<ApplyReply>();
+    api.apply.mockReturnValueOnce(late.promise);
+
+    const pending = dispatch({ type: 'copy_clips', ids: ['c1'] });
+    await vi.waitFor(() => expect(api.apply).toHaveBeenCalled());
+    const b = snapshotOf(project([clip('b1', 'v1', 0, sec(2))], { id: 'pB' }));
+    openSnapshot(b);
+    late.resolve(replyOf(a));
+    await pending;
+
+    expect(get(snapshot)).toBe(b);
+  });
+
+  it('an undo reply that arrives after closeEditor leaves the store closed', async () => {
+    openSnapshot(snapshotOf(selectionFixture()));
+    const late = deferred<EditorSnapshot>();
+    api.undo.mockReturnValueOnce(late.promise);
+
+    const pending = undo();
+    await vi.waitFor(() => expect(api.undo).toHaveBeenCalled());
+    closeEditor();
+    late.resolve(snapshotOf(project([])));
+    await pending;
+
+    expect(get(snapshot)).toBeNull();
+  });
+
+  it('a redo reply from a previous project does not overwrite the newly opened one', async () => {
+    openSnapshot(snapshotOf(selectionFixture()));
+    const late = deferred<EditorSnapshot>();
+    api.redo.mockReturnValueOnce(late.promise);
+
+    const pending = redo();
+    await vi.waitFor(() => expect(api.redo).toHaveBeenCalled());
+    const b = snapshotOf(project([], { id: 'pB' }));
+    openSnapshot(b);
+    late.resolve(snapshotOf(project([clip('old', 'v1', 0, sec(1))])));
+    await pending;
+
+    expect(get(snapshot)).toBe(b);
+  });
+});
+
+describe('closeEditor resets loop and shuttle', () => {
+  it('returns shuttle to 1x and turns loop off', () => {
+    shuttleRate.set(-4);
+    loopInOut.set(true);
+    closeEditor();
+    expect(get(shuttleRate)).toBe(1);
+    expect(get(loopInOut)).toBe(false);
   });
 });

@@ -8,6 +8,8 @@ import { editorApi } from './api';
 import { ACTIONS, type ActionId } from './shortcuts';
 import {
 	copySelection,
+	loopInOut,
+	shuttleRate,
 	dispatch,
 	dispatchWith,
 	isBusy,
@@ -42,11 +44,8 @@ export interface ActionContext {
 	hasSource: boolean;
 }
 
-/** Shuttle speed of J/L (negative = reverse). Read by the program monitor. */
-export const shuttleRate = writable<number>(1);
-
-/** When on, play starts at the work area in point and stops are kept inside the work area. */
-export const loopInOut = writable<boolean>(false);
+/** Shuttle speed of J/L (negative = reverse) and loop mode live in store.ts so closeEditor can reset them. */
+export { shuttleRate, loopInOut };
 
 /**
  * Cancels the drag in progress, if any, and returns true when one was cancelled. The timeline and

@@ -266,7 +266,7 @@ describe('input types decide whether a shortcut is blocked', () => {
     },
   );
 
-  it.each(['checkbox', 'range', 'button', 'color', 'radio', 'submit'])(
+  it.each(['checkbox', 'button', 'color', 'radio', 'submit'])(
     'does not block shortcuts in a non-text input (type %s)',
     (type) => {
       expect(resolveShortcut(ev('k', {}, { tagName: 'INPUT', type }))).toBe(ACTIONS.play_pause);
@@ -286,8 +286,10 @@ describe('input types decide whether a shortcut is blocked', () => {
     expect(resolveShortcut(ev('Delete', {}, { tagName: 'INPUT', type: 'checkbox' }))).toBe(ACTIONS.delete);
   });
 
-  it('does not block Space on a range slider (so the slider does not swallow play)', () => {
-    expect(resolveShortcut(ev(' ', {}, { tagName: 'INPUT', type: 'range' }))).toBe(ACTIONS.play_pause);
+  it('blocks Space, arrows and Delete while a range slider has focus', () => {
+    expect(resolveShortcut(ev(' ', {}, { tagName: 'INPUT', type: 'range' }))).toBeNull();
+    expect(resolveShortcut(ev('ArrowLeft', {}, { tagName: 'INPUT', type: 'range' }))).toBeNull();
+    expect(resolveShortcut(ev('Delete', {}, { tagName: 'INPUT', type: 'range' }))).toBeNull();
   });
 
   it('still blocks shortcuts in a SELECT and a TEXTAREA regardless of type', () => {

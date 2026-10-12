@@ -66,10 +66,11 @@ export interface ShortcutEvent {
 const TEXT_ENTRY_TAGS = new Set(['TEXTAREA', 'SELECT']);
 
 /**
- * `<input>` types that take typed text. Other input types (checkbox, range, button, color, ...)
+ * `<input>` types that take typed text or keys (range sliders included, so arrows and Space do not
+ * fire editor shortcuts while a slider has focus). Other input types (checkbox, button, color, ...)
  * do not block shortcuts.
  */
-const TEXT_INPUT_TYPES = new Set(['text', 'search', 'number', 'email', 'url', 'password', 'tel']);
+const TEXT_INPUT_TYPES = new Set(['text', 'search', 'number', 'email', 'url', 'password', 'tel', 'range']);
 
 /** True when the event target is a text-entry element. */
 function isTextEntry(target: ShortcutEvent['target']): boolean {

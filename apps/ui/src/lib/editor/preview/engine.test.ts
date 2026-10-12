@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { playingSeekDue } from './engine';
+import { playingSeekDue, shouldRetryMediaError } from './engine';
 
 describe('playingSeekDue', () => {
   it('resync seeks a video element that is off by 0.1 s (below the free-running threshold)', () => {
@@ -46,5 +46,22 @@ describe('playingSeekDue', () => {
 
   it('a seek or rate change still resyncs exactly, even at a boundary-sized offset', () => {
     expect(playingSeekDue(0.05, false, true, false, false)).toBe(true);
+  });
+});
+
+describe('shouldRetryMediaError', () => {
+  it('retries a network error (code 2) even after the metadata loaded', () => {
+    expect(shouldRetryMediaError(2, true)).toBe(true);
+  });
+
+  it('retries any error that happens before the metadata loaded', () => {
+    expect(shouldRetryMediaError(4, false)).toBe(true);
+    expect(shouldRetryMediaError(3, false)).toBe(true);
+    expect(shouldRetryMediaError(null, false)).toBe(true);
+  });
+
+  it('does not retry a decode or unsupported-source error after the metadata loaded', () => {
+    expect(shouldRetryMediaError(3, true)).toBe(false);
+    expect(shouldRetryMediaError(4, true)).toBe(false);
   });
 });

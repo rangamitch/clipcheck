@@ -279,11 +279,13 @@
     return shared(visualClips.map((c) => c.transform[key]));
   }
 
-  /** Whether a new transition may start on `c` in project `p`: visual, not first on its track, long enough. */
+  /** Whether a new transition may start on `c` in project `p`: visual, has an adjacent clip before it on its track, long enough. */
   function canStartTransition(p: Project, c: Clip): boolean {
     if (c.kind === 'audio') return false;
-    const firstOnTrack = !p.clips.some((o) => o.track_id === c.track_id && o.start < c.start);
-    return !firstOnTrack && c.dur >= secToTick(MIN_CLIP_FOR_TRANSITION_S);
+    const hasPredecessor = p.clips.some(
+      (o) => o.id !== c.id && o.track_id === c.track_id && Math.abs(o.start + o.dur - c.start) <= 1,
+    );
+    return hasPredecessor && c.dur >= secToTick(MIN_CLIP_FOR_TRANSITION_S);
   }
 
   /** Gain (dB, clamped) that moves a measured clip to the goal, or null when it cannot be measured. */
@@ -1046,7 +1048,7 @@
           </div>
           {#if transitionNote}
             <p class="muted">
-              Not available on the first clip of a track or on clips shorter than
+              Needs an adjacent clip before it on the track, and clips shorter than
               {MIN_CLIP_FOR_TRANSITION_S} s.
             </p>
           {/if}

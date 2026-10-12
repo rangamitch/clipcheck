@@ -347,6 +347,21 @@ export function playingSeekDue(
   return gapOpen && abs > (audioOnly ? DRIFT_SEEK_S : DRIFT_SEEK_VIDEO_S);
 }
 
+/** Delay before an element that failed transiently is dropped and created again. */
+const MEDIA_RETRY_DELAY_MS = 300;
+/** `HTMLMediaElement.HAVE_METADATA`. */
+const HAVE_METADATA = 1;
+
+/**
+ * Whether an element error gets one retry: a network error (MediaError code 2), or any error before
+ * the metadata loaded. Errors after the metadata (decode, unsupported source) fail at once. The
+ * decodability check (no video size) never reaches the element error handler, so it never retries.
+ */
+export function shouldRetryMediaError(code: number | null, hasMetadata: boolean): boolean {
+  if (code === 2) return true;
+  return !hasMetadata;
+}
+
 function disposeImage(img: HTMLImageElement): void {
   img.onload = null;
   img.onerror = null;
@@ -375,6 +390,8 @@ class Engine implements PreviewEngine {
   private readonly streamUrls = new Map<string, Promise<string | null>>();
   /** Streams whose extraction or playback failed. They are not retried until the media changes. */
   private readonly failedStreams = new Set<string>();
+  /** Media ids (or `streamKey`s) that already had their one transient-error retry. Cleared when the file changes. */
+  private readonly retried = new Set<string>();
   /** Last segment start prefetched per `streamKey`. */
   private readonly prefetchedStreams = new Map<string, Tick>();
   /** Stream keys needed by the current segment. Never evicted. */
@@ -1094,15 +1111,17 @@ class Engine implements PreviewEngine {
   private urlFor(mediaId: string): Promise<string | null> {
     let p = this.urls.get(mediaId);
     if (!p) {
-      p = Promise.resolve()
+      const own = Promise.resolve()
         .then(() => this.mediaUrl(mediaId))
         .then(
-          (url) => url,
+          // A reply from a replaced generation (the media was dropped or relinked) is ignored.
+          (url) => (this.urls.get(mediaId) === own ? url : null),
           (err: unknown) => {
-            this.failMedia(mediaId, err);
+            if (this.urls.get(mediaId) === own) this.failMedia(mediaId, err);
             return null;
           },
         );
+      p = own;
       this.urls.set(mediaId, p);
     }
     return p;
@@ -1139,7 +1158,8 @@ class Engine implements PreviewEngine {
       lastSeekTarget: Number.NaN,
       gapMs: SEEK_GAP_MS,
       nudging: false,
-      resync: false,
+      // A cold element missed any resync marked before it existed: its first playing position is exact.
+      resync: true,
       boundary: false,
       frameSeq: 0,
     };
@@ -1159,7 +1179,7 @@ class Engine implements PreviewEngine {
     };
     el.onloadeddata = () => this.scheduleRedraw();
     el.onloadedmetadata = () => this.checkDecodable(mediaId, el);
-    el.onerror = () => this.failMedia(mediaId, mediaErrorText(el));
+    el.onerror = () => this.onMediaError(mediaId, el);
     this.elements.set(mediaId, entry);
 
     try {
@@ -1303,7 +1323,10 @@ class Engine implements PreviewEngine {
     for (const [id, key] of next) {
       if (this.mediaKeys.get(id) !== key) stale.add(id);
     }
-    for (const id of stale) this.dropMedia(id);
+    for (const id of stale) {
+      this.forgetRetries(id);
+      this.dropMedia(id);
+    }
     this.mediaKeys.clear();
     for (const [id, key] of next) this.mediaKeys.set(id, key);
   }
@@ -1320,6 +1343,47 @@ class Engine implements PreviewEngine {
       this.chainKeys.delete(key);
       this.activeKeys.delete(key);
     }
+  }
+
+  /**
+   * Element error on a video. A transient error gets one retry: the element is dropped after a short
+   * delay and created again on its next use. A second error, or a non-transient one, fails the media.
+   */
+  private onMediaError(mediaId: string, el: HTMLMediaElement): void {
+    if (this.destroyed) return;
+    if (!this.retried.has(mediaId) && shouldRetryMediaError(el.error?.code ?? null, el.readyState >= HAVE_METADATA)) {
+      this.retried.add(mediaId);
+      setTimeout(() => {
+        if (this.destroyed || this.elements.get(mediaId)?.el !== el) return;
+        this.dropMedia(mediaId);
+        this.scheduleRedraw();
+      }, MEDIA_RETRY_DELAY_MS);
+      return;
+    }
+    this.failMedia(mediaId, mediaErrorText(el));
+  }
+
+  /** Element error on an audio stream: the same single retry as `onMediaError`, keyed per stream. */
+  private onStreamError(mediaId: string, stream: number, el: HTMLMediaElement): void {
+    if (this.destroyed) return;
+    const key = streamKey(mediaId, stream);
+    if (!this.retried.has(key) && shouldRetryMediaError(el.error?.code ?? null, el.readyState >= HAVE_METADATA)) {
+      this.retried.add(key);
+      setTimeout(() => {
+        if (this.destroyed || this.audioEls.get(key)?.el !== el) return;
+        this.dropMedia(mediaId);
+        this.scheduleRedraw();
+      }, MEDIA_RETRY_DELAY_MS);
+      return;
+    }
+    this.failStream(mediaId, stream);
+  }
+
+  /** Clears the retry bookkeeping of a media id and its streams. Called only when its file changed. */
+  private forgetRetries(mediaId: string): void {
+    this.retried.delete(mediaId);
+    const prefix = `${mediaId}#`;
+    for (const key of [...this.retried]) if (key.startsWith(prefix)) this.retried.delete(key);
   }
 
   /** Marks a media id unavailable, drops its element and reports the failure once. */
@@ -1657,11 +1721,12 @@ class Engine implements PreviewEngine {
       lastSeekTarget: Number.NaN,
       gapMs: SEEK_GAP_MS,
       nudging: false,
-      resync: false,
+      // Same as the video entries: a cold element takes its first playing position exactly.
+      resync: true,
       boundary: false,
     };
     el.onseeked = () => this.onSeeked(entry);
-    el.onerror = () => this.failStream(mediaId, stream);
+    el.onerror = () => this.onStreamError(mediaId, stream, el);
     this.audioEls.set(key, entry);
 
     try {

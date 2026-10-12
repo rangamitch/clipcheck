@@ -983,7 +983,8 @@
                       value={settings.codec}
                       onchange={(e) => {
                         const picked = codecOptions.find((o) => o.value === inputValue(e));
-                        if (picked) editSettings({ codec: picked.value });
+                        // A codec-specific encoder (e.g. h264_nvenc) does not fit another codec: reset to auto.
+                        if (picked) editSettings({ codec: picked.value, encoder: 'auto' });
                       }}
                     >
                       {#each codecOptions as o (o.value)}

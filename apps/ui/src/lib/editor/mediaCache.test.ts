@@ -55,7 +55,7 @@ describe('media cache eviction', () => {
   beforeEach(() => {
     clearMediaCache();
     vi.mocked(editorApi.thumbnails).mockReset();
-    vi.mocked(editorApi.thumbnails).mockResolvedValue([]);
+    vi.mocked(editorApi.thumbnails).mockImplementation(async (_id: string, times: number[]) => times.map(() => ''));
     vi.mocked(editorApi.waveform).mockReset();
   });
 
