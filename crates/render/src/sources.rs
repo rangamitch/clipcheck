@@ -27,8 +27,12 @@ use crate::pipeline::{AudioProvider, VideoProvider};
 const MAX_OPEN: usize = 4;
 /// A request this far (100 ns units, 2 s) past the last decoded frame seeks instead of decoding on.
 const SEEK_AHEAD_100NS: i64 = 20_000_000;
-/// Frames requested from an audio decoder per read.
-const AUDIO_CHUNK_FRAMES: usize = 4096;
+/// Open audio decoders kept per provider. A project can play many streams of one file at once
+/// (one decoder per stream); fewer slots than concurrent streams would reopen and reseek a
+/// decoder on every block.
+const MAX_OPEN_AUDIO: usize = 16;
+/// Frames requested from an audio decoder per read (about 0.34 s at 48 kHz).
+const AUDIO_CHUNK_FRAMES: usize = 16384;
 /// Largest still image accepted, in pixels (about 160 MB of BGRA).
 const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 
@@ -287,7 +291,7 @@ impl MfVideoProvider {
 
     /// Index of the open decoder for `media_id`, opening one (and evicting the least recently
     /// used decoder when full) if needed.
-    fn slot_index(&mut self, media_id: &str, src: &MediaSource) -> Option<usize> {
+    fn slot_index(&mut self, media_id: &str) -> Option<usize> {
         self.clock = self.clock.saturating_add(1);
         let now = self.clock;
         if let Some(i) = self.slots.iter().position(|s| s.media_id == media_id) {
@@ -296,7 +300,8 @@ impl MfVideoProvider {
             }
             return Some(i);
         }
-        let dec = match VideoDecoder::open(&src.path, OutFormat::Bgra) {
+        let path = self.sources.get(media_id).map(|s| s.path.clone())?;
+        let dec = match VideoDecoder::open(&path, OutFormat::Bgra) {
             Ok(d) => d,
             Err(_) => {
                 self.bad.insert(media_id.to_string());
@@ -354,17 +359,21 @@ impl VideoProvider for MfVideoProvider {
         if self.bad.contains(media_id) {
             return Ok(None);
         }
-        let Some(src) = self.sources.get(media_id).cloned() else {
+        // Only the cheap fields are copied per call; the path is cloned when a decoder is opened.
+        let Some((kind, fps)) = self.sources.get(media_id).map(|s| (s.kind, s.fps)) else {
             return Ok(None);
         };
-        if src.kind == MediaKind::Image {
+        if kind == MediaKind::Image {
+            let Some(src) = self.sources.get(media_id).cloned() else {
+                return Ok(None);
+            };
             return Ok(self.image(media_id, &src));
         }
-        let Some(idx) = self.slot_index(media_id, &src) else {
+        let Some(idx) = self.slot_index(media_id) else {
             return Ok(None);
         };
         let target = to_100ns(src_time);
-        let frame_100ns = (10_000_000.0 / src.fps).round() as i64;
+        let frame_100ns = (10_000_000.0 / fps).round() as i64;
         let secs = src_time.as_secs_f64().max(0.0);
         let Some(slot) = self.slots.get_mut(idx) else {
             return Ok(None);
@@ -544,7 +553,7 @@ impl MfAudioProvider {
                 return None;
             }
         };
-        if self.slots.len() >= MAX_OPEN {
+        if self.slots.len() >= MAX_OPEN_AUDIO {
             let oldest = self
                 .slots
                 .iter()
@@ -589,10 +598,10 @@ impl AudioProvider for MfAudioProvider {
         if frames == 0 || sample_rate == 0 {
             return Ok(false);
         }
-        let Some(src) = self.sources.get(media_id).cloned() else {
+        let Some(path) = self.sources.get(media_id).map(|s| s.path.clone()) else {
             return Ok(false);
         };
-        let Some(idx) = self.slot_index(media_id, stream, &src.path) else {
+        let Some(idx) = self.slot_index(media_id, stream, &path) else {
             return Ok(false);
         };
         let Some(slot) = self.slots.get_mut(idx) else {
