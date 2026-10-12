@@ -150,6 +150,30 @@ export interface DrawArgs {
   peaks: (mediaId: string, stream: number) => Float32Array | null;
 }
 
+/**
+ * Ids of clips that share a non-null `link_id` or `group_id` with a selected clip, excluding the
+ * selected clips themselves. Two passes over the clips: O(clips) per call.
+ */
+function findPartners(clips: readonly Clip[], selected: Set<string>): Set<string> {
+  const partners = new Set<string>();
+  if (selected.size === 0) return partners;
+  const linkIds = new Set<string>();
+  const groupIds = new Set<string>();
+  for (const clip of clips) {
+    if (!selected.has(clip.id)) continue;
+    if (clip.link_id) linkIds.add(clip.link_id);
+    if (clip.group_id) groupIds.add(clip.group_id);
+  }
+  if (linkIds.size === 0 && groupIds.size === 0) return partners;
+  for (const clip of clips) {
+    if (selected.has(clip.id)) continue;
+    if ((clip.link_id && linkIds.has(clip.link_id)) || (clip.group_id && groupIds.has(clip.group_id))) {
+      partners.add(clip.id);
+    }
+  }
+  return partners;
+}
+
 /** Clamps `v` into `lo..hi`. */
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
@@ -502,6 +526,7 @@ function drawClip(
   tracks: Map<string, Track>,
   media: Map<string, MediaRef>,
   selected: Set<string>,
+  partners: Set<string>,
   palette: Palette,
 ): void {
   const { view } = args;
@@ -509,6 +534,7 @@ function drawClip(
   const mediaRef = clip.media_id ? media.get(clip.media_id) : undefined;
   const isMissing = mediaRef?.missing === true;
   const isSelected = selected.has(clip.id);
+  const isPartner = !isSelected && partners.has(clip.id);
   const audioMuted = clip.kind === 'audio' && clip.audio.muted;
   const fill = audioMuted ? GREYED_COLOR : (clip.color ?? KIND_COLORS[clip.kind]);
   const bodyX = rect.x;
@@ -587,6 +613,17 @@ function drawClip(
     ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
     ctx.lineWidth = 1;
     ctx.stroke();
+  }
+  // Linked or grouped partners of the selection: dashed, muted accent, inside the bounds.
+  if (isPartner) {
+    roundRectPath(ctx, bodyX + 0.75, bodyY + 0.75, Math.max(0, bodyW - 1.5), Math.max(0, bodyH - 1.5), 4);
+    ctx.save();
+    ctx.globalAlpha *= 0.55;
+    ctx.strokeStyle = ACCENT;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.restore();
   }
 
   // Badges along the bottom edge: missing media, speed, reverse.
@@ -768,6 +805,8 @@ export function drawTimeline(ctx: CanvasRenderingContext2D, args: DrawArgs): voi
     media.set(m.id, m);
   }
   const selected = new Set<string>(args.selection);
+  // Partners: clips sharing a link or group with a selected clip, minus the selection itself.
+  const partners = findPartners(project.clips, selected);
 
   // Everything below is clipped to the area under the ruler.
   ctx.save();
@@ -783,7 +822,7 @@ export function drawTimeline(ctx: CanvasRenderingContext2D, args: DrawArgs): voi
     if (!rect) continue;
     if (rect.x + rect.w < 0 || rect.x > width) continue;
     if (rect.y + rect.h < RULER_HEIGHT || rect.y > height) continue;
-    drawClip(ctx, clip, rect, args, tracks, media, selected, palette);
+    drawClip(ctx, clip, rect, args, tracks, media, selected, partners, palette);
   }
 
   drawGroupBrackets(ctx, project, rows, view);
