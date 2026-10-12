@@ -1,9 +1,20 @@
 //! CPU reference compositor (M4). Pure Rust, used as the v1 export compositor and as the oracle
 //! for any future GPU path. Owner: worker `render-ref`.
+//!
+//! Performance notes: per-layer sampling taps (source index and bilinear weight per canvas column
+//! and row) are computed once, pixel loops only do table lookups, opaque pixels of unit-opacity
+//! layers are copied directly, and large canvases are split into disjoint row bands that run on
+//! scoped threads. Every arithmetic expression matches the original per-pixel formulation, so the
+//! output is byte-identical.
 
 use clipcheck_timeline::model::{FitMode, Rgba, Transform};
 
 use crate::frame::Frame;
+
+/// Canvas/resize row count at which row bands are split across threads.
+const PAR_MIN_ROWS: usize = 256;
+/// Upper bound on worker threads for one band-parallel pass.
+const MAX_THREADS: usize = 8;
 
 /// Where a source frame lands on the canvas after fit/fill/stretch/custom, crop, scale, position.
 /// All values in canvas pixels; the rectangle may extend beyond the canvas.
@@ -125,13 +136,9 @@ pub fn dest_rect(src_w: u32, src_h: u32, canvas_w: u32, canvas_h: u32, t: &Trans
     }
 }
 
-/// Read-only view of a cropped region inside a packed BGRA buffer, with the orientation
-/// (quarter turns and flips) needed to map canvas coordinates back into the source.
-struct Source<'a> {
-    /// Packed BGRA pixels of the whole source frame.
-    bgra: &'a [u8],
-    /// Full source width in pixels (row stride).
-    stride: usize,
+/// Orientation (quarter turns and flips) and crop of a source, used to map canvas coordinates
+/// back into the source. Pixel storage is passed separately (see [`Plan`]).
+struct Source {
     /// Crop origin in source pixels.
     ox: usize,
     /// Crop origin in source pixels.
@@ -148,16 +155,7 @@ struct Source<'a> {
     flip_v: bool,
 }
 
-impl Source<'_> {
-    /// Pixel at (x, y) inside the cropped region, or transparent black when out of range.
-    fn px(&self, x: usize, y: usize) -> [u8; 4] {
-        let i = ((self.oy + y) * self.stride + self.ox + x) * 4;
-        match self.bgra.get(i..i + 4) {
-            Some(&[b, g, r, a]) => [b, g, r, a],
-            _ => [0; 4],
-        }
-    }
-
+impl Source {
     /// Maps a point in oriented-source coordinates (after rotation) back to cropped-source
     /// coordinates (before rotation and flips), both continuous with pixel centres at +0.5.
     fn map(&self, u: f64, v: f64) -> (f64, f64) {
@@ -176,30 +174,6 @@ impl Source<'_> {
             fy = ch - fy;
         }
         (fx, fy)
-    }
-
-    /// Nearest pixel for a continuous cropped-source coordinate.
-    fn nearest(&self, fx: f64, fy: f64) -> [u8; 4] {
-        let x = fx.floor().clamp(0.0, (self.cw - 1) as f64) as usize;
-        let y = fy.floor().clamp(0.0, (self.ch - 1) as f64) as usize;
-        self.px(x, y)
-    }
-
-    /// Bilinear sample at a continuous cropped-source coordinate (edge pixels are clamped).
-    fn sample(&self, fx: f64, fy: f64) -> [f32; 4] {
-        let x = (fx - 0.5).clamp(0.0, (self.cw - 1) as f64);
-        let y = (fy - 0.5).clamp(0.0, (self.ch - 1) as f64);
-        let x0 = x.floor();
-        let y0 = y.floor();
-        let tx = (x - x0) as f32;
-        let ty = (y - y0) as f32;
-        let x0 = x0 as usize;
-        let y0 = y0 as usize;
-        let x1 = (x0 + 1).min(self.cw - 1);
-        let y1 = (y0 + 1).min(self.ch - 1);
-        let top = lerp4(to_f(self.px(x0, y0)), to_f(self.px(x1, y0)), tx);
-        let bottom = lerp4(to_f(self.px(x0, y1)), to_f(self.px(x1, y1)), tx);
-        lerp4(top, bottom, ty)
     }
 }
 
@@ -275,35 +249,210 @@ fn is_integral(v: f64) -> bool {
     (v - v.round()).abs() < 1e-6
 }
 
+/// Sampling taps for one canvas column or row: the nearest source index and the two bilinear
+/// neighbours with their weight. All indices are absolute (crop origin included).
+#[derive(Debug, Clone, Copy)]
+struct Tap {
+    /// Nearest source index.
+    near: usize,
+    /// Lower bilinear neighbour (edge clamped).
+    lo: usize,
+    /// Upper bilinear neighbour (edge clamped).
+    hi: usize,
+    /// Weight of `hi` (0..=1).
+    t: f32,
+}
+
+/// Builds the taps for a continuous cropped-source coordinate `f` along an axis of `n` (>= 1)
+/// pixels whose crop starts at `origin`. Same arithmetic as nearest/bilinear sampling per pixel.
+fn tap(f: f64, n: usize, origin: usize) -> Tap {
+    let last = n.saturating_sub(1);
+    let lastf = last as f64;
+    let near = f.floor().clamp(0.0, lastf) as usize;
+    let x = (f - 0.5).clamp(0.0, lastf);
+    let x0 = x.floor();
+    let lo = x0 as usize;
+    Tap {
+        near: near + origin,
+        lo: lo + origin,
+        hi: (lo + 1).min(last) + origin,
+        t: (x - x0) as f32,
+    }
+}
+
+/// Bilinear sample from two source rows given the column tap and the row weight.
+fn sample_taps(top: &[u8], bot: &[u8], cx: Tap, ty: f32) -> [f32; 4] {
+    let t = lerp4(to_f(bgra_at(top, cx.lo)), to_f(bgra_at(top, cx.hi)), cx.t);
+    let b = lerp4(to_f(bgra_at(bot, cx.lo)), to_f(bgra_at(bot, cx.hi)), cx.t);
+    lerp4(t, b, ty)
+}
+
+/// Pixel `x` of a packed BGRA row; transparent black when out of range.
+fn bgra_at(row: &[u8], x: usize) -> [u8; 4] {
+    match row.get(x * 4..x * 4 + 4) {
+        Some(&[b, g, r, a]) => [b, g, r, a],
+        _ => [0; 4],
+    }
+}
+
+/// A solid frame of `width` x `height` filled with `px` (b, g, r, a).
+fn solid_frame(width: u32, height: u32, px: [u8; 4]) -> Frame {
+    let n = (width as usize).saturating_mul(height as usize);
+    let mut bgra = vec![0u8; n.saturating_mul(4)];
+    for p in bgra.as_chunks_mut::<4>().0 {
+        p.copy_from_slice(&px);
+    }
+    Frame {
+        width,
+        height,
+        bgra,
+    }
+}
+
+/// Number of worker threads for a band-parallel pass (1 when unavailable).
+fn thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .clamp(1, MAX_THREADS)
+}
+
+/// Splits `region` (whole canvas rows of `cs` bytes, one entry of `per_row` per row) into
+/// disjoint row bands and runs `job` on each, in parallel for large regions.
+fn run_bands<T: Sync>(
+    region: &mut [u8],
+    cs: usize,
+    per_row: &[T],
+    job: impl Fn(&mut [u8], &[T]) + Sync,
+) {
+    let nrows = per_row.len();
+    let threads = if nrows >= PAR_MIN_ROWS && cs > 0 {
+        thread_count()
+    } else {
+        1
+    };
+    if threads <= 1 {
+        job(region, per_row);
+        return;
+    }
+    let band_rows = nrows.div_ceil(threads).max(1);
+    let job = &job;
+    std::thread::scope(|s| {
+        for (band, rows) in region
+            .chunks_mut(band_rows * cs)
+            .zip(per_row.chunks(band_rows))
+        {
+            s.spawn(move || job(band, rows));
+        }
+    });
+}
+
+/// Everything the per-pixel loops need about one layer.
+struct Plan<'a> {
+    /// Packed BGRA pixels of the whole source frame.
+    src: &'a [u8],
+    /// Bytes per source row.
+    sstride: usize,
+    /// Layer opacity (0 < opacity <= 1).
+    opacity: f32,
+    /// Nearest sampling is exact (1:1, unrotated, pixel-aligned).
+    fast: bool,
+}
+
+/// Blends one band of canvas rows for an unrotated layer using precomputed column and row taps.
+/// `band` holds whole canvas rows of `cs` bytes; `rows` has one tap per row of the band.
+fn blend_axis(band: &mut [u8], cs: usize, x0: usize, cols: &[Tap], rows: &[Tap], plan: &Plan<'_>) {
+    for (row, ry) in band.chunks_exact_mut(cs).zip(rows) {
+        let Some(seg) = row.get_mut(x0 * 4..(x0 + cols.len()) * 4) else {
+            continue;
+        };
+        let near_row = row_of(plan.src, plan.sstride, ry.near);
+        let top = row_of(plan.src, plan.sstride, ry.lo);
+        let bot = row_of(plan.src, plan.sstride, ry.hi);
+        for (px, &cx) in seg.as_chunks_mut::<4>().0.iter_mut().zip(cols) {
+            if plan.fast {
+                let [b, g, r, a] = bgra_at(near_row, cx.near);
+                if a == 0 {
+                    // Zero alpha leaves the canvas unchanged.
+                    continue;
+                }
+                if a == 255 && plan.opacity >= 1.0 {
+                    // Opaque at full opacity: the blend reduces to a copy.
+                    px.copy_from_slice(&[b, g, r, a]);
+                } else {
+                    blend_px(px, to_f([b, g, r, a]), plan.opacity);
+                }
+            } else {
+                blend_px(px, sample_taps(top, bot, cx, ry.t), plan.opacity);
+            }
+        }
+    }
+}
+
+/// Blends one band of canvas rows for a rotated or flipped layer. `vs` holds the oriented-source
+/// row coordinate of each band row; `us` the column coordinates of the layer.
+fn blend_general(
+    band: &mut [u8],
+    cs: usize,
+    x0: usize,
+    us: &[f64],
+    vs: &[f64],
+    src: &Source,
+    plan: &Plan<'_>,
+) {
+    for (row, &v) in band.chunks_exact_mut(cs).zip(vs) {
+        let Some(seg) = row.get_mut(x0 * 4..(x0 + us.len()) * 4) else {
+            continue;
+        };
+        for (px, &u) in seg.as_chunks_mut::<4>().0.iter_mut().zip(us) {
+            let (fx, fy) = src.map(u, v);
+            let cx = tap(fx, src.cw, src.ox);
+            let ry = tap(fy, src.ch, src.oy);
+            let top = row_of(plan.src, plan.sstride, ry.lo);
+            let bot = row_of(plan.src, plan.sstride, ry.hi);
+            blend_px(px, sample_taps(top, bot, cx, ry.t), plan.opacity);
+        }
+    }
+}
+
+/// Row `y` of a packed buffer with `stride` bytes per row; empty when out of range.
+fn row_of(buf: &[u8], stride: usize, y: usize) -> &[u8] {
+    buf.get(y * stride..(y + 1) * stride).unwrap_or(&[])
+}
+
 /// Bilinear resize of a whole frame to `w` x `h` (each >= 1).
 pub fn resize(frame: &Frame, w: u32, h: u32) -> Frame {
     let w = w.max(1);
     let h = h.max(1);
-    let mut out = Frame::solid(w, h, 0, 0, 0, 255);
     if !is_valid(frame) {
-        return out;
+        return solid_frame(w, h, [0, 0, 0, 255]);
     }
-    let src = Source {
-        bgra: &frame.bgra,
-        stride: frame.width as usize,
-        ox: 0,
-        oy: 0,
-        cw: frame.width as usize,
-        ch: frame.height as usize,
-        rot: 0,
-        flip_h: false,
-        flip_v: false,
-    };
+    let fw = frame.width as usize;
+    let fh = frame.height as usize;
     let scale_x = f64::from(frame.width) / f64::from(w);
     let scale_y = f64::from(frame.height) / f64::from(h);
+    let cols: Vec<Tap> = (0..w as usize)
+        .map(|x| tap((x as f64 + 0.5) * scale_x, fw, 0))
+        .collect();
+    let rows: Vec<Tap> = (0..h as usize)
+        .map(|y| tap((y as f64 + 0.5) * scale_y, fh, 0))
+        .collect();
     let row_len = w as usize * 4;
-    for (y, row) in out.bgra.chunks_exact_mut(row_len).enumerate() {
-        let fy = (y as f64 + 0.5) * scale_y;
-        for (x, px) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-            let fx = (x as f64 + 0.5) * scale_x;
-            store(px, src.sample(fx, fy));
+    let fstride = fw * 4;
+    let mut out = Frame {
+        width: w,
+        height: h,
+        bgra: vec![0u8; row_len * h as usize],
+    };
+    let src = &frame.bgra;
+    run_bands(&mut out.bgra, row_len, &rows, |band, rs| {
+        for (row, ry) in band.chunks_exact_mut(row_len).zip(rs) {
+            let top = row_of(src, fstride, ry.lo);
+            let bot = row_of(src, fstride, ry.hi);
+            for (px, &cx) in row.as_chunks_mut::<4>().0.iter_mut().zip(&cols) {
+                store(px, sample_taps(top, bot, cx, ry.t));
+            }
         }
-    }
+    });
     out
 }
 
@@ -312,13 +461,10 @@ pub fn resize(frame: &Frame, w: u32, h: u32) -> Frame {
 /// alpha-blended with `opacity * pixel alpha`, clipped to the canvas. The result is opaque
 /// (alpha 255) wherever the background is opaque.
 pub fn compose(canvas_w: u32, canvas_h: u32, background: Rgba, layers: &[LayerInput<'_>]) -> Frame {
-    let mut out = Frame::solid(
+    let mut out = solid_frame(
         canvas_w,
         canvas_h,
-        background.b,
-        background.g,
-        background.r,
-        background.a,
+        [background.b, background.g, background.r, background.a],
     );
     for layer in layers {
         blend_layer(&mut out, layer);
@@ -354,8 +500,6 @@ fn blend_layer(out: &mut Frame, layer: &LayerInput<'_>) {
         (cw as f64, ch as f64)
     };
     let src = Source {
-        bgra: &layer.frame.bgra,
-        stride: layer.frame.width as usize,
         ox,
         oy,
         cw,
@@ -385,22 +529,29 @@ fn blend_layer(out: &mut Frame, layer: &LayerInput<'_>) {
         && is_integral(dr.x)
         && is_integral(dr.y);
 
-    let stride_bytes = canvas_w as usize * 4;
-    for (&v, y) in vs.iter().zip(y0..y1) {
-        let start = y * stride_bytes + x0 * 4;
-        let end = y * stride_bytes + x1 * 4;
-        let Some(row) = out.bgra.get_mut(start..end) else {
-            continue;
-        };
-        for (px, &u) in row.as_chunks_mut::<4>().0.iter_mut().zip(us.iter()) {
-            let (fx, fy) = src.map(u, v);
-            let s = if fast {
-                to_f(src.nearest(fx, fy))
-            } else {
-                src.sample(fx, fy)
-            };
-            blend_px(px, s, opacity);
-        }
+    let cs = canvas_w as usize * 4;
+    let Some(region) = out.bgra.get_mut(y0 * cs..y1 * cs) else {
+        return;
+    };
+    let plan = Plan {
+        src: &layer.frame.bgra,
+        sstride: layer.frame.width as usize * 4,
+        opacity,
+        fast,
+    };
+
+    if rot == 0 {
+        // Unrotated: a source column depends only on the canvas column (and a row only on the
+        // row), so the taps are computed once per layer.
+        let cols: Vec<Tap> = us.iter().map(|&u| tap(src.map(u, 0.0).0, cw, ox)).collect();
+        let rows: Vec<Tap> = vs.iter().map(|&v| tap(src.map(0.0, v).1, ch, oy)).collect();
+        run_bands(region, cs, &rows, |band, rs| {
+            blend_axis(band, cs, x0, &cols, rs, &plan);
+        });
+    } else {
+        run_bands(region, cs, &vs, |band, vr| {
+            blend_general(band, cs, x0, &us, vr, &src, &plan);
+        });
     }
 }
 
@@ -443,7 +594,7 @@ pub fn blurred_cover(frame: &Frame, w: u32, h: u32) -> Frame {
     let w = w.max(1);
     let h = h.max(1);
     if !is_valid(frame) {
-        return Frame::solid(w, h, 0, 0, 0, 255);
+        return solid_frame(w, h, [0, 0, 0, 255]);
     }
 
     // Cover: scale uniformly until both sides reach the target, then centre-crop.
@@ -469,7 +620,7 @@ pub fn blurred_cover(frame: &Frame, w: u32, h: u32) -> Frame {
         }
     }
     if cropped.len() != row_len * h as usize {
-        return Frame::solid(w, h, 0, 0, 0, 255);
+        return solid_frame(w, h, [0, 0, 0, 255]);
     }
 
     let radius = ((w / 40).max(1)) as usize;
@@ -490,11 +641,6 @@ pub fn blurred_cover(frame: &Frame, w: u32, h: u32) -> Frame {
 /// Clamps a possibly out-of-range index into `0..n` (edge replication). `n` must be >= 1.
 fn clamp_index(i: isize, n: usize) -> usize {
     i.clamp(0, n as isize - 1) as usize
-}
-
-/// Row `y` of a packed buffer with `stride` bytes per row; empty when out of range.
-fn row_of(buf: &[u8], stride: usize, y: usize) -> &[u8] {
-    buf.get(y * stride..(y + 1) * stride).unwrap_or(&[])
 }
 
 /// Pixel `x` of a row as u32 channels, zero when out of range.
