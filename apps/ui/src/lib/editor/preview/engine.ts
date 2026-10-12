@@ -76,6 +76,12 @@ export interface PreviewEngine {
    * with `null`. Affects painting only; the plan is not changed.
    */
   setTransformOverride(clipId: string, transform: Transform | null): void;
+  /**
+   * Marks the start (true) or end (false) of a playhead drag. While scrubbing, playback is held
+   * (resumed at the end when it was running), only the picture follows (fast keyframe seeks), and
+   * the exact frame is shown when scrubbing stops.
+   */
+  setScrubbing?(on: boolean): void;
   /** Pauses, releases elements and the audio graph, and cancels all timers. */
   destroy(): void;
 }
@@ -86,6 +92,15 @@ export interface PreviewEngineOptions {
   mediaUrl: (mediaId: string) => Promise<string>;
 }
 
+/**
+ * Kill switch for bisecting playback lag: false skips the hidden <audio> elements of the non-default
+ * streams (the lanes using streams 1..6 are then silent).
+ */
+const MULTI_STREAM_AUDIO = true;
+/** Quiet time after the last seek of a paused playhead before the exact frame is seeked (ms). */
+const SCRUB_SETTLE_MS = 120;
+/** Minimum gap between positioning passes of the audio-stream elements while playing (ms). */
+const STREAM_SYNC_MS = 100;
 /** Maximum number of pooled video elements (media that are not needed are evicted first). */
 const MAX_ELEMENTS = 4;
 /** Maximum number of pooled audio-stream elements (least recently used unneeded one is evicted). */
@@ -163,6 +178,8 @@ interface PlayEntry {
   seekStartMs: number | null;
   /** Measured duration of the last completed seek (ms). Used as lead when re-seeking while playing. */
   seekCostMs: number;
+  /** Target (seconds) of the last seek assigned to `el`. */
+  lastSeekTarget: number;
   /** Current minimum gap between playing re-seeks (ms). */
   gapMs: number;
   /** True while the element runs at a nudged rate (drift hysteresis). */
@@ -357,6 +374,15 @@ class Engine implements PreviewEngine {
   /** Media ids already warned about this session (one toast per media). */
   private readonly warnedMedia = new Set<string>();
   private trackToastTimer: ReturnType<typeof setTimeout> | null = null;
+  /** True while the playhead is dragged (setScrubbing). */
+  private scrubbing = false;
+  /** Playback that was held by setScrubbing(true) and resumes at its end. */
+  private resumeRate: number | null = null;
+  /** performance.now() until which a paused seek counts as scrubbing (fast seeks, no exact frame). */
+  private scrubUntilMs = 0;
+  private scrubTimer: ReturnType<typeof setTimeout> | null = null;
+  private paintRaf: number | null = null;
+  private lastStreamSyncMs = 0;
 
   private readonly timeCbs = new Set<(t: Tick) => void>();
   private readonly levelCbs = new Set<(l: { master: number; tracks: number[] }) => void>();
@@ -441,7 +467,91 @@ class Engine implements PreviewEngine {
     this.prefetchedStreams.clear();
     this.segStart = null;
     this.emitTime(target);
-    this.scheduleRedraw();
+    if (this.clock.isRunning()) {
+      // Let every element jump to the new position at once (no re-seek back-off).
+      for (const entry of this.elements.values()) this.resetSeekGap(entry);
+      for (const entry of this.audioEls.values()) this.resetSeekGap(entry);
+      this.scheduleRedraw();
+      return;
+    }
+    this.paintDirty = true;
+    this.scrubUntilMs = performance.now() + SCRUB_SETTLE_MS;
+    this.armScrubSettle();
+    this.schedulePaint();
+  }
+
+  setScrubbing(on: boolean): void {
+    if (this.destroyed || this.scrubbing === on) return;
+    this.scrubbing = on;
+    if (on) {
+      if (this.clock.isRunning()) {
+        this.resumeRate = this.rate;
+        const t = this.stopPlayback();
+        this.emitLevels(SILENT_LEVELS);
+        this.emitTime(t);
+      }
+      this.scrubUntilMs = Number.POSITIVE_INFINITY;
+      return;
+    }
+    this.scrubUntilMs = 0;
+    this.settleScrub();
+    const rate = this.resumeRate;
+    this.resumeRate = null;
+    if (rate !== null) this.play(rate);
+  }
+
+  /** Clears the re-seek back-off of an element so the next drift check may seek at once. */
+  private resetSeekGap(entry: PlayEntry): void {
+    entry.gapMs = SEEK_GAP_MS;
+    entry.lastSeekMs = 0;
+  }
+
+  /** Paints the playhead frame on the next animation frame (coalesces seeks to one paint per frame). */
+  private schedulePaint(): void {
+    if (this.destroyed || this.paintRaf !== null) return;
+    if (this.hidden() || typeof requestAnimationFrame === 'undefined') {
+      this.scheduleRedraw();
+      return;
+    }
+    this.paintRaf = requestAnimationFrame(() => {
+      this.paintRaf = null;
+      if (!this.destroyed && !this.clock.isRunning()) this.paintAt(this.clock.now());
+    });
+  }
+
+  /** Paints at once while paused (a seek finished, so the new frame is ready). */
+  private redrawNow(): void {
+    if (this.destroyed || this.clock.isRunning()) return;
+    if (this.redrawTimer !== null) {
+      clearTimeout(this.redrawTimer);
+      this.redrawTimer = null;
+    }
+    this.paintAt(this.clock.now());
+  }
+
+  private armScrubSettle(): void {
+    if (this.scrubTimer !== null) clearTimeout(this.scrubTimer);
+    this.scrubTimer = setTimeout(() => {
+      this.scrubTimer = null;
+      if (!this.scrubbing) this.settleScrub();
+    }, SCRUB_SETTLE_MS);
+  }
+
+  /** Scrubbing stopped: exact frame at the playhead, and idle warm-up of the audio streams. */
+  private settleScrub(): void {
+    if (this.destroyed) return;
+    this.scrubUntilMs = 0;
+    if (this.clock.isRunning()) return;
+    this.redrawNow();
+    const plan = this.plan;
+    if (!plan || !MULTI_STREAM_AUDIO) return;
+    const seg = segmentAt(plan, this.clock.now());
+    if (!seg) return;
+    this.collectNeeds(seg, this.clock.now());
+    const now = performance.now();
+    this.keepAudioKeys.clear();
+    for (const key of this.streamNeeds.keys()) this.keepAudioKeys.add(key);
+    for (const need of this.streamNeeds.values()) this.ensureAudioElement(need.mediaId, need.stream, now);
   }
 
   play(rate?: number): void {
@@ -557,6 +667,10 @@ class Engine implements PreviewEngine {
     this.destroyed = true;
     document.removeEventListener('visibilitychange', this.onVisibility);
     this.updateHiddenTimer();
+    if (this.scrubTimer !== null) clearTimeout(this.scrubTimer);
+    this.scrubTimer = null;
+    if (this.paintRaf !== null && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(this.paintRaf);
+    this.paintRaf = null;
     this.audio.ctx.onstatechange = null;
     if (this.redrawTimer !== null) {
       clearTimeout(this.redrawTimer);
@@ -965,6 +1079,7 @@ class Engine implements PreviewEngine {
       lastSeekMs: 0,
       seekStartMs: null,
       seekCostMs: 0,
+      lastSeekTarget: Number.NaN,
       gapMs: SEEK_GAP_MS,
       nudging: false,
       frameSeq: 0,
@@ -979,7 +1094,9 @@ class Engine implements PreviewEngine {
     }
     el.onseeked = () => {
       this.onSeeked(entry);
-      this.scheduleRedraw();
+      // Paused: show the arrived frame now and chase the newest target. Playing: next tick paints.
+      if (this.clock.isRunning()) this.scheduleRedraw();
+      else this.redrawNow();
     };
     el.onloadeddata = () => this.scheduleRedraw();
     el.onloadedmetadata = () => this.checkDecodable(mediaId, el);
@@ -1013,6 +1130,7 @@ class Engine implements PreviewEngine {
   /** Assigns a seek and records when it started, so its cost can be measured. */
   private seekTo(entry: PlayEntry, sec: number, now: number): void {
     entry.el.currentTime = sec;
+    entry.lastSeekTarget = sec;
     entry.lastSeekMs = now;
     entry.seekStartMs = performance.now();
   }
@@ -1266,9 +1384,15 @@ class Engine implements PreviewEngine {
     this.keepAudioKeys.clear();
     for (const key of streams.keys()) this.keepAudioKeys.add(key);
     for (const [key, entry] of this.audioEls) {
-      if (streams.has(key)) continue;
+      if (streams.has(key) && playing && MULTI_STREAM_AUDIO) continue;
       if (!entry.el.paused) entry.el.pause();
     }
+    // Paused (scrubbing, stepping) the stream elements are not touched: they are silent anyway and
+    // seeking them on every playhead move only costs decoder and disk time. Playing, they are
+    // positioned at 10 Hz, not on every animation frame.
+    if (!playing || !MULTI_STREAM_AUDIO) return;
+    if (now - this.lastStreamSyncMs < STREAM_SYNC_MS && this.segStart === seg.start) return;
+    this.lastStreamSyncMs = now;
     for (const need of streams.values()) {
       const entry = this.ensureAudioElement(need.mediaId, need.stream, now);
       if (!entry) continue;
@@ -1284,6 +1408,11 @@ class Engine implements PreviewEngine {
     if (!entry.hasSrc) return;
     const el = entry.el;
     const target = tickToSec(need.src);
+
+    if (!playing && !audioOnly) {
+      this.seekPaused(entry as ElementEntry, target, now);
+      return;
+    }
 
     if (need.speed <= 0 || need.reverse || (playing && this.rate < 0)) {
       // Frozen, reversed or reverse-shuttled: cannot play backwards, so step the frame.
@@ -1322,7 +1451,9 @@ class Engine implements PreviewEngine {
       entry.gapMs = Math.min(SEEK_GAP_MAX_MS, entry.gapMs * 2);
       entry.nudging = false;
       if (el.playbackRate !== nominal) el.playbackRate = nominal;
-    } else if (abs > (entry.nudging ? DRIFT_NUDGE_OFF_S : DRIFT_NUDGE_S)) {
+    } else if (audioOnly && abs > (entry.nudging ? DRIFT_NUDGE_OFF_S : DRIFT_NUDGE_S)) {
+      // Only the extracted audio streams are nudged. The picture element free-runs: its own clock is
+      // the audio renderer, and rate changes on it re-sync the pipeline and drop frames.
       // Hysteresis: once nudging, keep the corrected rate until the drift is almost gone.
       entry.nudging = true;
       const factor = drift > 0 ? 1 - NUDGE_FACTOR : 1 + NUDGE_FACTOR;
@@ -1334,6 +1465,34 @@ class Engine implements PreviewEngine {
       entry.gapMs = SEEK_GAP_MS;
     }
     if (el.paused) this.playElement(el);
+  }
+
+  /**
+   * Paused positioning of a video element: one seek in flight; the newest target is chased from
+   * `seeked`. While scrubbing, intermediate targets use fastSeek (keyframe, quick); the exact seek
+   * follows when scrubbing settles.
+   */
+  private seekPaused(entry: ElementEntry, target: number, now: number): void {
+    const el = entry.el;
+    if (el.playbackRate !== 1) el.playbackRate = 1;
+    if (!el.paused) el.pause();
+    entry.nudging = false;
+    if (el.seeking || Math.abs(el.currentTime - target) <= DRIFT_PAUSED_S) return;
+    const scrubbing = now < this.scrubUntilMs;
+    if (!scrubbing) {
+      this.seekTo(entry, target, now);
+      return;
+    }
+    // A keyframe seek lands off the target; do not re-issue it for the same target.
+    if (Math.abs(entry.lastSeekTarget - target) <= DRIFT_PAUSED_S) return;
+    if (typeof el.fastSeek === 'function') {
+      el.fastSeek(target);
+      entry.lastSeekTarget = target;
+      entry.lastSeekMs = now;
+      entry.seekStartMs = performance.now();
+    } else {
+      this.seekTo(entry, target, now);
+    }
   }
 
   private playElement(el: HTMLMediaElement): void {
@@ -1397,7 +1556,6 @@ class Engine implements PreviewEngine {
     el.preservesPitch = false;
     // The file comes from another origin. Web Audio needs CORS or the source is silent.
     el.crossOrigin = 'anonymous';
-    hostElement(el);
     const entry: AudioEntry = {
       key,
       mediaId,
@@ -1408,6 +1566,7 @@ class Engine implements PreviewEngine {
       lastSeekMs: 0,
       seekStartMs: null,
       seekCostMs: 0,
+      lastSeekTarget: Number.NaN,
       gapMs: SEEK_GAP_MS,
       nudging: false,
     };

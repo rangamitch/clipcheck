@@ -13,6 +13,7 @@
     previewStats,
     project,
     seek,
+    scrubbing,
     selectClips,
     selectedClips,
     selection,
@@ -580,6 +581,14 @@
       lastEngineTick = t;
       e.seek(t);
     });
+  });
+
+  // Playhead drags hold audio and use fast picture seeks until released.
+  $effect(() => {
+    const e = engine;
+    const s = $scrubbing;
+    if (e === null) return;
+    e.setScrubbing?.(s);
   });
 
   $effect(() => {

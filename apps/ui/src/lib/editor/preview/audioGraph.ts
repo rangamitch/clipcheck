@@ -157,15 +157,9 @@ export class AudioGraph {
   private closed = false;
 
   constructor() {
-    // 'playback' uses larger device buffers: fewer underruns (crackle) while the main thread paints.
-    // The clock subtracts the reported output latency, so picture and sound stay aligned.
-    let ctx: AudioContext;
-    try {
-      ctx = new AudioContext({ latencyHint: 'playback' });
-    } catch {
-      ctx = new AudioContext();
-    }
-    this.ctx = ctx;
+    // Default latency hint: 'playback' buffers more audio, which delays the media clock of every
+    // routed element against the playhead clock (and made the drift correction fight the video).
+    this.ctx = new AudioContext();
     this.master = this.ctx.createGain();
     this.masterMeter = this.ctx.createAnalyser();
     this.masterMeter.fftSize = METER_FFT;

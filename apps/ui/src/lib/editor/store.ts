@@ -48,6 +48,8 @@ export const selection = writable<string[]>([]);
 export const playhead = writable<Tick>(0);
 /** True while playback runs. */
 export const playing = writable<boolean>(false);
+/** True while the playhead is dragged. The program monitor then only follows with its picture. */
+export const scrubbing = writable<boolean>(false);
 /** Preview diagnostics, refreshed about once per second while playing (see preview/engine.ts). */
 export interface PreviewStats {
   paintFps: number;
@@ -381,6 +383,16 @@ export function pasteAtPlayhead(): Promise<ApplyReply | null> {
 // ---------------------------------------------------------------------------------------------
 // Playhead and zoom
 // ---------------------------------------------------------------------------------------------
+
+/** Marks the start of a playhead drag (ruler or playhead handle). Pair with endScrub. */
+export function beginScrub(): void {
+	scrubbing.set(true);
+}
+
+/** Marks the end of a playhead drag. */
+export function endScrub(): void {
+	scrubbing.set(false);
+}
 
 /** Moves the playhead, clamped to 0..MAX_PROJECT_TICKS. */
 export function seek(t: Tick): void {
