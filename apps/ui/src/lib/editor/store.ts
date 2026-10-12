@@ -164,6 +164,27 @@ function clampScroll(px: number): number {
 	return Math.max(0, px);
 }
 
+/**
+ * Largest valid horizontal scroll at a given zoom (px per second), supplied by the timeline view
+ * while it is mounted. Null when no view is mounted, which leaves scroll unbounded above.
+ */
+let scrollLimitAt: ((pxPerSec: number) => number) | null = null;
+
+/** Registers (or, with null, clears) the function giving the maximum scroll for a zoom level. */
+export function setScrollLimit(fn: ((pxPerSec: number) => number) | null): void {
+	scrollLimitAt = fn;
+}
+
+/** Clamps a scroll offset to be non-negative, finite, and at most the limit for the zoom `px`. */
+function clampScrollAt(px: number, zoom: number): number {
+	let v = clampScroll(px);
+	if (scrollLimitAt !== null) {
+		const limit = scrollLimitAt(zoom);
+		if (Number.isFinite(limit)) v = Math.min(v, Math.max(0, limit));
+	}
+	return v;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Snapshot lifecycle
 // ---------------------------------------------------------------------------------------------
@@ -370,7 +391,7 @@ export function zoomBy(factor: number, anchorTick?: Tick): void {
 	const anchor = anchorTick ?? get(playhead);
 	const anchorSec = Number.isFinite(anchor) ? tickToSec(anchor) : 0;
 	const oldScroll = get(scrollX);
-	const newScroll = clampScroll(oldScroll + anchorSec * (newPx - oldPx));
+	const newScroll = clampScrollAt(oldScroll + anchorSec * (newPx - oldPx), newPx);
 	pxPerSec.set(newPx);
 	scrollX.set(newScroll);
 }

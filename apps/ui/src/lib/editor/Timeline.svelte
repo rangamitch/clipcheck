@@ -26,6 +26,7 @@
     selectAllClips,
     selectClips,
     selection,
+    setScrollLimit,
     timelineEndTick,
     toast,
     tool,
@@ -321,10 +322,26 @@
     };
   });
 
-  // Keep the scroll offsets inside their limits after resize, zoom or edits.
+  // Let store-side zoom writes respect the horizontal limit at the zoom they produce.
   $effect(() => {
-    const limit = maxScrollX;
-    if (get(scrollX) > limit) scrollX.set(Math.max(0, limit));
+    setScrollLimit((px: number): number => {
+      const p = get(projectStore);
+      const end = p ? tickToSec(timelineEndTick(p)) : 0;
+      return Math.max(0, (end + SCROLL_PAD_S) * px - vpWidth);
+    });
+    return () => setScrollLimit(null);
+  });
+
+  // Keep the horizontal scroll inside its limit after resize, zoom or edits. Reads $scrollX so any
+  // write above the limit (including when the content fits and the limit is 0) is pulled back.
+  $effect(() => {
+    const limit = Math.max(0, maxScrollX);
+    const x = $scrollX;
+    if (x > limit) scrollX.set(limit);
+  });
+  $effect(() => {
+    const limit = maxScrollY;
+    if (get(scrollY) > limit) scrollY.set(Math.max(0, limit));
   });
   $effect(() => {
     const limit = maxScrollY;
