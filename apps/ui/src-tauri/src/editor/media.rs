@@ -145,6 +145,9 @@ pub async fn editor_waveform(
     let path = PathBuf::from(&media.path);
     let meta = fs::metadata(&path).map_err(|_| format!("file is missing: {}", media.path))?;
     let cache_file = paths::peaks_file(&cache_root(), meta.len(), mtime_ms(&meta), stream, buckets);
+    if let Some(peaks) = peaks_mem_get(&cache_file) {
+        return Ok(peaks);
+    }
     if let Some(peaks) = read_peaks(&cache_file, buckets) {
         return Ok(peaks);
     }
@@ -163,7 +166,7 @@ pub async fn editor_waveform(
                 compute_peaks(&path, &cache_file, stream, buckets)
             })
             .await;
-            if matches!(done, Ok(Ok(_))) {
+            if matches!(done, Ok(Ok((_, true)))) {
                 let _ = app.emit(
                     "peaks-ready",
                     serde_json::json!({ "mediaId": id, "stream": stream }),
@@ -173,9 +176,11 @@ pub async fn editor_waveform(
         return Ok(Vec::new());
     }
 
-    tauri::async_runtime::spawn_blocking(move || compute_peaks(&path, &cache_file, stream, buckets))
-        .await
-        .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        compute_peaks(&path, &cache_file, stream, buckets).map(|(peaks, _)| peaks)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// JPEG thumbnails as `data:image/jpeg;base64,...` strings for the given source times (ms) of a
@@ -554,22 +559,79 @@ impl Drop for HeavyIo {
     }
 }
 
-/// Decodes the peaks of one audio stream, writes them to the cache file and returns them.
+/// Most peak results kept in memory (cleared when a new key would exceed this).
+const PEAKS_MEM_MAX: usize = 256;
+/// Most decodes of one cache file per process; further attempts fail instead of decoding again.
+const MAX_COMPUTES_PER_KEY: u32 = 2;
+
+/// Peak results of this process keyed by cache file path. Holds results even when the disk write
+/// failed, so a cache miss on disk never triggers a second decode of the same file.
+static PEAKS_MEM: Mutex<Option<HashMap<PathBuf, Vec<f32>>>> = Mutex::new(None);
+
+/// Number of decodes started per cache file path in this process.
+static COMPUTES: Mutex<Option<HashMap<PathBuf, u32>>> = Mutex::new(None);
+
+/// Peaks held in memory for a cache file, if any.
+fn peaks_mem_get(file: &Path) -> Option<Vec<f32>> {
+    let guard = PEAKS_MEM.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref()?.get(file).cloned()
+}
+
+/// Keeps peaks in memory for a cache file, clearing the map first when it is full.
+fn peaks_mem_put(file: &Path, peaks: Vec<f32>) {
+    let mut guard = PEAKS_MEM.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() >= PEAKS_MEM_MAX && !map.contains_key(file) {
+        map.clear();
+    }
+    map.insert(file.to_path_buf(), peaks);
+}
+
+/// Counts one decode of a cache file. Errors once the file has been decoded more than
+/// `MAX_COMPUTES_PER_KEY` times in this process (a runaway guard).
+fn count_compute(file: &Path) -> Result<(), String> {
+    let mut guard = COMPUTES.lock().unwrap_or_else(|e| e.into_inner());
+    let count = guard
+        .get_or_insert_with(HashMap::new)
+        .entry(file.to_path_buf())
+        .or_insert(0);
+    *count = count.saturating_add(1);
+    if *count > MAX_COMPUTES_PER_KEY {
+        return Err("waveform unavailable".to_string());
+    }
+    Ok(())
+}
+
+/// Returns the peaks of one audio stream, decoding the file only when no result is known yet.
+/// Order: memory, then the cache file, then a decode (stored in memory and written to disk; a
+/// failed write is logged and does not fail the call). The flag is false only when the result
+/// was already in memory, so the caller emits `peaks-ready` only when the UI has not seen it yet.
 fn compute_peaks(
     path: &Path,
     cache_file: &Path,
     stream: u32,
     buckets: usize,
-) -> Result<Vec<f32>, String> {
+) -> Result<(Vec<f32>, bool), String> {
     let _heavy = HeavyIo::enter();
-    // Another job may have produced the file while this one waited for its turn.
-    if let Some(done) = read_peaks(cache_file, buckets) {
-        return Ok(done);
+    // Another job may have produced the result while this one waited for its turn.
+    if let Some(done) = peaks_mem_get(cache_file) {
+        return Ok((done, false));
     }
+    if let Some(done) = read_peaks(cache_file, buckets) {
+        peaks_mem_put(cache_file, done.clone());
+        return Ok((done, true));
+    }
+    count_compute(cache_file)?;
     let (peaks, _secs) =
         clipcheck_mfdec::audio::decode_peaks(path, stream, buckets).map_err(|e| e.to_string())?;
-    let _ = write_peaks(cache_file, &peaks);
-    Ok(peaks)
+    peaks_mem_put(cache_file, peaks.clone());
+    if let Err(e) = write_peaks(cache_file, &peaks) {
+        eprintln!(
+            "editor waveform: cannot write peaks cache {}: {e}",
+            cache_file.display()
+        );
+    }
+    Ok((peaks, true))
 }
 
 /// Cache files whose background waveform computation is running (keyed by cache file path).
