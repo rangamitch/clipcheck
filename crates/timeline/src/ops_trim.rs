@@ -10,6 +10,7 @@ use crate::error::{EditError, EditResult};
 use crate::model::{Clip, ClipKind, EnvPoint, Project, WorkArea};
 use crate::ops_basic::overwrite_under;
 use crate::ops_group::expand_selection;
+use crate::ops_range::{cap_env, slice_env};
 use crate::time::{Rate, Tick, MAX_TICK, TICKS_PER_SECOND};
 
 /// Which edge of a clip.
@@ -35,7 +36,8 @@ pub enum Edge {
 ///   the track stays contiguous (for a Start-edge ripple the clip's `start` stays put and later
 ///   clips shift by `-delta`).
 ///
-/// Fades are clamped to the new length; envelope points beyond the end are dropped.
+/// Fades are clamped to the new length. Shortening an end edge slices the envelope to the new
+/// length, so the level at the new end is kept (see [`refit_env`]); points beyond the end go.
 pub fn trim_edge(
     p: &mut Project,
     clip_id: &str,
@@ -114,6 +116,7 @@ pub fn roll_edit(p: &mut Project, left_id: &str, right_id: &str, new_cut: Tick) 
     let mut np = p.clone();
     let mut nl = left.clone();
     nl.dur = left.dur.saturating_add(delta);
+    refit_env(&mut nl, left.dur);
     if left.reverse {
         // Reversed: the timeline end is the source start, so the source range moves opposite to the cut.
         nl.src_in = left
@@ -184,7 +187,9 @@ pub fn slide(p: &mut Project, clip_id: &str, delta: Tick) -> EditResult<()> {
     let mut np = p.clone();
     if let Some(lid) = left_nb.as_deref() {
         let mut l = get_clip(&np, lid)?;
+        let old_dur = l.dur;
         l.dur = l.dur.saturating_add(delta);
+        refit_env(&mut l, old_dur);
         if l.reverse {
             // Reversed neighbour: its end is the source start, so the source range moves opposite.
             l.src_in = l.src_in.saturating_sub(scale_tick(delta, l.speed));
@@ -625,7 +630,17 @@ fn join_envelope(left: &Clip, right: &Clip) -> Vec<EnvPoint> {
             });
         }
     }
-    out
+    cap_env(out)
+}
+
+/// Re-fits an envelope after a clip's length changed from `old_dur` to `c.dur`. A shortened clip
+/// gets its envelope sliced to the new length, with a point interpolated at the new end (so the
+/// level there is kept rather than the last point before the cut). A lengthened clip keeps its
+/// envelope as it is (the last level is held).
+fn refit_env(c: &mut Clip, old_dur: Tick) {
+    if c.dur < old_dur {
+        c.audio.envelope = slice_env(&c.audio.envelope, Tick::ZERO, c.dur);
+    }
 }
 
 /// Shortens a timeline length by whole ticks until the source range it implies at `speed` fits the
@@ -650,8 +665,8 @@ fn fit_dur_to_media(p: &Project, c: &Clip, speed: f64, dur: Tick) -> Tick {
     d
 }
 
-/// Keeps fades within the clip length (shrinking fade-out first) and drops envelope points at or
-/// after the end.
+/// Keeps fades within the clip length (shrinking fade-out first) and drops envelope points after
+/// the end. A point exactly at the end is kept: it is the boundary point that holds the level there.
 fn clamp_fades(c: &mut Clip) {
     let dur = c.dur;
     let fi = c.audio.fade_in.max(Tick::ZERO).min(dur);
@@ -661,7 +676,7 @@ fn clamp_fades(c: &mut Clip) {
     }
     c.audio.fade_in = fi;
     c.audio.fade_out = fo;
-    c.audio.envelope.retain(|e| e.t < dur);
+    c.audio.envelope.retain(|e| e.t <= dur);
 }
 
 /// Fits two fades into a clip of length `dur`: each is clamped to `0..=dur`, and when their sum
@@ -737,6 +752,7 @@ fn trim_one(p: &mut Project, id: &str, edge: Edge, target: Tick, ripple: bool) -
         }
         Edge::End => {
             nc.dur = target.saturating_sub(c.start);
+            refit_env(&mut nc, c.dur);
             if c.reverse {
                 // Reversed: the timeline end plays the earliest source, so shortening the end
                 // advances `src_in` by the removed source length (lengthening moves it back).

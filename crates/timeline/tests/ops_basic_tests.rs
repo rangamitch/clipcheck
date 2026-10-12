@@ -1814,3 +1814,28 @@ fn overwrite_split_right_piece_gets_a_copy_of_its_group() {
     assert_eq!(copy.name, "Dialogue");
     assert_eq!(copy.color.as_deref(), Some("#ff0000"));
 }
+
+#[test]
+fn overwriting_a_linked_audio_clip_entirely_unlinks_its_video_partner() {
+    // V1 clip `v` and A1 clip `a` share link X. `b` (A1, 10..15) is moved onto `a`, covering it
+    // completely, so `a` is removed and `v` is left as the only holder of link X.
+    let mut p = project();
+    let vt = v1(&p);
+    let at = a1(&p);
+    let v = raw(&mut p, &vt, ClipKind::Video, s(0), s(5));
+    let a = raw(&mut p, &at, ClipKind::Audio, s(0), s(5));
+    let b = raw(&mut p, &at, ClipKind::Audio, s(10), s(5));
+    set_link(&mut p, &v, &a, "X");
+    move_clips(
+        &mut p,
+        &[ClipMove {
+            clip_id: b.clone(),
+            new_start: s(0),
+            new_track: None,
+        }],
+    )
+    .expect("b goes on top of a");
+    assert!(p.clip(&a).is_none(), "a is fully covered and removed");
+    assert_eq!(clip(&p, &v).link_id, None, "v has no partner left");
+    assert_eq!(clip(&p, &b).link_id, None);
+}

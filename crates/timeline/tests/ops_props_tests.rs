@@ -232,9 +232,19 @@ fn transition_shorter_than_point_one_second_is_invalid() {
     assert_invalid(patch_clips(&mut p, &ids(&["v"]), &patch));
 }
 
+/// `mixed_project` with "v" moved to 2 s and a video clip "prev" (0..2 s) before it on the same
+/// track, so a transition on "v" has the neighbour it needs.
+fn project_with_video_predecessor() -> Project {
+    let mut p = mixed_project();
+    let vv = tid(&p, TrackKind::Video, 0);
+    p.clip_mut("v").expect("v").start = secs(2);
+    p.clips.push(video_clip("prev", &vv, secs(0), secs(2)));
+    p
+}
+
 #[test]
 fn transition_of_exactly_point_one_second_is_accepted() {
-    let mut p = mixed_project();
+    let mut p = project_with_video_predecessor();
     let t = Transition {
         kind: TransitionKind::DipToWhite,
         duration: Tick(25_401_600_000),
@@ -248,11 +258,31 @@ fn transition_of_exactly_point_one_second_is_accepted() {
 }
 
 #[test]
-fn transition_longer_than_the_clip_is_invalid() {
+fn transition_longer_than_the_clip_is_clamped_to_the_clip() {
     let mut p = Project::new("t");
     let vv = tid(&p, TrackKind::Video, 0);
+    p.clips.push(video_clip("prev", &vv, secs(0), secs(1)));
     p.clips
-        .push(video_clip("v", &vv, secs(0), Tick::from_ms(500)));
+        .push(video_clip("v", &vv, secs(1), Tick::from_ms(500)));
+    let t = Transition {
+        kind: TransitionKind::Crossfade,
+        duration: secs(1),
+    };
+    let patch = ClipPatch {
+        transition_in: Some(Some(t)),
+        ..ClipPatch::default()
+    };
+    patch_clips(&mut p, &ids(&["v"]), &patch).expect("clamped, not refused");
+    assert_eq!(
+        clip_ref(&p, "v").transition_in.map(|t| t.duration),
+        Some(Tick::from_ms(500))
+    );
+}
+
+#[test]
+fn transition_without_an_adjacent_clip_before_it_is_invalid_and_nothing_changes() {
+    // "v" starts at 0 with nothing before it.
+    let mut p = mixed_project();
     let t = Transition {
         kind: TransitionKind::Crossfade,
         duration: secs(1),
@@ -262,11 +292,25 @@ fn transition_longer_than_the_clip_is_invalid() {
         ..ClipPatch::default()
     };
     assert_invalid(patch_clips(&mut p, &ids(&["v"]), &patch));
+    assert_eq!(clip_ref(&p, "v").transition_in, None);
+
+    // A gap before the clip (predecessor ends at 2 s, "v" starts at 3 s) is not adjacent either.
+    let mut gap = project_with_video_predecessor();
+    gap.clip_mut("v").expect("v").start = secs(3);
+    assert_invalid(patch_clips(&mut gap, &ids(&["v"]), &patch));
+    assert_eq!(clip_ref(&gap, "v").transition_in, None);
+
+    // Clearing a transition never needs a neighbour.
+    let clear = ClipPatch {
+        transition_in: Some(None),
+        ..ClipPatch::default()
+    };
+    patch_clips(&mut p, &ids(&["v"]), &clear).expect("clear ok");
 }
 
 #[test]
 fn transition_in_null_clears_an_existing_transition() {
-    let mut p = mixed_project();
+    let mut p = project_with_video_predecessor();
     let t = Transition {
         kind: TransitionKind::Crossfade,
         duration: secs(1),

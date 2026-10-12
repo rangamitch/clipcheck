@@ -16,7 +16,7 @@ use crate::model::{
     new_id, Clip, ClipAudio, ClipKind, Group, MediaKind, MediaRef, Project, Track, TrackKind,
 };
 use crate::ops_group::expand_selection;
-use crate::ops_range::slice_env;
+use crate::ops_range::{slice_env, tidy};
 use crate::time::{Tick, MAX_PROJECT_TICKS, MAX_TICK};
 
 /// Most video tracks a project may hold.
@@ -810,6 +810,8 @@ fn cut_tracks(p: &mut Project, tracks: &[String], from: Tick, to: Tick) {
 
 /// Lets the clips in `incoming` overwrite what is under them, the way an overwrite edit does, and
 /// adds the group copies that split pieces need to `p.groups`. See [`overwrite_under_groups`].
+/// Afterwards [`tidy`] drops links left with fewer than two clips and groups left with no members
+/// (a fully covered clip may have been the only other member of its link or group).
 pub(crate) fn overwrite_project(p: &mut Project, incoming: &[String]) {
     let mut new_groups: Vec<Group> = Vec::new();
     p.clips = overwrite_under_groups(
@@ -819,6 +821,7 @@ pub(crate) fn overwrite_project(p: &mut Project, incoming: &[String]) {
         &mut new_groups,
     );
     p.groups.extend(new_groups);
+    tidy(p);
 }
 
 /// [`overwrite_under_groups`] for callers that cannot add groups (no group copies are made, so

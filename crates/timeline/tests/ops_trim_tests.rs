@@ -271,7 +271,7 @@ fn trim_fade_out_shrinks_when_fades_exceed_length() {
 }
 
 #[test]
-fn trim_drops_envelope_points_at_or_after_new_end() {
+fn trim_drops_envelope_points_after_new_end_and_keeps_the_level_there() {
     let mut p = ab_project();
     p.clip_mut("a").expect("a").audio.envelope = vec![
         EnvPoint { t: s(1), db: -3.0 },
@@ -283,8 +283,97 @@ fn trim_drops_envelope_points_at_or_after_new_end() {
     ];
     trim_edge(&mut p, "a", Edge::End, s(2), false).expect("trim ok");
     let env = get(&p, "a").audio.envelope;
-    assert_eq!(env.len(), 1);
-    assert_eq!(env[0].t, s(1));
+    assert!(env.iter().all(|e| e.t <= s(2)), "nothing past the end");
+    let last = env.last().expect("envelope kept");
+    assert_eq!(last.t, s(2));
+    assert!((last.db + 6.0).abs() < 1e-9, "level at the end is -6 dB");
+}
+
+/// An audio clip on A1 at `start` (media m1, source from 0).
+fn audio_on_a1(p: &Project, id: &str, start: Tick, dur: Tick, src_in: Tick) -> Clip {
+    audio(p, id, "A1", start, dur, src_in)
+}
+
+/// Zig-zag envelope (-3 dB, -9 dB alternating every 70 ms) with `n` points, so no point is
+/// close to the line through its neighbours.
+fn zigzag(n: i64) -> Vec<EnvPoint> {
+    (0..n)
+        .map(|k| EnvPoint {
+            t: ms(k * 70),
+            db: if k % 2 == 0 { -3.0 } else { -9.0 },
+        })
+        .collect()
+}
+
+#[test]
+fn shortening_an_end_keeps_the_interpolated_level_at_the_new_end() {
+    // Envelope -20 dB at 0 rising to 0 dB at 10 s. Trimmed to 5 s the end is -10 dB, not the
+    // -20 dB held from the last point that survived.
+    let mut p = project();
+    let x = audio_on_a1(&p, "x", s(0), s(10), s(0));
+    p.clips.push(x);
+    p.clip_mut("x").expect("x").audio.envelope = vec![
+        EnvPoint { t: s(0), db: -20.0 },
+        EnvPoint { t: s(10), db: 0.0 },
+    ];
+    trim_edge(&mut p, "x", Edge::End, s(5), false).expect("trim ok");
+    let env = get(&p, "x").audio.envelope;
+    let last = env.last().expect("envelope kept");
+    assert_eq!(last.t, s(5));
+    assert!((last.db + 10.0).abs() < 1e-9, "got {} dB", last.db);
+}
+
+#[test]
+fn roll_shortening_the_left_clip_keeps_the_interpolated_end_level() {
+    let mut p = project();
+    let mut x = audio_on_a1(&p, "x", s(0), s(10), s(0));
+    x.audio.envelope = vec![
+        EnvPoint { t: s(0), db: -20.0 },
+        EnvPoint { t: s(10), db: 0.0 },
+    ];
+    let y = audio_on_a1(&p, "y", s(10), s(5), s(5));
+    p.clips.push(x);
+    p.clips.push(y);
+    roll_edit(&mut p, "x", "y", s(5)).expect("roll ok");
+    let env = get(&p, "x").audio.envelope;
+    let last = env.last().expect("envelope kept");
+    assert_eq!(last.t, s(5));
+    assert!((last.db + 10.0).abs() < 1e-9, "got {} dB", last.db);
+}
+
+#[test]
+fn slide_shortening_the_left_neighbour_keeps_the_interpolated_end_level() {
+    let mut p = project();
+    let mut x = audio_on_a1(&p, "x", s(0), s(10), s(0));
+    x.audio.envelope = vec![
+        EnvPoint { t: s(0), db: -20.0 },
+        EnvPoint { t: s(10), db: 0.0 },
+    ];
+    let y = audio_on_a1(&p, "y", s(10), s(5), s(5));
+    p.clips.push(x);
+    p.clips.push(y);
+    slide(&mut p, "y", s(-5)).expect("slide ok");
+    let env = get(&p, "x").audio.envelope;
+    let last = env.last().expect("envelope kept");
+    assert_eq!(get(&p, "x").dur, s(5));
+    assert_eq!(last.t, s(5));
+    assert!((last.db + 10.0).abs() < 1e-9, "got {} dB", last.db);
+}
+
+#[test]
+fn join_caps_the_envelope_at_64_points_and_keeps_the_ends() {
+    let mut p = project();
+    let mut l = audio_on_a1(&p, "l", s(0), s(5), s(0));
+    l.audio.envelope = zigzag(64);
+    let mut r = audio_on_a1(&p, "r", s(5), s(5), s(5));
+    r.audio.envelope = zigzag(64);
+    p.clips.push(l);
+    p.clips.push(r);
+    join_through_edit(&mut p, "l", "r").expect("join ok");
+    let env = get(&p, "l").audio.envelope;
+    assert_eq!(env.len(), 64, "capped at MAX_ENV_POINTS");
+    assert_eq!(env.first().map(|e| e.t), Some(Tick::ZERO));
+    assert_eq!(env.last().map(|e| e.t), Some(s(5) + ms(63 * 70)));
 }
 
 #[test]

@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::error::{EditError, EditResult};
 use crate::model::{new_id, Clip, ClipKind, EnvPoint, Group, Project, TrackKind};
 use crate::ops_basic::PlaceMode;
+use crate::ops_props::MAX_ENV_POINTS;
 use crate::time::{Tick, MAX_PROJECT_TICKS, MAX_TICK};
 
 /// Pastes clip copies (the clipboard) so the earliest starts at `at`. Clips go onto their original
@@ -559,7 +560,7 @@ fn check(p: &Project) -> EditResult<()> {
 }
 
 /// Drops link ids held by fewer than two clips and groups with no members.
-fn tidy(q: &mut Project) {
+pub(crate) fn tidy(q: &mut Project) {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     for c in &q.clips {
         if let Some(l) = &c.link_id {
@@ -748,7 +749,8 @@ fn env_db_at(points: &[EnvPoint], t: Tick) -> f64 {
 }
 
 /// Envelope points for the window `from..to` of a clip, re-based so the window starts at zero.
-/// Boundary points are interpolated. An empty envelope stays empty.
+/// Boundary points are interpolated. An empty envelope stays empty. The result is capped (see
+/// [`cap_env`]).
 pub(crate) fn slice_env(points: &[EnvPoint], from: Tick, to: Tick) -> Vec<EnvPoint> {
     if points.is_empty() || to <= from {
         return Vec::new();
@@ -769,5 +771,53 @@ pub(crate) fn slice_env(points: &[EnvPoint], from: Tick, to: Tick) -> Vec<EnvPoi
         t: to - from,
         db: env_db_at(points, to),
     });
-    out
+    cap_env(out)
+}
+
+/// Limits an envelope to [`MAX_ENV_POINTS`] points, which repeated splits and joins can exceed.
+/// Interior points that lie within 0.05 dB of the straight line between their neighbours go
+/// first (the line is taken to the next point as it was before thinning, so the error stays
+/// small). If the count is still too high, interior points are kept at even spacing. The first
+/// and last points always stay, and the result is sorted by time as the input was.
+pub(crate) fn cap_env(points: Vec<EnvPoint>) -> Vec<EnvPoint> {
+    if points.len() <= MAX_ENV_POINTS {
+        return points;
+    }
+    let last_index = points.len() - 1;
+    let mut thinned: Vec<EnvPoint> = Vec::with_capacity(points.len());
+    for (i, pt) in points.iter().enumerate() {
+        let interior = i != 0 && i != last_index;
+        if interior {
+            if let (Some(prev), Some(next)) = (thinned.last(), points.get(i + 1)) {
+                if on_line(prev, pt, next) {
+                    continue;
+                }
+            }
+        }
+        thinned.push(*pt);
+    }
+    if thinned.len() <= MAX_ENV_POINTS {
+        return thinned;
+    }
+    // Even spacing over `thinned` (which has more than MAX_ENV_POINTS points, so the steps are
+    // more than one index and the rounded indices are distinct).
+    let steps = MAX_ENV_POINTS - 1;
+    let span = thinned.len() - 1;
+    (0..MAX_ENV_POINTS)
+        .filter_map(|k| {
+            let idx = ((k * span) as f64 / steps as f64).round() as usize;
+            thinned.get(idx).copied()
+        })
+        .collect()
+}
+
+/// True when `mid` lies within 0.05 dB of the line from `a` to `b`, interpolated by time.
+fn on_line(a: &EnvPoint, mid: &EnvPoint, b: &EnvPoint) -> bool {
+    let span = (b.t.0 - a.t.0) as f64;
+    if span <= 0.0 {
+        return false;
+    }
+    let f = (mid.t.0 - a.t.0) as f64 / span;
+    let line_db = a.db + (b.db - a.db) * f;
+    (mid.db - line_db).abs() <= 0.05
 }

@@ -21,7 +21,7 @@ const MAX_VIDEO_TRACKS: usize = 6;
 /// Most audio tracks a project may hold.
 const MAX_AUDIO_TRACKS: usize = 8;
 /// Most envelope points one clip may be given.
-const MAX_ENV_POINTS: usize = 64;
+pub(crate) const MAX_ENV_POINTS: usize = 64;
 /// Longest marker label, in characters.
 const MAX_MARKER_LABEL: usize = 80;
 /// Longest title text, in characters.
@@ -120,6 +120,7 @@ pub fn patch_clips(p: &mut Project, ids: &[String], patch: &ClipPatch) -> EditRe
         };
         ensure_unlocked(p, &clip.track_id)?;
         check_clip_accepts(clip, patch)?;
+        check_transition_neighbour(p, clip, patch)?;
     }
     for &i in &targets {
         if let Some(clip) = p.clips.get_mut(i) {
@@ -131,7 +132,8 @@ pub fn patch_clips(p: &mut Project, ids: &[String], patch: &ClipPatch) -> EditRe
 
 /// Replaces an audio clip's volume envelope (points sorted, de-duplicated by time, clamped to
 /// -60..=12 dB, at most 64 points). Points before the start or at/after the end (`t >= dur`) are
-/// dropped, the same rule `clamp_fades` applies to a trimmed clip.
+/// dropped. (A trimmed clip keeps a point exactly at its new end, see `clamp_fades`; this setter
+/// is stricter because a user-set point at the end has no meaning.)
 pub fn set_envelope(p: &mut Project, clip_id: &str, points: Vec<EnvPoint>) -> EditResult<()> {
     let i = clip_index(p, clip_id)?;
     let Some(clip) = p.clips.get(i) else {
@@ -858,14 +860,46 @@ fn check_clip_accepts(clip: &Clip, patch: &ClipPatch) -> EditResult<()> {
         }
     }
     if let Some(Some(t)) = &patch.transition_in {
-        if t.duration > clip.dur {
+        // A transition longer than its clip is clamped to the clip (see `clamp_transition`); only a
+        // clip too short to hold even the minimum transition is refused.
+        if clamp_transition(t, clip.dur).duration < MIN_TRANSITION {
             return Err(EditError::Invalid(format!(
-                "transition_in is longer than clip {}",
+                "clip {} is too short for a transition (0.1 s minimum)",
                 clip.id
             )));
         }
     }
     Ok(())
+}
+
+/// Refuses a transition on a clip with no clip before it on the same track. The test is the one
+/// `normalise_transitions` applies (a neighbour ending within one tick of the clip's start); without
+/// it the transition would be erased after the edit while the edit still reported success.
+/// Clearing a transition (`Some(None)`) and patches without one always pass.
+fn check_transition_neighbour(p: &Project, clip: &Clip, patch: &ClipPatch) -> EditResult<()> {
+    if !matches!(patch.transition_in, Some(Some(_))) {
+        return Ok(());
+    }
+    let has_predecessor = p.clips.iter().any(|o| {
+        o.id != clip.id
+            && o.track_id == clip.track_id
+            && (-1..=1).contains(&o.end().0.saturating_sub(clip.start.0))
+    });
+    if has_predecessor {
+        Ok(())
+    } else {
+        Err(EditError::Invalid(
+            "a transition needs an adjacent clip before it on the same track".to_string(),
+        ))
+    }
+}
+
+/// `t` with its length clamped to `dur`, so a transition never outlasts its clip.
+fn clamp_transition(t: &Transition, dur: Tick) -> Transition {
+    Transition {
+        kind: t.kind,
+        duration: Tick(t.duration.0.min(dur.0)),
+    }
 }
 
 /// Writes a validated patch into a clip. Only call after `check_clip_accepts` passed.
@@ -909,8 +943,9 @@ fn apply_clip_patch(clip: &mut Clip, patch: &ClipPatch) {
     if let Some(c) = patch.fade_curve {
         clip.audio.fade_curve = c;
     }
-    if let Some(tr) = patch.transition_in {
-        clip.transition_in = tr;
+    if let Some(tr) = &patch.transition_in {
+        let dur = clip.dur;
+        clip.transition_in = tr.as_ref().map(|t| clamp_transition(t, dur));
     }
     if let Some(t) = &patch.text {
         clip.text = Some(t.clone());
