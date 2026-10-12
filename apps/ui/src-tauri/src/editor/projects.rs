@@ -523,8 +523,12 @@ pub fn editor_save_project(state: State<'_, EditorState>) -> Result<(), String> 
     session.project.modified_ms = now_ms();
     let path = ccproj_path(&session.project.id)?;
     write_atomic(&path, &json::to_json(&session.project))?;
-    remove_if_exists(&autosave_path(&session.project.id)?)?;
     session.mark_saved();
+    // The project is saved; a leftover autosave is only a stale recovery copy, so a failed delete
+    // is logged rather than reported as a failed save.
+    if let Err(e) = autosave_path(&session.project.id).and_then(|p| remove_if_exists(&p)) {
+        eprintln!("could not remove the autosave after saving: {e}");
+    }
     Ok(())
 }
 

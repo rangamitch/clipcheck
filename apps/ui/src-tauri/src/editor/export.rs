@@ -671,7 +671,7 @@ impl Drop for WorkerGuard {
             inner.worker_running = false;
             let mut changed = false;
             for entry in inner.entries.iter_mut() {
-                if entry.dto.state == JobState::Running {
+                if matches!(entry.dto.state, JobState::Running | JobState::Paused) {
                     entry.dto.state = JobState::Failed;
                     entry.dto.error = Some("The export stopped unexpectedly".to_string());
                     changed = true;

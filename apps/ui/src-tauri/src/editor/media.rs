@@ -3,7 +3,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::UNIX_EPOCH;
@@ -845,6 +844,8 @@ fn thumbnails_blocking(
     // One heavy-job lock for the whole call, not one per frame.
     let _heavy = HeavyIo::enter();
     let mut out = Vec::with_capacity(times_ms.len());
+    let mut decodes = 0usize;
+    let mut decoded_ok = 0usize;
     for &ms in times_ms {
         if !still_open() {
             return Ok(Vec::new());
@@ -858,10 +859,21 @@ fn thumbnails_blocking(
         // One failing time (for example one past the end) leaves an empty slot; the rest still come.
         let disk = dir.join(disk_name(&media.path, meta.len(), mtime, ms, height));
         let cached = fs::metadata(&disk).map(|m| m.len() > 0).unwrap_or(false);
-        let failed = !cached
-            && clipcheck_mfdec::thumbnail_jpeg(path, ms as f64 / 1000.0, width, &disk).is_err();
+        let mut failed = false;
+        if !cached {
+            decodes += 1;
+            if clipcheck_mfdec::thumbnail_jpeg(path, ms as f64 / 1000.0, width, &disk).is_ok() {
+                decoded_ok += 1;
+            } else {
+                failed = true;
+            }
+        }
         if failed {
             let _ = fs::remove_file(&disk);
+            // The decoder cannot handle this source: stop instead of retrying every time.
+            if thumb_decoder_gave_up(decodes, decoded_ok) {
+                return Err("thumbnails unavailable for this media".to_string());
+            }
             out.push(String::new());
             continue;
         }
@@ -888,15 +900,26 @@ fn image_data_uri(path: &Path) -> Result<String, String> {
     Ok(format!("data:{mime};base64,{}", base64_encode(&bytes)))
 }
 
-/// Cache file name for one thumbnail: a hash of the file identity, time and height.
+/// Cache file name for one thumbnail: a hash of the file identity, time and height. Uses FNV-1a
+/// over fixed-width fields, so names stay the same across Rust versions.
 fn disk_name(path: &str, size: u64, mtime: i64, ms: i64, height: u32) -> String {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
-    size.hash(&mut h);
-    mtime.hash(&mut h);
-    ms.hash(&mut h);
-    height.hash(&mut h);
-    format!("{:016x}.jpg", h.finish())
+    let mut buf = path.to_ascii_lowercase().into_bytes();
+    buf.push(0);
+    buf.extend_from_slice(&size.to_le_bytes());
+    buf.extend_from_slice(&mtime.to_le_bytes());
+    buf.extend_from_slice(&ms.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    format!("{:016x}.jpg", fnv1a64(&buf))
+}
+
+/// Frame decodes in one thumbnail call that must all fail (with none succeeding) before the
+/// source is treated as undecodable.
+const THUMB_GIVE_UP_AFTER: usize = 3;
+
+/// True when the decoder should be given up on: `decodes` frame decodes were attempted in this
+/// call, `successes` of them worked, and the first `THUMB_GIVE_UP_AFTER` all failed.
+fn thumb_decoder_gave_up(decodes: usize, successes: usize) -> bool {
+    decodes >= THUMB_GIVE_UP_AFTER && successes == 0
 }
 
 /// Standard base64 with padding.
@@ -1168,6 +1191,29 @@ mod tests {
     fn fnv1a64_matches_reference_vectors() {
         assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn thumb_give_up_after_three_failed_decodes() {
+        assert!(!thumb_decoder_gave_up(0, 0));
+        assert!(!thumb_decoder_gave_up(1, 0));
+        assert!(!thumb_decoder_gave_up(2, 0));
+        assert!(thumb_decoder_gave_up(3, 0));
+        assert!(thumb_decoder_gave_up(4, 0));
+        // A single working frame keeps the source alive.
+        assert!(!thumb_decoder_gave_up(3, 1));
+        assert!(!thumb_decoder_gave_up(5, 2));
+    }
+
+    #[test]
+    fn disk_name_is_stable_and_case_insensitive() {
+        let a = disk_name(r"C:\Clips\A.mp4", 10, 20, 30, 90);
+        assert_eq!(a, disk_name(r"c:\clips\a.mp4", 10, 20, 30, 90));
+        assert_ne!(a, disk_name(r"C:\Clips\A.mp4", 11, 20, 30, 90));
+        assert_ne!(a, disk_name(r"C:\Clips\A.mp4", 10, 20, 31, 90));
+        assert_ne!(a, disk_name(r"C:\Clips\A.mp4", 10, 20, 30, 91));
+        assert!(a.ends_with(".jpg"));
+        assert_eq!(a.len(), 16 + 4);
     }
 
     #[test]
