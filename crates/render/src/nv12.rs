@@ -114,11 +114,12 @@ fn luma_of(r: i32, g: i32, b: i32) -> u8 {
 }
 
 /// Averaged chroma (U, V) of one 2x2 block mean (BT.709, limited range). The coefficients are the
-/// BT.709 Pb/Pr matrix scaled to the 224-level chroma range and by 256: U uses -26, -87, +112
-/// (sum -1, so white reads U = 127, within the +-1 tolerance) and V uses +112, -102, -10 (sum 0).
+/// BT.709 Pb/Pr matrix scaled to the 224-level chroma range and by 256: U uses -26, -86, +112
+/// and V uses +112, -102, -10. Both rows sum to zero, so every neutral grey reads exactly U = V = 128
+/// (white included; the float value is 128 too, so no tolerance is needed).
 #[inline]
 fn uv_of(r: i32, g: i32, b: i32) -> (u8, u8) {
-    let u = (((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+    let u = (((-26 * r - 86 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
     let v = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
     (u, v)
 }
@@ -294,6 +295,15 @@ mod tests {
                 let diff = (f64::from(a) - e.round()).abs();
                 assert!(diff <= 1.0, "{name} channel {k}: got {a}, float {e:.2}");
             }
+        }
+    }
+
+    #[test]
+    fn neutral_greys_have_exact_neutral_chroma() {
+        // Sum-to-zero U and V rows: every grey, white included, must read U = V = 128 exactly.
+        for x in [0u8, 1, 16, 64, 127, 128, 200, 254, 255] {
+            let [_, u, v] = solid_yuv(x, x, x);
+            assert_eq!((u, v), (128, 128), "grey {x}");
         }
     }
 

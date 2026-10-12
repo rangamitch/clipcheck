@@ -278,8 +278,9 @@ fn export_video(
     } else {
         (0.0, 100.0)
     };
-    // Progress budget: a target-size job may run up to MAX_RETRIES + 1 passes, a single pass
-    // otherwise. The budget is fixed so the bar never moves backwards when a retry is added.
+    // Progress budget: a target-size job may run up to MAX_RETRIES + 1 passes (the first pass
+    // gets most of the bar, see `pass_span`), a single pass otherwise. The budget is fixed so the
+    // bar never moves backwards when a retry is added.
     let budget: u32 = if target_bytes.is_some() {
         MAX_RETRIES + 1
     } else {
@@ -745,7 +746,7 @@ fn encode_pass(
 }
 
 /// Maps one pass's own progress (0..=100) into the overall job percent: the job is
-/// `offset..offset+span` percent, split evenly across a budget of `budget` passes.
+/// `offset..offset+span` percent, divided among the passes by `pass_span`.
 #[derive(Debug, Clone, Copy)]
 struct ProgressMap {
     offset: f32,
@@ -756,13 +757,28 @@ struct ProgressMap {
     budget: u32,
 }
 
+/// Share of the job, in percent (0..=100), that pass `attempt` covers. A single-pass job uses the
+/// whole bar. A target-size job gives its first pass 0..70 (most jobs finish in one pass) and the
+/// retries 70..90 and 90..100. The spans are contiguous, so the bar never moves backwards.
+fn pass_span(attempt: u32, budget: u32) -> (f32, f32) {
+    if budget <= 1 {
+        return (0.0, 100.0);
+    }
+    match attempt {
+        0 => (0.0, 70.0),
+        1 => (70.0, 90.0),
+        _ => (90.0, 100.0),
+    }
+}
+
 impl ProgressMap {
     /// Overall percent (0..=100) for a pass percent `pass` (0..=100). Non-decreasing in both
-    /// `attempt` and `pass`, because a pass ends at `(attempt + 1) / budget` and the next starts there.
+    /// `attempt` and `pass`, because each pass span starts where the previous one ended.
     fn apply(&self, pass: f32) -> f32 {
-        let frac = (f64::from(self.attempt) + f64::from(pass.clamp(0.0, 100.0)) / 100.0)
-            / f64::from(self.budget.max(1));
-        (self.offset + self.span * frac.min(1.0) as f32).clamp(0.0, 100.0)
+        let (lo, hi) = pass_span(self.attempt, self.budget);
+        let t = pass.clamp(0.0, 100.0);
+        let job = lo + (hi - lo) * t / 100.0;
+        (self.offset + self.span * job / 100.0).clamp(0.0, 100.0)
     }
 }
 
@@ -1300,4 +1316,62 @@ fn mp4_err(e: clipcheck_mp4::Mp4Error) -> RenderError {
 /// Maps a file-system error.
 fn io_out(context: &str, e: std::io::Error) -> RenderError {
     RenderError::Output(format!("{context}: {e}"))
+}
+
+#[cfg(test)]
+mod progress_map_tests {
+    use super::*;
+
+    fn map(offset: f32, span: f32, attempt: u32, budget: u32) -> ProgressMap {
+        ProgressMap {
+            offset,
+            span,
+            attempt,
+            budget,
+        }
+    }
+
+    #[test]
+    fn single_pass_job_spans_whole_bar() {
+        let m = map(0.0, 100.0, 0, 1);
+        assert_eq!(m.apply(0.0), 0.0);
+        assert_eq!(m.apply(50.0), 50.0);
+        assert_eq!(m.apply(100.0), 100.0);
+    }
+
+    #[test]
+    fn single_pass_job_respects_loudness_offset() {
+        // With loudness normalisation the encode gets `offset..100`.
+        let m = map(20.0, 80.0, 0, 1);
+        assert_eq!(m.apply(0.0), 20.0);
+        assert_eq!(m.apply(100.0), 100.0);
+    }
+
+    #[test]
+    fn first_pass_of_target_job_gets_most_of_the_bar() {
+        let m = map(0.0, 100.0, 0, 3);
+        assert_eq!(m.apply(50.0), 35.0);
+        assert_eq!(m.apply(100.0), 70.0);
+    }
+
+    #[test]
+    fn retries_split_the_remainder() {
+        assert_eq!(map(0.0, 100.0, 1, 3).apply(0.0), 70.0);
+        assert_eq!(map(0.0, 100.0, 1, 3).apply(100.0), 90.0);
+        assert_eq!(map(0.0, 100.0, 2, 3).apply(0.0), 90.0);
+        assert_eq!(map(0.0, 100.0, 2, 3).apply(100.0), 100.0);
+    }
+
+    #[test]
+    fn progress_is_monotone_across_passes_and_ends_at_100() {
+        let mut last = -1.0_f32;
+        for attempt in 0..3 {
+            for step in 0..=100 {
+                let p = map(0.0, 100.0, attempt, 3).apply(step as f32);
+                assert!(p >= last, "went back: {last} -> {p} at {attempt}/{step}");
+                last = p;
+            }
+        }
+        assert_eq!(last, 100.0);
+    }
 }
