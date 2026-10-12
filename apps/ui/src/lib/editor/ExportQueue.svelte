@@ -102,6 +102,11 @@
     void run(() => editorApi.exportReorder(job.id, target));
   }
 
+  /** Opens the finished export in the default player. */
+  function play(job: JobDto): void {
+    void run(() => editorApi.openExport(job.outPath));
+  }
+
   /** Shows the output file selected in Explorer, or its folder when it is not in the library. */
   function showInFolder(job: JobDto): void {
     const id = job.recordingId;
@@ -266,6 +271,15 @@
             {/if}
 
             {#if job.state === 'done'}
+              <button
+                type="button"
+                class="btn"
+                aria-label="Play {fileName(job.outPath)}"
+                onclick={() => play(job)}
+              >
+                Play
+              </button>
+
               <button
                 type="button"
                 class="btn"

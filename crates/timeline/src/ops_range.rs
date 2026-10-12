@@ -15,6 +15,10 @@ use crate::time::{Tick, MAX_PROJECT_TICKS, MAX_TICK};
 /// Pastes clip copies (the clipboard) so the earliest starts at `at`. Clips go onto their original
 /// track when it still exists, else `track_id`, else the first track of the right kind. Mode
 /// semantics as in [`place_media`] (Overwrite or Insert). Returns the new ids.
+///
+/// `Append` anchors on the pasted clips' own target tracks, as [`place_media`] does: the end of the
+/// video target tracks when the paste holds any non-audio clip (audio lanes are not consulted),
+/// otherwise the end of the first audio target track. See [`append_anchor`].
 pub fn paste_clips(
     p: &mut Project,
     clips: &[Clip],
@@ -50,10 +54,7 @@ pub fn paste_clips(
     // Append lands after the last clip of the affected tracks; Insert and Overwrite use `at`.
     let insert = mode != PlaceMode::Overwrite;
     let anchor = if mode == PlaceMode::Append {
-        uniq.iter()
-            .map(|t| track_end(p, t))
-            .max()
-            .unwrap_or(Tick::ZERO)
+        append_anchor(p, clips, &targets)
     } else {
         at
     };
@@ -375,6 +376,29 @@ fn track_end(p: &Project, track_id: &str) -> Tick {
         .map(Clip::end)
         .max()
         .unwrap_or(Tick::ZERO)
+}
+
+/// Start for an `Append` paste. `targets[i]` is the track chosen for `clips[i]`. When any pasted
+/// clip goes on a video track, the anchor is the end of the latest video target track (audio
+/// lanes are not consulted). An audio-only paste anchors on the end of the first audio target.
+/// Like `place_media`, an occupied lane is refused by the overlap check, never shifted around.
+fn append_anchor(p: &Project, clips: &[Clip], targets: &[String]) -> Tick {
+    let video_targets: Vec<&str> = clips
+        .iter()
+        .zip(targets.iter())
+        .filter(|(c, _)| clip_track_kind(c.kind) == TrackKind::Video)
+        .map(|(_, t)| t.as_str())
+        .collect();
+    if !video_targets.is_empty() {
+        return video_targets
+            .iter()
+            .map(|t| track_end(p, t))
+            .max()
+            .unwrap_or(Tick::ZERO);
+    }
+    targets
+        .first()
+        .map_or(Tick::ZERO, |t| track_end(p, t.as_str()))
 }
 
 /// Chooses the track for a pasted clip: its own track, then `wanted`, then the first unlocked

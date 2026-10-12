@@ -260,8 +260,10 @@
 
   function onEditClick() {
     if (!ready) return;
+    // Read the id first: closing the menu can unmount this component, after which props are undefined.
+    const recordingId = id;
     closeMenu(false);
-    editInEditor(id);
+    editInEditor(recordingId);
   }
 
   function onRevealClick() {

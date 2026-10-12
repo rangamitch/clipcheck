@@ -196,6 +196,10 @@ pub fn slide(p: &mut Project, clip_id: &str, delta: Tick) -> EditResult<()> {
 /// source range (so `dur` becomes `src_len / speed`). With `ripple`, later clips on each affected
 /// track shift by the length change; without, the call fails with Overlap if the clip would run
 /// into its right neighbour. Envelope point times and fade lengths are rescaled/clamped.
+///
+/// Fades scale with the timeline length. After scaling, `fade_in + fade_out` is clamped to the new
+/// `dur` by shrinking both fades by the same factor (see [`clamp_fade_pair`]), not by cutting only
+/// the fade-out as [`clamp_fades`] does.
 pub fn set_speed(p: &mut Project, clip_id: &str, speed: f64, ripple: bool) -> EditResult<()> {
     if !speed.is_finite() || !(0.1..=8.0).contains(&speed) {
         return Err(EditError::Invalid(
@@ -232,8 +236,13 @@ pub fn set_speed(p: &mut Project, clip_id: &str, speed: f64, ripple: bool) -> Ed
         let mut nc = c.clone();
         nc.speed = speed;
         nc.dur = new_dur;
-        nc.audio.fade_in = scale_tick(c.audio.fade_in, ratio);
-        nc.audio.fade_out = scale_tick(c.audio.fade_out, ratio);
+        let (fi, fo) = clamp_fade_pair(
+            scale_tick(c.audio.fade_in, ratio),
+            scale_tick(c.audio.fade_out, ratio),
+            new_dur,
+        );
+        nc.audio.fade_in = fi;
+        nc.audio.fade_out = fo;
         for e in nc.audio.envelope.iter_mut() {
             e.t = scale_tick(e.t, ratio);
         }
@@ -496,6 +505,23 @@ fn clamp_fades(c: &mut Clip) {
     c.audio.fade_in = fi;
     c.audio.fade_out = fo;
     c.audio.envelope.retain(|e| e.t < dur);
+}
+
+/// Fits two fades into a clip of length `dur`: each is clamped to `0..=dur`, and when their sum
+/// exceeds `dur` both shrink by the same factor (fade-out is then capped at what is left after
+/// fade-in, so rounding can never push the sum past `dur`).
+fn clamp_fade_pair(fi: Tick, fo: Tick, dur: Tick) -> (Tick, Tick) {
+    let fi = fi.max(Tick::ZERO);
+    let fo = fo.max(Tick::ZERO);
+    let sum = fi.saturating_add(fo);
+    if sum <= dur {
+        return (fi, fo);
+    }
+    // sum > dur >= 0, so sum is positive and the factor is finite.
+    let factor = dur.0 as f64 / sum.0 as f64;
+    let new_fi = scale_tick(fi, factor).min(dur);
+    let new_fo = scale_tick(fo, factor).min(dur.saturating_sub(new_fi));
+    (new_fi.max(Tick::ZERO), new_fo.max(Tick::ZERO))
 }
 
 /// Validates a replacement clip (same id) and writes it into the project. Refuses locked tracks,

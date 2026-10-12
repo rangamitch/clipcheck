@@ -18,6 +18,7 @@
   import SourceMonitor from './SourceMonitor.svelte';
   import Timeline from './Timeline.svelte';
   import Toolbar from './Toolbar.svelte';
+  import ToolRail from './ToolRail.svelte';
   import { ACTIONS, resolveShortcut, type ActionId } from './shortcuts';
   import { closeEditor, dispatch, openSnapshot, playing, snapshot, startAutosave, stopAutosave } from './store';
   import { msToTick } from './ticks';
@@ -56,6 +57,8 @@
   const FALLBACK_AUTOSAVE_S = 60;
   /** Width of the track header column in the timeline, excluded from the zoom-to-fit width. */
   const HEADER_W = 140;
+  /** Width of the tool rail left of the timeline, excluded from the zoom-to-fit width. */
+  const RAIL_W = 32;
   /** What leaving the editor does to the backend session: keep it, close it, or discard it. */
   type LeaveAction = 'keep' | 'close' | 'discard';
   /** Shortcuts that may repeat while a key is held. */
@@ -87,10 +90,10 @@
 
   /** Height of the editor root, used to turn vertical drags into a fraction. */
   let rootHeight = $state(0);
-  /** Width of the timeline area, including the track headers. */
+  /** Width of the timeline cell, including the tool rail and the track headers. */
   let timelineWidth = $state(0);
-  /** Width of the track rows only (the timeline minus the header column), used by zoom to fit. */
-  const trackViewWidth = $derived(timelineWidth > HEADER_W ? timelineWidth - HEADER_W : 0);
+  /** Width of the track rows only (the cell minus the tool rail and the header column), used by zoom to fit. */
+  const trackViewWidth = $derived(Math.max(0, timelineWidth - RAIL_W - HEADER_W));
 
   /** Clamps `v` into `lo..hi`. */
   function clamp(v: number, lo: number, hi: number): number {
@@ -491,7 +494,10 @@
       ></div>
 
       <div class="timeline" bind:clientWidth={timelineWidth}>
-        <Timeline />
+        <ToolRail />
+        <div class="timeline-main">
+          <Timeline />
+        </div>
       </div>
     </div>
   {/if}
@@ -643,11 +649,18 @@
 
   .timeline {
     grid-area: timeline;
+    display: flex;
     min-width: 0;
     min-height: 0;
     overflow: hidden;
     background: var(--bg);
     border-top: 1px solid var(--border);
+  }
+
+  .timeline-main {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
   }
 
   .bin-splitter {

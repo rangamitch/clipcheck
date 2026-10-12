@@ -205,6 +205,11 @@ export const editorApi = {
     return invoke<void>('editor_export_reorder', { jobId, index });
   },
 
+  /** Opens a finished export in the default player (backend checks the path is in the export folder). */
+  openExport(path: string): Promise<void> {
+    return invoke<void>('editor_open_export', { path });
+  },
+
   /**
    * Exports one still frame at `at` right away and returns its file path. `dir` and
    * `nameTemplate` are optional; null uses the default folder and file name.

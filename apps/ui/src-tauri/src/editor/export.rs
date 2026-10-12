@@ -1379,3 +1379,91 @@ pub fn editor_delete_preset(id: String) -> Result<Vec<Preset>, String> {
     settings::save(&path, &s)?;
     Ok(s.custom_presets)
 }
+
+/// File extensions `editor_open_export` is willing to open (lower case).
+const OPENABLE_EXTS: [&str; 8] = ["mp4", "mov", "mkv", "webm", "m4a", "png", "jpg", "jpeg"];
+
+/// Win32 `SW_SHOWNORMAL` show command.
+const SW_SHOWNORMAL: i32 = 1;
+
+// Declared directly so no extra `windows` crate feature is needed (ShellExecuteW lives behind
+// Win32_UI_WindowsAndMessaging, which the crate does not enable).
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        hwnd: isize,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+    ) -> isize;
+}
+
+/// Opens an exported file in the user's default player (or viewer for stills). Only files that
+/// exist, have a video, audio or image extension, and lie inside the export folder (the default
+/// one or the last export folder chosen) are opened.
+#[tauri::command]
+pub async fn editor_open_export(
+    client: State<'_, Arc<DaemonClient>>,
+    path: String,
+) -> Result<(), String> {
+    let daemon = Arc::clone(&*client);
+    blocking(move || {
+        use std::os::windows::ffi::OsStrExt;
+
+        let requested = PathBuf::from(path.trim());
+        let file = fs::canonicalize(&requested)
+            .map_err(|_| format!("The export file is missing: {}", requested.display()))?;
+        if !file.is_file() {
+            return Err(format!("The export file is missing: {}", file.display()));
+        }
+        let ext = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_default();
+        if !OPENABLE_EXTS.contains(&ext.as_str()) {
+            return Err("Only video, audio and image exports can be opened".to_string());
+        }
+
+        let ed = settings::load(&settings::settings_path());
+        let last_dir = ed.last_export_dir.trim();
+        let mut roots = vec![default_export_dir(Some(&*daemon))];
+        if !last_dir.is_empty() {
+            roots.push(PathBuf::from(expand_vars(last_dir)));
+        }
+        let inside = roots
+            .iter()
+            .filter_map(|root| fs::canonicalize(root).ok())
+            .any(|root| file.starts_with(&root));
+        if !inside {
+            return Err("That file is not in the export folder".to_string());
+        }
+
+        let op: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = file
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: every pointer is a NUL-terminated UTF-16 buffer that outlives the call; null
+        // parameters and directory are allowed for the "open" verb.
+        let code = unsafe {
+            ShellExecuteW(
+                0,
+                op.as_ptr(),
+                wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if code > 32 {
+            Ok(())
+        } else {
+            Err(format!("Windows could not open the file (code {code})"))
+        }
+    })
+    .await
+}

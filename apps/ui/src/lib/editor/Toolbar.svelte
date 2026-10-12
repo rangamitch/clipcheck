@@ -1,7 +1,7 @@
 <script lang="ts">
   import { runAction, type ActionContext } from './actions';
   import { ACTIONS } from './shortcuts';
-  import { dispatch, project, selection, snapshot, tool, undo, redo, zoomBy, type EditorTool } from './store';
+  import { dispatch, project, selection, snapshot, undo, redo, zoomBy } from './store';
 
   interface Props {
     /** Opens the export dialog. */
@@ -20,13 +20,6 @@
 
   /** Name being typed, or null when the name input is not focused. */
   let editingName = $state<string | null>(null);
-
-  const TOOLS: { id: EditorTool; label: string; key: string; glyph: string }[] = [
-    { id: 'select', label: 'Selection tool', key: 'V', glyph: 'V' },
-    { id: 'razor', label: 'Razor tool', key: 'C', glyph: 'C' },
-    { id: 'hand', label: 'Hand tool', key: 'H', glyph: 'H' },
-    { id: 'zoom', label: 'Zoom tool', key: 'Z', glyph: 'Z' },
-  ];
 
   /** Context for actions started from buttons. */
   function ctx(): ActionContext {
@@ -123,22 +116,6 @@
     >
       <span aria-hidden="true">&#8631;</span>
     </button>
-  </div>
-
-  <div class="group" role="group" aria-label="Tools">
-    {#each TOOLS as t (t.id)}
-      <button
-        class="btn tool"
-        class:active={$tool === t.id}
-        type="button"
-        aria-label={t.label}
-        aria-pressed={$tool === t.id}
-        title={`${t.label} (${t.key})`}
-        onclick={() => tool.set(t.id)}
-      >
-        {t.glyph}
-      </button>
-    {/each}
   </div>
 
   <div class="group" role="group" aria-label="Editing modes">

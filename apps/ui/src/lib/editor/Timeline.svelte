@@ -824,6 +824,18 @@
     const muteIds = current.clips
       .filter((c) => c.kind === 'audio' && (ids.includes(c.id) || (c.link_id !== null && linkIds.has(c.link_id))))
       .map((c) => c.id);
+    // Only offer what would change something.
+    const sharedOne = (vals: (string | null)[]): boolean =>
+      vals.length > 0 && vals[0] !== null && vals.every((v) => v === vals[0]);
+    const canGroup = clips.length >= 2 && !sharedOne(clips.map((c) => c.group_id));
+    const canUngroup = clips.some((c) => c.group_id !== null);
+    const canLink = clips.length >= 2 && !sharedOne(clips.map((c) => c.link_id));
+    const canUnlink = clips.some((c) => c.link_id !== null);
+    const muteClips = current.clips.filter((c) => muteIds.includes(c.id));
+    const canMute = muteClips.some((c) => !c.audio.muted);
+    const canUnmute = muteClips.some((c) => c.audio.muted);
+    const canEnable = clips.some((c) => !c.enabled);
+    const canDisable = clips.some((c) => c.enabled);
     return [
       {
         label: 'Split at playhead',
@@ -890,6 +902,7 @@
       {
         label: 'Group',
         shortcut: 'Ctrl+G',
+        disabled: !canGroup,
         action: () => {
           void dispatch({ type: 'group_clips', ids });
         },
@@ -897,18 +910,21 @@
       {
         label: 'Ungroup',
         shortcut: 'Ctrl+Shift+G',
+        disabled: !canUngroup,
         action: () => {
           void dispatch({ type: 'ungroup', ids });
         },
       },
       {
         label: 'Link audio and video',
+        disabled: !canLink,
         action: () => {
           void dispatch({ type: 'link_clips', ids });
         },
       },
       {
         label: 'Unlink audio and video',
+        disabled: !canUnlink,
         action: () => {
           void dispatch({ type: 'unlink_clips', ids });
         },
@@ -925,26 +941,28 @@
       },
       {
         label: 'Mute clip',
-        disabled: muteIds.length === 0,
+        disabled: !canMute,
         action: () => {
           void dispatch({ type: 'patch_clips', ids: muteIds, patch: { muted: true } });
         },
       },
       {
         label: 'Unmute clip',
-        disabled: muteIds.length === 0,
+        disabled: !canUnmute,
         action: () => {
           void dispatch({ type: 'patch_clips', ids: muteIds, patch: { muted: false } });
         },
       },
       {
         label: 'Enable clip',
+        disabled: !canEnable,
         action: () => {
           void dispatch({ type: 'patch_clips', ids, patch: { enabled: true } });
         },
       },
       {
         label: 'Disable clip',
+        disabled: !canDisable,
         action: () => {
           void dispatch({ type: 'patch_clips', ids, patch: { enabled: false } });
         },

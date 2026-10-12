@@ -176,6 +176,7 @@ pub fn run() {
             editor::export::editor_export_still,
             editor::export::editor_save_preset,
             editor::export::editor_delete_preset,
+            editor::export::editor_open_export,
             ipc::daemon_connection_error
         ])
         .run(tauri::generate_context!())
