@@ -3,6 +3,7 @@
 //! providers and an encoder sink; tests supply fakes. Owner: worker `render-pipe`.
 //! Types/traits are the final CONTRACT.
 
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use clipcheck_timeline::audiomath::{clip_gain_at, db_to_lin, pan_gains};
@@ -468,7 +469,12 @@ struct VideoStage {
     background: Rgba,
     blur: bool,
     /// Last rendered title. The canvas size is fixed for a run, so the spec alone is the key.
-    title_cache: Option<(TextSpec, Frame)>,
+    title_cache: Option<(TextSpec, Rc<Frame>)>,
+    /// Last solid colour layer, reused while the colour stays the same.
+    solid_cache: Option<(Rgba, Rc<Frame>)>,
+    /// Shared canvas-sized frames, built on first use and reused for every later frame.
+    transparent_frame: Option<Rc<Frame>>,
+    black_frame: Option<Rc<Frame>>,
     warnings: Vec<String>,
 }
 
@@ -482,16 +488,25 @@ impl VideoStage {
             background: canvas.background,
             blur: canvas.blur_background,
             title_cache: None,
+            solid_cache: None,
+            transparent_frame: None,
+            black_frame: None,
             warnings: Vec::new(),
         }
     }
 
-    fn transparent(&self) -> Frame {
-        Frame::solid(self.cw, self.ch, 0, 0, 0, 0)
+    fn transparent(&mut self) -> Rc<Frame> {
+        let (w, h) = (self.cw, self.ch);
+        self.transparent_frame
+            .get_or_insert_with(|| Rc::new(Frame::solid(w, h, 0, 0, 0, 0)))
+            .clone()
     }
 
-    fn black(&self) -> Frame {
-        Frame::solid(self.cw, self.ch, 0, 0, 0, 255)
+    fn black(&mut self) -> Rc<Frame> {
+        let (w, h) = (self.cw, self.ch);
+        self.black_frame
+            .get_or_insert_with(|| Rc::new(Frame::solid(w, h, 0, 0, 0, 255)))
+            .clone()
     }
 
     /// Composes the output frame at timeline time `t` for segment `seg` (None = gap).
@@ -506,7 +521,7 @@ impl VideoStage {
             Some(s) => (s.start, s.video.as_slice()),
             None => (t, &[]),
         };
-        let mut sources: Vec<(Frame, f64)> = Vec::with_capacity(layers.len());
+        let mut sources: Vec<(Rc<Frame>, f64)> = Vec::with_capacity(layers.len());
         let mut dip: Option<(Rgba, f64)> = None;
         for layer in layers {
             let frame = self.layer_frame(layer, seg_start, t, video, titles);
@@ -572,7 +587,7 @@ impl VideoStage {
         t: Tick,
         video: &mut dyn VideoProvider,
         titles: &mut dyn TitleProvider,
-    ) -> Frame {
+    ) -> Rc<Frame> {
         match layer.kind {
             ClipKind::Title => {
                 let Some(spec) = layer.text.as_ref() else {
@@ -585,9 +600,9 @@ impl VideoStage {
                 }
                 match titles.render(spec, self.cw, self.ch) {
                     Ok(frame) => {
-                        let out = frame.clone();
-                        self.title_cache = Some((spec.clone(), frame));
-                        out
+                        let frame = Rc::new(frame);
+                        self.title_cache = Some((spec.clone(), frame.clone()));
+                        frame
                     }
                     Err(_) => {
                         let msg = format!("title {} could not be rendered, skipped", layer.clip_id);
@@ -598,13 +613,20 @@ impl VideoStage {
             }
             ClipKind::Solid => {
                 let c = layer.solid.unwrap_or(Rgba::BLACK);
-                Frame::solid(self.cw, self.ch, c.b, c.g, c.r, c.a)
+                if let Some((cached, frame)) = self.solid_cache.as_ref() {
+                    if *cached == c {
+                        return frame.clone();
+                    }
+                }
+                let frame = Rc::new(Frame::solid(self.cw, self.ch, c.b, c.g, c.r, c.a));
+                self.solid_cache = Some((c, frame.clone()));
+                frame
             }
             ClipKind::Video | ClipKind::Image | ClipKind::Audio => {
                 let mid = layer.media_id.as_deref().unwrap_or("");
                 let st = source_time(layer, seg_start, t);
                 match video.frame_at(mid, st) {
-                    Ok(Some(frame)) => frame,
+                    Ok(Some(frame)) => Rc::new(frame),
                     _ => {
                         let msg = format!("media {mid} unavailable, black used");
                         push_warning(&mut self.warnings, msg);
@@ -639,6 +661,10 @@ struct AudioStage {
     expected: usize,
     /// Segment cursor; block start times are non-decreasing.
     cursor: usize,
+    /// Scratch: one source's samples for the current block (reused across blocks and sources).
+    read_buf: Vec<f32>,
+    /// Scratch for the speed change, which ping-pongs with `read_buf`.
+    tmp_buf: Vec<f32>,
     warnings: Vec<String>,
 }
 
@@ -672,6 +698,8 @@ impl AudioStage {
             loud_lin: db_to_lin(loud_db) as f32,
             expected: usize::try_from(total.max(0)).unwrap_or(0),
             cursor: 0,
+            read_buf: Vec::new(),
+            tmp_buf: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -712,24 +740,82 @@ impl AudioStage {
         };
         let last = self.tracks.len().saturating_sub(1);
         for src in &seg.audio {
+            // A muted clip or a track at -120 dB or below contributes exact silence: neither read
+            // it from the provider nor mix it.
+            if src.audio.muted || db_to_lin(src.track_db) == 0.0 {
+                continue;
+            }
             let idx = if self.mix {
                 0
             } else {
                 (src.track_index as usize).min(last)
             };
-            let mut buf = read_source(
-                src,
-                seg.start,
-                block_t,
-                samples,
-                self.sr,
-                audio,
-                &mut self.warnings,
-            );
-            apply_clip_gain(&mut buf, src, block_t, samples, self.sr);
+            self.read_source(src, seg.start, block_t, samples, audio);
+            apply_clip_gain(&mut self.read_buf, src, block_t, samples, self.sr);
             if let Some(dst) = self.tracks.get_mut(idx) {
-                dsp::mix_into(dst, &buf, 1.0);
+                dsp::mix_into(dst, &self.read_buf, 1.0);
             }
+        }
+    }
+
+    /// Reads one source for a block into `read_buf`: `samples` stereo frames at output speed.
+    /// Handles speed (read `ceil(samples * speed)` source frames then time-stretch), reverse and
+    /// mono. Missing audio gives silence and a warning.
+    fn read_source(
+        &mut self,
+        src: &AudioSource,
+        seg_start: Tick,
+        block_t: Tick,
+        samples: usize,
+        audio: &mut dyn AudioProvider,
+    ) {
+        let speed = if src.speed.is_finite() && src.speed > 0.0 {
+            src.speed
+        } else {
+            1.0
+        };
+        let elapsed = (block_t.0 - seg_start.0) as f64 * speed;
+        let base = src.src_time.0 as f64;
+        let pos0 = if src.reverse {
+            base - elapsed
+        } else {
+            base + elapsed
+        };
+        let need = (samples as f64 * speed).ceil() as usize;
+        // Reverse reads the window that ends at `pos0`, then flips it.
+        let window = need as f64 * TICKS_PER_SECOND as f64 / self.sr as f64;
+        let start = if src.reverse { pos0 - window } else { pos0 };
+
+        let buf = &mut self.read_buf;
+        buf.clear();
+        let read_ok = matches!(
+            audio.read(
+                &src.media_id,
+                src.source_track,
+                Tick(ticks_to_i64(start)),
+                need,
+                self.sr,
+                buf
+            ),
+            Ok(true)
+        );
+        if !read_ok {
+            let msg = format!("media {} audio unavailable, silence used", src.media_id);
+            push_warning(&mut self.warnings, msg);
+            buf.clear();
+        }
+        buf.resize(need * 2, 0.0);
+        if src.reverse {
+            dsp::reverse_frames_in_place(buf, 2);
+        }
+        if (speed - 1.0).abs() > 1e-9 {
+            dsp::change_speed_into(buf.as_slice(), 2, speed, &mut self.tmp_buf);
+            std::mem::swap(&mut self.read_buf, &mut self.tmp_buf);
+        }
+        let buf = &mut self.read_buf;
+        buf.resize(samples * 2, 0.0);
+        if src.audio.mono {
+            dsp::stereo_to_mono_in_place(buf);
         }
     }
 
@@ -743,8 +829,11 @@ impl AudioStage {
             .zip(self.limiters.iter_mut())
             .enumerate()
         {
-            for s in buf.iter_mut() {
-                *s *= loud;
+            // A gain of exactly 1.0 leaves every sample unchanged, so the pass is skipped.
+            if loud != 1.0 {
+                for s in buf.iter_mut() {
+                    *s *= loud;
+                }
             }
             match lim.as_mut() {
                 Some(state) => {
@@ -785,66 +874,6 @@ impl AudioStage {
     }
 }
 
-/// Reads one source for a block: `samples` stereo frames at output speed. Handles speed (read
-/// `ceil(samples * speed)` source frames then time-stretch), reverse and mono. Missing audio
-/// gives silence and a warning.
-fn read_source(
-    src: &AudioSource,
-    seg_start: Tick,
-    block_t: Tick,
-    samples: usize,
-    sr: u32,
-    audio: &mut dyn AudioProvider,
-    warnings: &mut Vec<String>,
-) -> Vec<f32> {
-    let speed = if src.speed.is_finite() && src.speed > 0.0 {
-        src.speed
-    } else {
-        1.0
-    };
-    let elapsed = (block_t.0 - seg_start.0) as f64 * speed;
-    let base = src.src_time.0 as f64;
-    let pos0 = if src.reverse {
-        base - elapsed
-    } else {
-        base + elapsed
-    };
-    let need = (samples as f64 * speed).ceil() as usize;
-    // Reverse reads the window that ends at `pos0`, then flips it.
-    let window = need as f64 * TICKS_PER_SECOND as f64 / sr as f64;
-    let start = if src.reverse { pos0 - window } else { pos0 };
-
-    let mut buf: Vec<f32> = Vec::new();
-    let read_ok = matches!(
-        audio.read(
-            &src.media_id,
-            src.source_track,
-            Tick(ticks_to_i64(start)),
-            need,
-            sr,
-            &mut buf
-        ),
-        Ok(true)
-    );
-    if !read_ok {
-        let msg = format!("media {} audio unavailable, silence used", src.media_id);
-        push_warning(warnings, msg);
-        buf.clear();
-    }
-    buf.resize(need * 2, 0.0);
-    if src.reverse {
-        buf = dsp::reverse_frames(&buf, 2);
-    }
-    if (speed - 1.0).abs() > 1e-9 {
-        buf = dsp::change_speed(&buf, 2, speed);
-    }
-    buf.resize(samples * 2, 0.0);
-    if src.audio.mono {
-        dsp::stereo_to_mono_in_place(&mut buf);
-    }
-    buf
-}
-
 /// Multiplies a block by the clip gain (interpolated between the block ends), the track fader
 /// and the constant-power pan.
 fn apply_clip_gain(buf: &mut [f32], src: &AudioSource, block_t: Tick, samples: usize, sr: u32) {
@@ -854,14 +883,20 @@ fn apply_clip_gain(buf: &mut [f32], src: &AudioSource, block_t: Tick, samples: u
     let g1 = clip_gain_at(&src.audio, src.clip_dur, Tick(rel1));
     let track = db_to_lin(src.track_db);
     let denom = samples.max(1) as f64;
-    for i in 0..samples {
+    let (pl, pr) = pan_gains(src.audio.pan);
+    let (pl, pr) = (pl as f32, pr as f32);
+    // One pass: clip gain then pan, in the same float operation order as two separate passes.
+    for (i, frame) in buf
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .take(samples)
+        .enumerate()
+    {
         let f = i as f64 / denom;
         let g = ((g0 + (g1 - g0) * f) * track) as f32;
-        if let Some([l, r]) = buf.get_mut(2 * i..2 * i + 2) {
-            *l *= g;
-            *r *= g;
-        }
+        let [l, r] = frame;
+        *l = (*l * g) * pl;
+        *r = (*r * g) * pr;
     }
-    let (pl, pr) = pan_gains(src.audio.pan);
-    dsp::apply_stereo_gain(buf, pl as f32, pr as f32);
 }

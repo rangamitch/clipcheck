@@ -117,21 +117,27 @@ pub fn resample(input: &[f32], channels: usize, from: u32, to: u32) -> Vec<f32> 
         return Vec::new();
     };
 
-    let mut work: Vec<f32> = input.iter().take(whole).copied().collect();
-    if to < from {
+    // Only a downsample needs a filtered copy; an upsample interpolates straight from the input.
+    let filtered: Vec<f32>;
+    let work: &[f32] = if to < from {
+        let mut buf: Vec<f32> = input.iter().take(whole).copied().collect();
         let lp = butterworth_lowpass(f64::from(from), 0.45 * f64::from(to));
         let mut filters = vec![lp; channels];
-        for frame in work.chunks_exact_mut(channels) {
+        for frame in buf.chunks_exact_mut(channels) {
             for (f, s) in filters.iter_mut().zip(frame.iter_mut()) {
                 *s = f.process(f64::from(*s)) as f32;
             }
         }
-    }
+        filtered = buf;
+        &filtered
+    } else {
+        input.get(..whole).unwrap_or(input)
+    };
 
     let ratio = f64::from(from) / f64::from(to);
     let mut out = Vec::with_capacity(out_frames * channels);
     for o in 0..out_frames {
-        push_interp(&work, channels, frames, o as f64 * ratio, &mut out);
+        push_interp(work, channels, frames, o as f64 * ratio, &mut out);
     }
     out
 }
@@ -142,26 +148,34 @@ pub fn resample(input: &[f32], channels: usize, from: u32, to: u32) -> Vec<f32> 
 /// Speed `<= 0`, non-finite speed, or `channels == 0` return empty output. Speed 1.0 returns the
 /// input (whole frames only). Positions are linear interpolation at `i * speed`.
 pub fn change_speed(input: &[f32], channels: usize, speed: f64) -> Vec<f32> {
+    let mut out = Vec::new();
+    change_speed_into(input, channels, speed, &mut out);
+    out
+}
+
+/// Same as [`change_speed`], writing into `out` (cleared first) so a caller can reuse its buffer.
+pub fn change_speed_into(input: &[f32], channels: usize, speed: f64, out: &mut Vec<f32>) {
+    out.clear();
     if channels == 0 || !speed.is_finite() || speed <= 0.0 {
-        return Vec::new();
+        return;
     }
     let frames = input.len() / channels;
     if frames == 0 {
-        return Vec::new();
+        return;
     }
     if (speed - 1.0).abs() < 1e-12 {
-        return input.iter().take(frames * channels).copied().collect();
+        out.extend(input.iter().take(frames * channels).copied());
+        return;
     }
     let r = (frames as f64 / speed).round();
     if !r.is_finite() || r > MAX_OUT_FRAMES as f64 {
-        return Vec::new();
+        return;
     }
     let out_frames = r as usize;
-    let mut out = Vec::with_capacity(out_frames * channels);
+    out.reserve(out_frames * channels);
     for o in 0..out_frames {
-        push_interp(input, channels, frames, o as f64 * speed, &mut out);
+        push_interp(input, channels, frames, o as f64 * speed, out);
     }
-    out
 }
 
 /// Reverses the frame order of interleaved audio.
@@ -169,11 +183,38 @@ pub fn reverse_frames(input: &[f32], channels: usize) -> Vec<f32> {
     if channels == 0 {
         return Vec::new();
     }
-    input
-        .chunks_exact(channels)
-        .rev()
-        .flat_map(|frame| frame.iter().copied())
-        .collect()
+    let mut buf: Vec<f32> = input
+        .iter()
+        .take(input.len() / channels * channels)
+        .copied()
+        .collect();
+    reverse_frames_in_place(&mut buf, channels);
+    buf
+}
+
+/// Reverses the frame order of interleaved audio in place. A trailing partial frame (length not a
+/// multiple of `channels`) is not moved. `channels == 0` does nothing.
+pub fn reverse_frames_in_place(buf: &mut [f32], channels: usize) {
+    if channels == 0 {
+        return;
+    }
+    let whole = buf.len() / channels * channels;
+    let Some(body) = buf.get_mut(..whole) else {
+        return;
+    };
+    let mut lo = 0usize;
+    let mut hi = whole / channels;
+    while lo + 1 < hi {
+        hi -= 1;
+        let (head, tail) = body.split_at_mut(hi * channels);
+        if let (Some(a), Some(b)) = (
+            head.get_mut(lo * channels..(lo + 1) * channels),
+            tail.get_mut(..channels),
+        ) {
+            a.swap_with_slice(b);
+        }
+        lo += 1;
+    }
 }
 
 /// Adds `src * gain` into `dst` (up to the shorter length).
