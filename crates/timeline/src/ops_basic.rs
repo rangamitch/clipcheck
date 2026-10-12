@@ -303,22 +303,13 @@ pub fn place_media(
         PlaceMode::Append => {}
     }
 
-    // Name each audio lane after what it carries (the stream title, such as "Game" or "Mic").
+    // Stream titles (such as "Game" or "Mic") label the audio clips; audio lanes keep their
+    // default names (A1, A2, ...).
     let labels: Vec<String> = placed
         .iter()
         .take(slots.len())
         .map(|&orig| stream_label(&media, orig, media.audio.len()))
         .collect();
-    for (tid, label) in slots.iter().zip(&labels) {
-        if label.is_empty() || w.clips.iter().any(|c| &c.track_id == tid) {
-            continue;
-        }
-        if let Some(t) = w.tracks.iter_mut().find(|t| &t.id == tid) {
-            if is_default_audio_name(&t.name) {
-                t.name = label.clone();
-            }
-        }
-    }
 
     let link = new_id();
     let mut created: Vec<Clip> = Vec::new();
@@ -426,12 +417,6 @@ fn stream_label(media: &MediaRef, i: usize, count: usize) -> String {
     } else {
         String::new()
     }
-}
-
-/// True for the names the editor gives new audio lanes ("A1", "A2", ...).
-fn is_default_audio_name(name: &str) -> bool {
-    let rest = name.strip_prefix('A').unwrap_or("");
-    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Moves clips (and their group/link partners, which keep their relative offsets). In magnetic
