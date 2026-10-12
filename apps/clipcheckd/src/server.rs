@@ -1046,6 +1046,7 @@ mod tests {
                 source_recording_id: None,
                 path: "p".into(),
                 keep_source_time: false,
+                game: None,
             },
             Command::ListLibraries,
             Command::ScanLibraries { root_id: None },
