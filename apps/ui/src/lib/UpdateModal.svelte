@@ -1,6 +1,8 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import { formatBytes } from './format';
+  import InlineMd from './InlineMd.svelte';
+  import { parseMarkdown } from './markdown';
   import {
     closeUpdateModal,
     installNow,
@@ -14,6 +16,7 @@
   /** Shown when there is an update and the user opened it from the pill. */
   const visible = $derived($updateStore.modalOpen && $updateStore.available !== null);
   const info = $derived($updateStore.available);
+  const blocks = $derived(parseMarkdown(info?.notes ?? ''));
   const error = $derived($updateStore.error);
   const installing = $derived($updateStore.installing);
   const progress = $derived($updateStore.progress);
@@ -64,7 +67,27 @@
       <h2 id={TITLE_ID} class="title">Update to {info.version}</h2>
       <p class="current">You have version {info.current_version}.</p>
 
-      <pre id={NOTES_ID} class="notes">{info.notes.trim() || 'No release notes.'}</pre>
+      <div id={NOTES_ID} class="notes">
+        {#each blocks as b}
+          {#if b.t === 'heading'}
+            <p class="h h{b.level}"><InlineMd nodes={b.c} /></p>
+          {:else if b.t === 'p'}
+            <p><InlineMd nodes={b.c} /></p>
+          {:else if b.t === 'list'}
+            {#if b.ordered}
+              <ol>{#each b.items as it}<li><InlineMd nodes={it} /></li>{/each}</ol>
+            {:else}
+              <ul>{#each b.items as it}<li><InlineMd nodes={it} /></li>{/each}</ul>
+            {/if}
+          {:else if b.t === 'code'}
+            <pre>{b.v}</pre>
+          {:else}
+            <hr />
+          {/if}
+        {:else}
+          <p class="empty">No release notes.</p>
+        {/each}
+      </div>
 
       {#if error}
         <p class="error" role="alert">{error.message}</p>
