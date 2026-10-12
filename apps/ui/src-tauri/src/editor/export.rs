@@ -17,6 +17,7 @@
 //! Lock order: `ExportManager::inner` before `ExportManager::jobs`. No lock is held across a
 //! render call, a daemon request or an event emit.
 
+use std::collections::HashSet;
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -639,8 +640,51 @@ fn take_next(inner: &mut Inner, now: Instant) -> Option<Job> {
     }
 }
 
+/// Clears `worker_running` when the worker thread ends by panic or early exit, so the next queued
+/// job starts a new worker (and restarts one at once when jobs are still waiting). Disarmed on
+/// the normal exit, which clears the flag itself under the lock.
+struct WorkerGuard {
+    app: AppHandle,
+    client: Arc<DaemonClient>,
+    armed: bool,
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(st) = self.app.try_state::<EditorState>() else {
+            return;
+        };
+        let restart = {
+            let mut inner = lock(&st.exports.inner);
+            inner.worker_running = false;
+            inner
+                .entries
+                .iter()
+                .any(|e| e.dto.state == JobState::Queued)
+        };
+        if restart {
+            let mut inner = lock(&st.exports.inner);
+            if !inner.worker_running {
+                inner.worker_running = true;
+                if start_worker(self.app.clone(), Arc::clone(&self.client)).is_err() {
+                    inner.worker_running = false;
+                }
+            }
+        }
+    }
+}
+
 /// Body of the `clipcheck-export` thread: runs queued jobs in order until the queue is empty.
 fn worker_loop(app: AppHandle, client: Arc<DaemonClient>) {
+    let mut guard = WorkerGuard {
+        app: app.clone(),
+        client: Arc::clone(&client),
+        armed: true,
+    };
+    sweep_leftovers(&app, &client);
     loop {
         let Some(st) = app.try_state::<EditorState>() else {
             return;
@@ -654,12 +698,82 @@ fn worker_loop(app: AppHandle, client: Arc<DaemonClient>) {
                 }
                 None => {
                     inner.worker_running = false;
+                    guard.armed = false;
                     return;
                 }
             }
         };
         emit_queue(&app, list);
         run_job(&app, &client, job);
+    }
+}
+
+/// Age after which a `*.part` file in the export folder counts as a leftover.
+const PART_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Removes leftovers that no queued, running or paused job uses: folders in `export-work` whose
+/// name is not a live job id, and `*.part` files older than [`PART_MAX_AGE`] in the default export
+/// folder. Only those two places are touched. Runs once when a worker starts.
+fn sweep_leftovers(app: &AppHandle, client: &DaemonClient) {
+    let Some(st) = app.try_state::<EditorState>() else {
+        return;
+    };
+    let (live_ids, live_part_names) = {
+        let inner = lock(&st.exports.inner);
+        let live: Vec<&JobEntry> = inner
+            .entries
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e.dto.state,
+                    JobState::Queued | JobState::Running | JobState::Paused
+                )
+            })
+            .collect();
+        let ids: HashSet<String> = live.iter().map(|e| e.dto.id.clone()).collect();
+        let parts: HashSet<std::ffi::OsString> = live
+            .iter()
+            .filter_map(|e| {
+                let mut name = PathBuf::from(&e.dto.out_path).into_os_string();
+                name.push(".part");
+                PathBuf::from(name).file_name().map(|n| n.to_os_string())
+            })
+            .collect();
+        (ids, parts)
+    };
+
+    let work_root =
+        paths::editor_root(std::env::var("LOCALAPPDATA").ok().as_deref()).join("export-work");
+    if let Ok(read) = fs::read_dir(&work_root) {
+        for item in read.flatten() {
+            let path = item.path();
+            let name = item.file_name().to_string_lossy().into_owned();
+            if path.is_dir() && !live_ids.contains(&name) {
+                let _ = fs::remove_dir_all(&path);
+            }
+        }
+    }
+
+    let folder = default_export_dir(Some(client));
+    if let Ok(read) = fs::read_dir(&folder) {
+        for item in read.flatten() {
+            let path = item.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("part") || !path.is_file() {
+                continue;
+            }
+            if live_part_names.contains(&item.file_name()) {
+                continue;
+            }
+            let old = item
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age >= PART_MAX_AGE);
+            if old {
+                let _ = fs::remove_file(&path);
+            }
+        }
     }
 }
 
@@ -1400,6 +1514,22 @@ unsafe extern "system" {
     ) -> isize;
 }
 
+/// Drops the Windows verbatim prefix that `canonicalize` adds, so the shell gets a plain path:
+/// `\\?\C:\x` becomes `C:\x` and `\\?\UNC\srv\share\x` becomes `\\srv\share\x`. Other paths, and
+/// paths that are not valid UTF-8, are returned unchanged.
+fn strip_verbatim(path: &Path) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 /// Opens an exported file in the user's default player (or viewer for stills). Only files that
 /// exist, have a video, audio or image extension, and lie inside the export folder (the default
 /// one or the last export folder chosen) are opened.
@@ -1442,7 +1572,9 @@ pub async fn editor_open_export(
         }
 
         let op: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
-        let wide: Vec<u16> = file
+        // The containment check above uses the canonical path; the shell gets the plain form.
+        let shell_path = strip_verbatim(&file);
+        let wide: Vec<u16> = shell_path
             .as_os_str()
             .encode_wide()
             .chain(std::iter::once(0))
@@ -1500,4 +1632,25 @@ pub async fn editor_list_encoders(codec: String) -> Result<Vec<EncoderInfo>, Str
             .collect())
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verbatim_prefix_is_stripped_for_the_shell() {
+        assert_eq!(
+            strip_verbatim(Path::new("\\\\?\\C:\\Videos\\a.mp4")),
+            PathBuf::from("C:\\Videos\\a.mp4")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new("\\\\?\\UNC\\server\\share\\a.mp4")),
+            PathBuf::from("\\\\server\\share\\a.mp4")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"C:\plain.mp4")),
+            PathBuf::from(r"C:\plain.mp4")
+        );
+    }
 }

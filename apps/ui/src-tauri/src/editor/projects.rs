@@ -199,10 +199,9 @@ pub(crate) fn media_is_missing(media: &MediaRef) -> bool {
 
 /// Locks the open-session slot. The guard must not be held across an `.await`.
 fn lock_session(state: &EditorState) -> Result<MutexGuard<'_, Option<Session>>, String> {
-    state
-        .session
-        .lock()
-        .map_err(|_| "the editor state is unavailable after an earlier failure".to_string())
+    // A panic while the lock was held leaves the session in its last consistent state; recover it
+    // like the other editor modules do instead of failing every later command.
+    Ok(state.session.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Applies one command to a session, turning the error into text.

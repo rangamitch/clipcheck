@@ -17,7 +17,7 @@ use clipcheck_timeline::model::{
 };
 use clipcheck_timeline::time::Tick;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use super::projects::media_is_missing;
 use super::{paths, settings, EditorState};
@@ -144,7 +144,7 @@ pub async fn editor_waveform(
     }
     let path = PathBuf::from(&media.path);
     let meta = fs::metadata(&path).map_err(|_| format!("file is missing: {}", media.path))?;
-    let cache_file = paths::peaks_file(&cache_root(), meta.len(), mtime_ms(&meta), stream, buckets);
+    let cache_file = peaks_cache_file(&cache_root(), &path, &meta, stream, buckets);
     if let Some(peaks) = peaks_mem_get(&cache_file) {
         return Ok(peaks);
     }
@@ -185,11 +185,13 @@ pub async fn editor_waveform(
 
 /// JPEG thumbnails as `data:image/jpeg;base64,...` strings for the given source times (ms) of a
 /// media file of the open project, each `height` px tall (16..=240). Uses `mfdec` to decode and
-/// `mfdec::thumbnail_jpeg`; an on-disk cache avoids repeat work. Images return one thumbnail for
-/// every time. Audio media returns an error.
+/// `mfdec::thumbnail_jpeg`; an on-disk cache avoids repeat work. An image returns a single entry
+/// (its one frame, not one copy per time). Audio media returns an error. Stops with an error when
+/// the project it was requested for is closed meanwhile.
 #[tauri::command]
 pub async fn editor_thumbnails(
     state: State<'_, EditorState>,
+    app: AppHandle,
     media_id: String,
     times_ms: Vec<i64>,
     height: u32,
@@ -202,9 +204,19 @@ pub async fn editor_thumbnails(
         return Err(format!("at most {MAX_THUMB_TIMES} thumbnails per call"));
     }
     let height = height.clamp(MIN_THUMB_HEIGHT, MAX_THUMB_HEIGHT);
-    tauri::async_runtime::spawn_blocking(move || thumbnails_blocking(&media, &times_ms, height))
-        .await
-        .map_err(|e| e.to_string())?
+    let Some(project_id) = open_project_id(&state) else {
+        return Err("no project is open".to_string());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let still_open = || {
+            app.try_state::<EditorState>()
+                .and_then(|st| open_project_id(&st))
+                .is_some_and(|id| id == project_id)
+        };
+        thumbnails_blocking(&media, &times_ms, height, &still_open)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// A playable URL for a media file of the open project: for library recordings the existing
@@ -293,6 +305,11 @@ pub async fn editor_audio_stream_url(
 /// Locks the session, recovering from a poisoned mutex.
 fn lock_session(state: &EditorState) -> MutexGuard<'_, Option<Session>> {
     state.session.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Id of the open project, if any.
+fn open_project_id(state: &EditorState) -> Option<String> {
+    lock_session(state).as_ref().map(|s| s.project.id.clone())
 }
 
 /// A copy of one media entry of the open project.
@@ -666,6 +683,33 @@ fn compute_peaks(
     Ok((peaks, true))
 }
 
+/// Short hex tag of a source file's canonical path (case-folded), so two files with the same size
+/// and modification time never share a cache entry.
+fn source_tag(path: &Path) -> String {
+    let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let text = canon.to_string_lossy().to_ascii_lowercase();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    format!("{:016x}", h.finish())[..12].to_string()
+}
+
+/// Peaks cache file of one stream of `path`: the `paths::peaks_file` name with the source tag
+/// appended to the stem, so the key includes the file's path as well as its size and mtime.
+fn peaks_cache_file(
+    cache: &Path,
+    path: &Path,
+    meta: &fs::Metadata,
+    stream: u32,
+    buckets: usize,
+) -> PathBuf {
+    let base = paths::peaks_file(cache, meta.len(), mtime_ms(meta), stream, buckets);
+    let stem = base
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    base.with_file_name(format!("{stem}-{}.pk", source_tag(path)))
+}
+
 /// Cache files whose background waveform computation is running (keyed by cache file path).
 static PENDING: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
 
@@ -762,18 +806,20 @@ fn thumb_put(key: ThumbKey, value: String) {
     }
 }
 
-/// Computes the thumbnails of one media entry (blocking).
+/// Computes the thumbnails of one media entry (blocking). `still_open` reports whether the
+/// project the request was made for is still open; the loop stops with an error when it is not.
 fn thumbnails_blocking(
     media: &MediaRef,
     times_ms: &[i64],
     height: u32,
+    still_open: &dyn Fn() -> bool,
 ) -> Result<Vec<String>, String> {
     let path = Path::new(&media.path);
     let meta = fs::metadata(path).map_err(|_| format!("file is missing: {}", media.path))?;
 
     if media.kind == MediaKind::Image {
-        let uri = image_data_uri(path)?;
-        return Ok(vec![uri; times_ms.len()]);
+        // A still image has one frame: one entry, not a copy of its data URI per time.
+        return Ok(vec![image_data_uri(path)?]);
     }
     if media.width == 0 || media.height == 0 {
         return Err("the media has no video frames".to_string());
@@ -784,8 +830,13 @@ fn thumbnails_blocking(
 
     let dir = cache_root().join("thumbs");
     let mtime = mtime_ms(&meta);
+    // One heavy-job lock for the whole call, not one per frame.
+    let _heavy = HeavyIo::enter();
     let mut out = Vec::with_capacity(times_ms.len());
     for &ms in times_ms {
+        if !still_open() {
+            return Err("the project was closed before the thumbnails were made".to_string());
+        }
         let ms = ms.max(0);
         let key: ThumbKey = (media.path.clone(), ms, height);
         if let Some(hit) = thumb_get(&key) {
@@ -795,10 +846,8 @@ fn thumbnails_blocking(
         // One failing time (for example one past the end) leaves an empty slot; the rest still come.
         let disk = dir.join(disk_name(&media.path, meta.len(), mtime, ms, height));
         let cached = fs::metadata(&disk).map(|m| m.len() > 0).unwrap_or(false);
-        let failed = !cached && {
-            let _heavy = HeavyIo::enter();
-            clipcheck_mfdec::thumbnail_jpeg(path, ms as f64 / 1000.0, width, &disk).is_err()
-        };
+        let failed = !cached
+            && clipcheck_mfdec::thumbnail_jpeg(path, ms as f64 / 1000.0, width, &disk).is_err();
         if failed {
             let _ = fs::remove_file(&disk);
             out.push(String::new());
@@ -930,10 +979,12 @@ fn extract_audio_stream_locked(path: &Path, stream: u32) -> Result<PathBuf, Stri
         return Err("audio track extraction needs an MP4 file".to_string());
     }
     let meta = fs::metadata(path).map_err(|_| format!("file is missing: {}", path.display()))?;
-    let out =
-        cache_root()
-            .join("audio")
-            .join(format!("{}-{}-{stream}.m4a", meta.len(), mtime_ms(&meta)));
+    let out = cache_root().join("audio").join(format!(
+        "{}-{}-{stream}-{}.m4a",
+        meta.len(),
+        mtime_ms(&meta),
+        source_tag(path)
+    ));
     let cached = || fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false);
     if cached() {
         return Ok(out);
@@ -971,10 +1022,10 @@ fn measure_loudness(
     src_in: Tick,
     src_len: Tick,
 ) -> Result<LoudnessReport, String> {
-    let (src, src_stream) = {
-        let _heavy = HeavyIo::enter();
-        decode_source_locked(path, stream)
-    };
+    // Held for the whole measurement (open, seek and every read), so the decode is serialised
+    // with the other heavy jobs and runs at background priority.
+    let _heavy = HeavyIo::enter();
+    let (src, src_stream) = decode_source_locked(path, stream);
     let mut dec = AudioDecoder::open(&src, src_stream).map_err(|e| e.to_string())?;
     let rate = dec.sample_rate().max(1);
     let channels = dec.channels().max(1) as usize;
@@ -1099,5 +1150,14 @@ mod tests {
         png.extend_from_slice(&640u32.to_be_bytes());
         png.extend_from_slice(&480u32.to_be_bytes());
         assert_eq!(image_header(&png), Some(("png", "image/png", 640, 480)));
+    }
+
+    #[test]
+    fn source_tag_differs_per_path() {
+        let a = source_tag(Path::new(r"C:\cache-test\a\clip.mp4"));
+        let b = source_tag(Path::new(r"C:\cache-test\b\clip.mp4"));
+        assert_eq!(a.len(), 12);
+        assert_ne!(a, b);
+        assert_eq!(a, source_tag(Path::new(r"C:\cache-test\a\clip.mp4")));
     }
 }
