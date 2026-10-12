@@ -108,7 +108,8 @@ pub struct PipelineReport {
 /// clip is not blended; dip = [`crate::reference::dip_to_color`]),
 /// compose with the reference compositor at the canvas size, scale to `out_w` x `out_h` if
 /// different, push to the sink. Audio is produced in blocks of one video frame's worth of samples
-/// (accumulated with exact sample counts so total samples == duration * sample_rate): each source
+/// (accumulated with exact sample counts so total samples == duration * sample_rate, or the
+/// whole-frame length frames / fps when video is on): each source
 /// is read, speed/reverse applied, multiplied by clip gain/envelope/fades (using
 /// `clipcheck_timeline::audiomath`), track fader, pan, summed per output track, limited, and
 /// pushed. Checks `ctl` every frame: cancel gives `RenderError::Cancelled`; pause blocks (sleep
@@ -131,8 +132,10 @@ pub fn run(
     let frames = frame_count(dur, cfg.fps);
     let mut total = total_samples(dur, cfg.sample_rate);
     if cfg.video {
-        // A range shorter than one frame still gets one frame; its audio must cover that frame.
-        total = total.max(sample_index(frames, cfg.sample_rate, cfg.fps));
+        // Video is whole frames, so the audio ends where the last frame ends (frames / fps), not at
+        // the exact duration, which can run up to one frame longer. A range shorter than one frame
+        // still gets one frame, and frame_count guarantees frames >= 1, so its audio covers it.
+        total = sample_index(frames, cfg.sample_rate, cfg.fps);
     }
     let mix = matches!(cfg.layout, AudioLayout::Mix);
     let n_tracks = if mix { 1 } else { cfg.audio_tracks.max(1) };

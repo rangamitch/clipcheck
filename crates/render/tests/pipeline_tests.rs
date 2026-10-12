@@ -539,6 +539,8 @@ fn audio_only_run(dur: Tick, sr: u32, fps: Rate, limiter: bool) -> Run {
     let mut c_cfg = cfg(sr);
     c_cfg.fps = fps;
     c_cfg.limiter = limiter;
+    // Audio-only: with video on, the audio length snaps to whole frames (see the video tests).
+    c_cfg.video = false;
     go(
         &plan_of(&p),
         &c_cfg,
@@ -610,7 +612,8 @@ fn audio_total_exact_with_limiter_on() {
 
 #[test]
 fn audio_total_exact_when_video_drives_blocks() {
-    // With video on, audio is produced per frame block. Totals must still be exact.
+    // With video on, audio is produced per frame block and ends with the last whole frame:
+    // 37 frames at 30 fps = 1.2333 s = 54390 samples at 44.1 kHz (not the exact 54419).
     let mut p = project(black_bg());
     add_media(&mut p, "m1", MediaKind::Video);
     add_media(&mut p, "a1", MediaKind::Audio);
@@ -626,7 +629,28 @@ fn audio_total_exact_when_video_drives_blocks() {
         FakeTitles::default(),
     );
     assert_eq!(ok(&r).frames, 37);
-    assert_eq!(r.sink.track_frames(0), 54419);
+    assert_eq!(r.sink.track_frames(0), 54390);
+}
+
+#[test]
+fn video_audio_length_is_whole_frames_not_exact_duration() {
+    // 1.234 s at 30 fps: video is 37 frames; audio must end at 37 / 30 s, not at 1.234 s.
+    let mut p = project(black_bg());
+    add_media(&mut p, "m1", MediaKind::Video);
+    add_media(&mut p, "a1", MediaKind::Audio);
+    let v = video_clip(&p, 0, "v1", "m1", Tick::ZERO, Tick::from_ms(1234));
+    let a = audio_clip(&p, 0, "a1c", "a1", Tick::ZERO, Tick::from_ms(1234));
+    p.clips.push(v);
+    p.clips.push(a);
+    let r = go(
+        &plan_of(&p),
+        &cfg(48000),
+        FakeVideo::default(),
+        FakeAudio::constant(0.5),
+        FakeTitles::default(),
+    );
+    assert_eq!(ok(&r).frames, 37);
+    assert_eq!(r.sink.track_frames(0), 37 * 48000 / 30);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1683,7 +1707,8 @@ fn limiter_total_exact_when_video_drives_blocks() {
         FakeTitles::default(),
     );
     assert_eq!(ok(&r).frames, 37);
-    assert_eq!(r.sink.track_frames(0), 54419);
+    // Whole frames drive the length: 37 / 30 s at 44.1 kHz = 54390 (see audio_total_exact_when_video_drives_blocks).
+    assert_eq!(r.sink.track_frames(0), 54390);
 }
 
 #[test]

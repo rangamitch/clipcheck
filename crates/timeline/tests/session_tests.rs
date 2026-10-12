@@ -6,7 +6,8 @@ mod common;
 use clipcheck_timeline::cmd::{Command, Session, UNDO_DEPTH};
 use clipcheck_timeline::error::EditError;
 use clipcheck_timeline::model::{
-    Canvas, ClipKind, EnvPoint, Project, Rgba, TextSpec, TrackKind, WorkArea,
+    Canvas, ClipKind, EnvPoint, Project, Rgba, TextSpec, TrackKind, Transition, TransitionKind,
+    WorkArea,
 };
 use clipcheck_timeline::ops_basic::{ClipMove, PlaceMode};
 use clipcheck_timeline::ops_props::{ClipPatch, TrackPatch};
@@ -826,5 +827,55 @@ fn moving_a_neighbour_away_clears_its_transition_and_undo_restores_it() {
     assert!(
         s.project.clip("b").expect("b").transition_in.is_some(),
         "undo restores the transition"
+    );
+}
+
+#[test]
+fn trim_shortening_a_clip_clamps_its_transition_and_drops_it_below_the_minimum() {
+    let mut p = project_with_media();
+    let vt = nth_track(&p, TrackKind::Video, 0);
+    let prev = clip("prev", &vt, ClipKind::Video, Tick::ZERO, Tick::from_secs(1));
+    let mut v = clip(
+        "v",
+        &vt,
+        ClipKind::Video,
+        Tick::from_secs(1),
+        Tick::from_ms(600),
+    );
+    v.media_id = Some(MEDIA_ID.to_string());
+    v.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: Tick::from_ms(500),
+    });
+    p.clips.push(prev);
+    p.clips.push(v);
+    let mut s = Session::new(p);
+    s.apply(Command::TrimEdge {
+        clip_id: "v".to_string(),
+        edge: Edge::End,
+        new_time: Tick::from_ms(1400),
+        ripple: false,
+    })
+    .expect("trim to 0.4 s");
+    assert_eq!(
+        s.project
+            .clip("v")
+            .expect("v")
+            .transition_in
+            .map(|t| t.duration),
+        Some(Tick::from_ms(400)),
+        "transition clamped to the 0.4 s clip"
+    );
+    s.apply(Command::TrimEdge {
+        clip_id: "v".to_string(),
+        edge: Edge::End,
+        new_time: Tick::from_ms(1050),
+        ripple: false,
+    })
+    .expect("trim to 0.05 s");
+    assert_eq!(
+        s.project.clip("v").expect("v").transition_in,
+        None,
+        "0.05 s is under the 0.1 s minimum, so the transition is dropped"
     );
 }

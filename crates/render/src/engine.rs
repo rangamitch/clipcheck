@@ -358,9 +358,8 @@ fn export_video(
                     break bytes;
                 }
                 attempt += 1;
-                // Scale the bitrate by the measured overshoot so one retry can converge.
-                let scaled = f64::from(kbps) * (1.0 / ratio) * RETRY_SAFETY;
-                kbps = scaled.max(MIN_RETRY_KBPS) as u32;
+                // Scale the video bitrate so one retry can converge (audio share removed).
+                kbps = retry_video_kbps(kbps, bytes, target, duration_secs, audio_kbps_total);
             }
             _ => break bytes,
         }
@@ -578,6 +577,34 @@ struct Job<'a> {
     audio_kbps: u32,
 }
 
+/// Appends `incoming` to `dst`, skipping any message `dst` already holds. A target-size export
+/// runs several passes that each report the same warnings, so plain `extend` would repeat them.
+fn extend_unique(dst: &mut Vec<String>, incoming: impl IntoIterator<Item = String>) {
+    for w in incoming {
+        if !dst.contains(&w) {
+            dst.push(w);
+        }
+    }
+}
+
+/// Video bitrate (kbps) for a target-size retry. The measured overshoot covers the whole file,
+/// audio included, so the audio share (`audio_kbps_total` over `secs`) is removed from both the
+/// actual and the target size before scaling the video rate. Falls back to scaling by the plain
+/// ratio when the actual video size is not positive, and never goes below `MIN_RETRY_KBPS`.
+fn retry_video_kbps(kbps: u32, bytes: u64, target: f64, secs: f64, audio_kbps_total: u32) -> u32 {
+    let audio_bytes = f64::from(audio_kbps_total) * secs / 8.0 * 1000.0;
+    let actual_video = bytes as f64 - audio_bytes;
+    let target_video = target - audio_bytes;
+    let scaled = if actual_video <= 0.0 {
+        f64::from(kbps) * (target / bytes as f64) * RETRY_SAFETY
+    } else if target_video <= 0.0 {
+        MIN_RETRY_KBPS
+    } else {
+        f64::from(kbps) * (target_video / actual_video) * RETRY_SAFETY
+    };
+    scaled.max(MIN_RETRY_KBPS) as u32
+}
+
 /// Result of one encode pass.
 struct PassResult {
     bytes: u64,
@@ -708,7 +735,7 @@ fn encode_pass(
             return Err(e);
         }
     };
-    warnings.extend(report.warnings);
+    extend_unique(warnings, report.warnings);
 
     let done = match sink.finish() {
         Ok(d) => d,
@@ -720,7 +747,7 @@ fn encode_pass(
             return Err(e);
         }
     };
-    warnings.extend(done.warnings);
+    extend_unique(warnings, done.warnings);
     if done.fell_back {
         *allow_hw = false;
     }
@@ -1373,5 +1400,53 @@ mod progress_map_tests {
             }
         }
         assert_eq!(last, 100.0);
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn warnings_are_not_repeated_across_passes() {
+        let mut warnings = vec!["Encoder: x".to_string()];
+        extend_unique(
+            &mut warnings,
+            vec!["Encoder: x".to_string(), "new".to_string()],
+        );
+        extend_unique(&mut warnings, vec!["new".to_string()]);
+        assert_eq!(warnings, vec!["Encoder: x".to_string(), "new".to_string()]);
+    }
+
+    #[test]
+    fn retry_removes_audio_share_before_scaling() {
+        // 4 MB target, 60 s, 128 kbps audio = 960 kB of audio. First pass 4.8 MB.
+        // Video: actual 3.84 MB, target 3.04 MB -> 1000 * 0.791666 * 0.97 = 767.9 kbps.
+        let v = retry_video_kbps(1000, 4_800_000, 4_000_000.0, 60.0, 128);
+        assert_eq!(v, 767);
+        // The plain ratio (4.0 / 4.8) would have given 808, under-correcting the overshoot.
+        let plain = (1000.0 * (4.0 / 4.8) * RETRY_SAFETY) as u32;
+        assert!(v < plain, "{v} vs {plain}");
+    }
+
+    #[test]
+    fn retry_without_audio_matches_plain_ratio() {
+        let v = retry_video_kbps(1000, 4_800_000, 4_000_000.0, 60.0, 0);
+        assert_eq!(v, (1000.0 * (4.0 / 4.8) * RETRY_SAFETY) as u32);
+    }
+
+    #[test]
+    fn retry_falls_back_when_audio_exceeds_the_file() {
+        // Audio alone is larger than the actual file: the plain ratio is used, never zero.
+        let v = retry_video_kbps(1000, 100_000, 50_000.0, 60.0, 1000);
+        assert!(v >= MIN_RETRY_KBPS as u32);
+        assert_eq!(v, (1000.0 * (50_000.0 / 100_000.0) * RETRY_SAFETY) as u32);
+    }
+
+    #[test]
+    fn retry_is_floored_when_target_is_inside_audio() {
+        // Target smaller than the audio share: nothing video-wise fits, use the floor.
+        let v = retry_video_kbps(1000, 2_000_000, 500_000.0, 60.0, 128);
+        assert_eq!(v, MIN_RETRY_KBPS as u32);
     }
 }

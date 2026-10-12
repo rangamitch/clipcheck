@@ -377,6 +377,39 @@ fn join_caps_the_envelope_at_64_points_and_keeps_the_ends() {
 }
 
 #[test]
+fn join_with_a_left_point_at_the_seam_gives_no_two_points_the_same_time() {
+    let mut p = project();
+    // The joined 12 s clip reads 0..12 s of source, so the media must be longer than the fixture's 10 s.
+    for m in p.media.iter_mut() {
+        m.duration = s(20);
+    }
+    let mut l = audio_on_a1(&p, "l", s(0), s(10), s(0));
+    l.audio.envelope = vec![
+        EnvPoint { t: s(0), db: 0.0 },
+        EnvPoint { t: s(10), db: -6.0 },
+    ];
+    let mut r = audio_on_a1(&p, "r", s(10), s(2), s(10));
+    r.audio.envelope = vec![
+        EnvPoint { t: s(0), db: -3.0 },
+        EnvPoint { t: s(1), db: -9.0 },
+    ];
+    p.clips.push(l);
+    p.clips.push(r);
+    join_through_edit(&mut p, "l", "r").expect("join ok");
+    let env = get(&p, "l").audio.envelope;
+    assert!(
+        env.windows(2).all(|w| w[0].t < w[1].t),
+        "times must be strictly increasing: {env:?}"
+    );
+    let at_seam: Vec<&EnvPoint> = env.iter().filter(|e| e.t == s(10)).collect();
+    assert_eq!(at_seam.len(), 1, "one point at the seam");
+    assert!(
+        (at_seam[0].db + 6.0).abs() < 1e-9,
+        "seam keeps the left level"
+    );
+}
+
+#[test]
 fn trim_reverse_clip_start_edge_keeps_src_in() {
     let mut p = project();
     let mut r = video(&p, "r", "V2", s(0), s(4), s(5));

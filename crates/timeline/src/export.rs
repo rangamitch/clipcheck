@@ -522,8 +522,11 @@ pub fn apply_preset(
     }
 }
 
+/// Highest video bitrate (kbps) any export is allowed to request; the encoder refuses more.
+const MAX_VIDEO_KBPS: u32 = 200_000;
+
 /// Video bitrate (kbps) that makes a `duration` clip land near `target_mb`, after subtracting
-/// audio and 2 % container overhead. Never below 100 kbps.
+/// audio and 2 % container overhead. Never below 100 kbps, never above `MAX_VIDEO_KBPS`.
 pub fn solve_target_bitrate(target_mb: f64, duration: Tick, audio_kbps_total: u32) -> u32 {
     let secs = duration.as_secs_f64();
     if !target_mb.is_finite() || !secs.is_finite() || secs <= 0.0 {
@@ -531,12 +534,12 @@ pub fn solve_target_bitrate(target_mb: f64, duration: Tick, audio_kbps_total: u3
     }
     let total_bits = target_mb * 1_000_000.0 * 8.0 * 0.98;
     let video_kbps = total_bits / secs / 1000.0 - f64::from(audio_kbps_total);
-    clamp_to_u32(video_kbps, 100, u32::MAX)
+    clamp_to_u32(video_kbps, 100, MAX_VIDEO_KBPS)
 }
 
 /// Maps the 1..=100 quality slider to a video bitrate (kbps) for a resolution, fps and codec.
 /// Bits per pixel rise from 0.03 (value 1) to 0.25 (value 100) with a 1.5 power curve. HEVC and
-/// AV1 use 0.65 of the H.264 rate. The result is clamped to 100..=200_000 kbps.
+/// AV1 use 0.65 of the H.264 rate. The result is clamped to 100..=`MAX_VIDEO_KBPS` kbps.
 pub fn quality_to_kbps(value: u32, width: u32, height: u32, fps: f64, codec: VideoCodec) -> u32 {
     let v = value.clamp(1, 100);
     let t = f64::from(v - 1) / 99.0;
@@ -551,7 +554,7 @@ pub fn quality_to_kbps(value: u32, width: u32, height: u32, fps: f64, codec: Vid
         30.0
     };
     let kbps = f64::from(width) * f64::from(height) * fps * bits_per_pixel * codec_factor / 1000.0;
-    clamp_to_u32(kbps, 100, 200_000)
+    clamp_to_u32(kbps, 100, MAX_VIDEO_KBPS)
 }
 
 /// Bytes for `kbps` sustained over `secs` seconds, with 2 % container overhead.
@@ -741,7 +744,7 @@ pub fn validate_settings(s: &ExportSettings) -> Vec<String> {
             }
         }
         QualityMode::Bitrate { kbps } | QualityMode::Cbr { kbps } => {
-            if !(100..=200_000).contains(&kbps) {
+            if !(100..=MAX_VIDEO_KBPS).contains(&kbps) {
                 problems.push(format!(
                     "Bitrate must be from 100 to 200000 kbps (0.1 to 200 Mbps, got {kbps})"
                 ));

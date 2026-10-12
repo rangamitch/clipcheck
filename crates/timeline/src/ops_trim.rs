@@ -596,13 +596,15 @@ fn join_envelope(left: &Clip, right: &Clip) -> Vec<EnvPoint> {
         return Vec::new();
     }
     let seam = left.dur;
+    // Left points at or past the seam are dropped: the seam point pushed below holds that level,
+    // and keeping them would give two points the same time.
     let mut out = if l.is_empty() {
         vec![EnvPoint {
             t: Tick::ZERO,
             db: 0.0,
         }]
     } else {
-        l.clone()
+        l.iter().filter(|e| e.t < seam).cloned().collect()
     };
     let left_end_db = if l.is_empty() {
         0.0
@@ -622,8 +624,10 @@ fn join_envelope(left: &Clip, right: &Clip) -> Vec<EnvPoint> {
         t: seam.saturating_add(Tick(1)),
         db: right_start_db,
     });
+    // Right points at 0 (the seam level) or 1 tick (the slot of the seam+1 point) would duplicate a
+    // time already in `out`, so only points after that slot are copied.
     for e in r {
-        if e.t > Tick::ZERO {
+        if e.t > Tick(1) {
             out.push(EnvPoint {
                 t: seam.saturating_add(e.t),
                 db: e.db,

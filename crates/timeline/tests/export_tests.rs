@@ -296,6 +296,16 @@ fn target_bitrate_non_finite_target_is_floor() {
 }
 
 #[test]
+fn target_bitrate_is_capped_at_200_000_kbps() {
+    // 500 MB over 10 s would solve to ~390 Mbps, which the encoder cannot open.
+    assert_eq!(solve_target_bitrate(500.0, secs(10), 128), 200_000);
+    assert_eq!(
+        solve_target_bitrate(500.0, secs(10), 128),
+        quality_to_kbps(100, 8192, 8192, 120.0, VideoCodec::H264)
+    );
+}
+
+#[test]
 fn target_bitrate_grows_with_target_size() {
     let small = solve_target_bitrate(10.0, secs(60), 128);
     let big = solve_target_bitrate(50.0, secs(60), 128);

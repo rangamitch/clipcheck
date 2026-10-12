@@ -601,7 +601,8 @@ pub fn audio_clip_for(
 }
 
 /// Clears stale `transition_in` values. A transition stays only while a clip on the same track
-/// ends at (within one tick of) the clip's start, and it is no longer than the clip itself.
+/// ends at (within one tick of) the clip's start. Its length is clamped to the clip's length, and it
+/// is removed when there is no neighbour or the clamped length is under the minimum transition.
 /// Otherwise (after a move, trim, delete or split of the neighbour) it is removed. Run by the
 /// command layer after every successful command, so the result belongs to that command.
 pub(crate) fn normalise_transitions(p: &mut Project) {
@@ -623,8 +624,17 @@ pub(crate) fn normalise_transitions(p: &mut Project) {
         let has_neighbour = spans.iter().any(|(id, track, end)| {
             *id != c.id && *track == c.track_id && (end - c.start.0).abs() <= 1
         });
-        if !has_neighbour || duration > c.dur {
+        if !has_neighbour {
             c.transition_in = None;
+            continue;
+        }
+        // Same clamp as `patch_clips`: a transition longer than the clip shrinks to the clip, and
+        // is dropped only when that leaves less than the minimum transition.
+        let clamped = if duration > c.dur { c.dur } else { duration };
+        if clamped < MIN_TRANSITION {
+            c.transition_in = None;
+        } else if let Some(t) = c.transition_in.as_mut() {
+            t.duration = clamped;
         }
     }
 }
