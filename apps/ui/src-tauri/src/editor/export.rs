@@ -369,9 +369,9 @@ fn free_bytes(dir: &Path) -> u64 {
 }
 
 /// When true, the encoder dropdown also lists the hardware encoders of H.264 and HEVC. The
-/// engine only uses the software encoder today, so the list stays at "auto" and "software".
+/// engine can use hardware encoders (with a software fallback), so they are listed.
 /// Set this to true when the engine can use hardware encoders again.
-const LIST_HARDWARE_ENCODERS: bool = false;
+const LIST_HARDWARE_ENCODERS: bool = true;
 
 /// Encoder names for the dropdown: "auto" and "software" only, unless
 /// [`LIST_HARDWARE_ENCODERS`] is set. Then the hardware encoders of H.264 and HEVC follow.
@@ -1464,6 +1464,40 @@ pub async fn editor_open_export(
         } else {
             Err(format!("Windows could not open the file (code {code})"))
         }
+    })
+    .await
+}
+
+/// One encoder for the Export dialog's Encoder dropdown.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncoderInfo {
+    /// Friendly name, e.g. "NVIDIA H.264 Encoder MFT". The render engine accepts it as the
+    /// `encoder` setting.
+    pub name: String,
+    /// True for a GPU/ASIC encoder, false for the Microsoft software encoder.
+    pub hardware: bool,
+}
+
+/// Lists the Media Foundation encoders for `codec` ("h264" or "hevc", case-insensitive), hardware
+/// first. Other codecs (such as "av1") give an empty list.
+#[tauri::command]
+pub async fn editor_list_encoders(codec: String) -> Result<Vec<EncoderInfo>, String> {
+    let codec = match codec.trim().to_ascii_lowercase().as_str() {
+        "h264" => Codec::H264,
+        "hevc" => Codec::Hevc,
+        _ => return Ok(Vec::new()),
+    };
+    blocking(move || {
+        clipcheck_hwenc::mf_startup().map_err(|e| e.to_string())?;
+        let list = clipcheck_hwenc::enumerate(codec).map_err(|e| e.to_string())?;
+        Ok(list
+            .into_iter()
+            .map(|desc| EncoderInfo {
+                name: desc.name,
+                hardware: desc.hardware,
+            })
+            .collect())
     })
     .await
 }

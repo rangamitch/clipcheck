@@ -34,7 +34,18 @@ export interface PeaksReady {
   stream: number;
 }
 
+/** One encoder from `editor_list_encoders`. */
+export interface EncoderInfo {
+  name: string;
+  hardware: boolean;
+}
+
 export const editorApi = {
+  /** Lists the Media Foundation encoders for `codec` ("h264" | "hevc"), hardware first. */
+  listEncoders(codec: string): Promise<EncoderInfo[]> {
+    return invoke<EncoderInfo[]>('editor_list_encoders', { codec });
+  },
+
   /** Lists saved projects, newest first. */
   listProjects(): Promise<ProjectSummary[]> {
     return invoke<ProjectSummary[]>('editor_list_projects');
