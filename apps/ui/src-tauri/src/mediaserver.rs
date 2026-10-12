@@ -9,6 +9,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -16,7 +17,7 @@ use crate::media::{self, RangeSpec};
 use crate::{commands, player};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
-const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const PATH_TTL: Duration = Duration::from_secs(30);
 const CHUNK: usize = 256 * 1024;
 
@@ -93,10 +94,35 @@ fn generate_token() -> String {
 fn accept_loop(listener: TcpListener, token: String) {
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
+        if ACTIVE_CONNS.fetch_add(1, Ordering::AcqRel) >= MAX_CONNS {
+            ACTIVE_CONNS.fetch_sub(1, Ordering::AcqRel);
+            let mut s = stream;
+            let _ = s.set_write_timeout(Some(Duration::from_secs(2)));
+            let _ = write_simple(&mut s, 503, true);
+            continue;
+        }
         let token = token.clone();
-        let _ = std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("media-conn".into())
-            .spawn(move || handle_connection(stream, &token));
+            .spawn(move || {
+                let _guard = ConnGuard;
+                handle_connection(stream, &token);
+            });
+        if spawned.is_err() {
+            ACTIVE_CONNS.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+/// Simultaneous connections allowed; each gets its own short-lived thread, so idle keep-alive
+/// sockets never hold a worker that another media element is waiting on.
+const MAX_CONNS: usize = 64;
+static ACTIVE_CONNS: AtomicUsize = AtomicUsize::new(0);
+
+struct ConnGuard;
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        ACTIVE_CONNS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -118,7 +144,7 @@ enum ReadError {
 fn handle_connection(stream: TcpStream, token: &str) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
     let Ok(mut writer) = stream.try_clone() else {
         return;
     };
@@ -248,6 +274,7 @@ fn status_text(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         416 => "Range Not Satisfiable",
+        503 => "Service Unavailable",
         431 => "Request Header Fields Too Large",
         _ => "Internal Server Error",
     }
