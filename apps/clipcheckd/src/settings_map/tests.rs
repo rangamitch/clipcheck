@@ -1747,3 +1747,19 @@ fn gating_ptt_mix_option_without_push_to_talk_changes_nothing() {
     let tracks = audio_tracks_gated(&audio, gating(true, false));
     assert_eq!(tracks[0].sources[0].kind, gated_mic_kind(None));
 }
+
+#[test]
+fn gating_ptt_only_ignores_the_mix_choice_so_no_open_mic_is_recorded() {
+    let mut audio = mic_only_audio(false);
+    audio.mic.ptt_mix_gated = false;
+    let tracks = audio_tracks_gated(&audio, gating(false, true));
+    assert_eq!(tracks.len(), 2);
+    for track in &tracks {
+        assert_eq!(
+            track.sources[0].kind,
+            gated_mic_kind(None),
+            "{}",
+            track.title
+        );
+    }
+}

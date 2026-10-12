@@ -203,3 +203,38 @@ export const MIC_TEST_SILENT_DB = -60;
 export function micTestVerdict(peakDb: number): 'silent' | 'ok' {
   return !Number.isFinite(peakDb) || peakDb <= MIC_TEST_SILENT_DB ? 'silent' : 'ok';
 }
+
+/** The two push-to-talk recording choices on the Audio tab. */
+export type PttMode = 'ptt_only' | 'ptt_and_open';
+
+/**
+ * The choice a config is in. `mic.ptt_separate_track` false is "Push to talk only": no open mic
+ * is recorded anywhere. True is "Push to talk and open microphone".
+ */
+export function pttModeOf(audio: Pick<AudioConfig, 'mic'>): PttMode {
+  return audio.mic.ptt_separate_track ? 'ptt_and_open' : 'ptt_only';
+}
+
+/** The `mic.ptt_separate_track` value for a choice. */
+export function pttSeparateOf(mode: PttMode): boolean {
+  return mode === 'ptt_and_open';
+}
+
+/**
+ * Read-only line naming the microphone tracks that will be recorded, for example
+ * "Mix (push to talk), Microphone (push to talk)". The Microphone and Push to talk tracks only
+ * exist with `separate_tracks` (see `trackPlanPreview`). `mic.ptt_mix_gated` only matters in
+ * "Push to talk and open microphone".
+ */
+export function micTrackSummary(audio: Pick<AudioConfig, 'separate_tracks' | 'mic'>): string {
+  if (!audio.mic.enabled) return 'Microphone is off, so no microphone is recorded.';
+  const separate = audio.separate_tracks;
+  if (pttModeOf(audio) === 'ptt_only') {
+    const parts = ['Mix (push to talk)'];
+    if (separate) parts.push('Microphone (push to talk)');
+    return parts.join(', ');
+  }
+  const parts = [`Mix (${audio.mic.ptt_mix_gated ? 'push to talk' : 'open mic'})`];
+  if (separate) parts.push('Microphone (open mic)', 'Push to talk (push to talk)');
+  return parts.join(', ');
+}

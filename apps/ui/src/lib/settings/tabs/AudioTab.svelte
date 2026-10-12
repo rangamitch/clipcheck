@@ -15,6 +15,7 @@
   import AppPicker, { type PickerApp } from '../fields/AppPicker.svelte';
   import FieldRow from '../fields/FieldRow.svelte';
   import MeterBar from '../fields/MeterBar.svelte';
+  import Segmented, { type SegmentOption } from '../fields/Segmented.svelte';
   import Select from '../fields/Select.svelte';
   import Toggle from '../fields/Toggle.svelte';
   import VolumeSlider from '../fields/VolumeSlider.svelte';
@@ -29,9 +30,13 @@
     canAddSource,
     micDeviceOptions,
     micTestVerdict,
+    micTrackSummary,
+    pttModeOf,
+    pttSeparateOf,
     removeApp,
     setAppField,
     trackPlanPreview,
+    type PttMode,
   } from '../audio';
   import { diagnosticAt, fieldDiagnostic } from '../pure';
   import { frameCoalesced } from '../frame';
@@ -57,6 +62,21 @@
   const pttKeyCount = $derived($settings.draft?.hotkeys?.session?.push_to_talk?.length ?? 0);
   /** PTT is active with keys set, or with the legacy mute-key hold mode (which still works). */
   const pttActive = $derived(pttKeyCount > 0 || muteMode === 'push_to_talk');
+  /** Microphone track layout choices. "Push to talk + open microphone" needs separate tracks. */
+  const PTT_MODE_OPTIONS: SegmentOption<PttMode>[] = [
+    { value: 'ptt_only', label: 'Push to talk only' },
+    { value: 'ptt_and_open', label: 'Push to talk + open microphone' },
+  ];
+  const MIX_SOURCE_OPTIONS: SegmentOption<'gated' | 'open'>[] = [
+    { value: 'gated', label: 'Push to talk' },
+    { value: 'open', label: 'Open microphone' },
+  ];
+  const pttModeOptions = $derived(
+    PTT_MODE_OPTIONS.map((o) => ({
+      ...o,
+      disabled: o.value === 'ptt_and_open' && !audio?.separate_tracks,
+    })),
+  );
 
   const CODEC_OPTIONS: { value: AudioCodec; label: string; disabled?: boolean; title?: string }[] = [
     { value: 'aac', label: 'AAC-LC' },
@@ -516,44 +536,51 @@
     </div>
 
     {#if pttActive}
-      <div class="toggle-row">
-        <div class="toggle-text">
-          <span class="toggle-label" id="audio-ptt-track-label">Record push to talk on its own track</span>
-          <p class="help" id="audio-ptt-track-help">
-            {#if audio.separate_tracks}
-              Adds a Push to talk track that only has your voice while the key is held. The Microphone track keeps
-              recording normally. The Mix track gets the push-to-talk version.
-            {:else}
-              Needs "Separate audio tracks" on. Turn that on above first.
-            {/if}
-          </p>
-        </div>
-        <Toggle
-          checked={audio.mic.ptt_separate_track}
-          labelId="audio-ptt-track-label"
-          describedBy="audio-ptt-track-help"
-          disabled={disabled || !audio.separate_tracks}
-          onchange={(v) => setPath('audio.mic.ptt_separate_track', v)}
-        />
-      </div>
+      <FieldRow
+        label="Microphone tracks"
+        path="audio.mic.ptt_separate_track"
+        help={pttModeOf(audio) === 'ptt_only'
+          ? 'Only audio recorded while a push-to-talk key is held is saved. No open microphone is recorded anywhere, including the Mix track.'
+          : 'Adds a separate Push to talk track. The Microphone track records your open mic all the time.' +
+            (audio.separate_tracks ? '' : ' Turn on Separate audio tracks to use this.')}
+      >
+        {#snippet children(ctl)}
+          <Segmented
+            name={ctl.id}
+            labelId={ctl.labelId}
+            describedBy={ctl.describedBy}
+            value={pttModeOf(audio)}
+            options={pttModeOptions}
+            {disabled}
+            onchange={(v) => setPath('audio.mic.ptt_separate_track', pttSeparateOf(v))}
+          />
+        {/snippet}
+      </FieldRow>
 
-      <div class="toggle-row">
-        <div class="toggle-text">
-          <span class="toggle-label" id="audio-ptt-mix-label">Push to talk applies to the Mix track</span>
-          <p class="help" id="audio-ptt-mix-help">
-            On: the Mix track only has your voice while a push-to-talk key is held. Off: the Mix track keeps your
-            microphone open all the time (use this if you want the Mix to have your normal mic and only the Push to
-            talk track gated).
-          </p>
-        </div>
-        <Toggle
-          checked={audio.mic.ptt_mix_gated}
-          labelId="audio-ptt-mix-label"
-          describedBy="audio-ptt-mix-help"
-          disabled={disabled}
-          onchange={(v) => setPath('audio.mic.ptt_mix_gated', v)}
-        />
-      </div>
+      {#if audio.mic.ptt_separate_track}
+        <FieldRow
+          label="Mix track contains"
+          path="audio.mic.ptt_mix_gated"
+          help="Choose which version of your microphone goes on the Mix track."
+        >
+          {#snippet children(ctl)}
+            <Segmented
+              name={ctl.id}
+              labelId={ctl.labelId}
+              describedBy={ctl.describedBy}
+              value={audio.mic.ptt_mix_gated ? 'gated' : 'open'}
+              options={MIX_SOURCE_OPTIONS}
+              {disabled}
+              onchange={(v) => setPath('audio.mic.ptt_mix_gated', v === 'gated')}
+            />
+          {/snippet}
+        </FieldRow>
+      {/if}
+
+      <p class="help ptt-result" id="audio-ptt-result">
+        <span class="result-label">Resulting tracks:</span>
+        {micTrackSummary(audio)}
+      </p>
 
       <FieldRow
         label="Keep mic open after release"
@@ -764,6 +791,17 @@
     gap: 12px;
     padding-top: 10px;
     border-top: 1px solid var(--border);
+  }
+
+  .ptt-result {
+    margin: 0;
+    padding: 10px 0 14px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .result-label {
+    font-weight: 600;
+    color: var(--text);
   }
 
   .toggle-text {

@@ -1,9 +1,13 @@
-<script lang="ts" generics="T extends string">
+<script module lang="ts">
   export interface SegmentOption<V extends string> {
     value: V;
     label: string;
+    /** Disables this option only. The group's `disabled` still applies to all options. */
+    disabled?: boolean;
   }
+</script>
 
+<script lang="ts" generics="T extends string">
   interface Props {
     value: T;
     options: SegmentOption<T>[];
@@ -25,13 +29,13 @@
   aria-describedby={describedBy}
 >
   {#each options as opt (opt.value)}
-    <label class="option" class:selected={opt.value === value} class:disabled>
+    <label class="option" class:selected={opt.value === value} class:disabled={disabled || opt.disabled}>
       <input
         type="radio"
         {name}
         value={opt.value}
         checked={opt.value === value}
-        {disabled}
+        disabled={disabled || opt.disabled}
         onchange={() => onchange(opt.value)}
       />
       <span>{opt.label}</span>

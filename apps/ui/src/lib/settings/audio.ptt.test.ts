@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { trackPlanPreview, type TrackPlanInput } from './audio';
-import type { AudioAppConfig } from './store';
+import {
+  micTrackSummary,
+  pttModeOf,
+  pttSeparateOf,
+  trackPlanPreview,
+  type TrackPlanInput,
+} from './audio';
+import type { AudioAppConfig, AudioConfig } from './store';
 
 /** A layout with game and mic on, separate tracks on. Override pieces per test. */
 function plan(over: Partial<TrackPlanInput> = {}, ptt = false): TrackPlanInput {
@@ -97,5 +103,67 @@ describe('trackPlanPreview with push-to-talk on its own track', () => {
     expect(more.enabledSources).toBe(8);
     expect(more.count).toBe(9);
     expect(more.over).toBe(true);
+  });
+});
+describe('push-to-talk mode and resulting tracks', () => {
+  /** Audio config with the microphone on, for the mode and summary helpers. */
+  function audioCfg(
+    opts: { separate?: boolean; ptt?: boolean; gated?: boolean; micOn?: boolean } = {},
+  ): Pick<AudioConfig, 'separate_tracks' | 'mic'> {
+    return {
+      separate_tracks: opts.separate ?? true,
+      mic: {
+        enabled: opts.micOn ?? true,
+        device: 'default',
+        gain_db: 0,
+        gate_enabled: false,
+        gate_db: -50,
+        ptt_separate_track: opts.ptt ?? false,
+        ptt_mix_gated: opts.gated ?? true,
+        ptt_release_ms: 250,
+      },
+    };
+  }
+
+  it('pttModeOf maps ptt_separate_track false to ptt_only and true to ptt_and_open', () => {
+    expect(pttModeOf(audioCfg({ ptt: false }))).toBe('ptt_only');
+    expect(pttModeOf(audioCfg({ ptt: true }))).toBe('ptt_and_open');
+  });
+
+  it('pttSeparateOf is the inverse of pttModeOf', () => {
+    expect(pttSeparateOf('ptt_only')).toBe(false);
+    expect(pttSeparateOf('ptt_and_open')).toBe(true);
+  });
+
+  it('ptt_only with separate tracks on lists Mix and Microphone, both push to talk', () => {
+    expect(micTrackSummary(audioCfg({ separate: true, ptt: false }))).toBe(
+      'Mix (push to talk), Microphone (push to talk)',
+    );
+  });
+
+  it('ptt_only with separate tracks off lists only the Mix track', () => {
+    expect(micTrackSummary(audioCfg({ separate: false, ptt: false }))).toBe('Mix (push to talk)');
+  });
+
+  it('ptt_and_open with mix gated lists the Mix as push to talk and the open mic tracks', () => {
+    expect(micTrackSummary(audioCfg({ separate: true, ptt: true, gated: true }))).toBe(
+      'Mix (push to talk), Microphone (open mic), Push to talk (push to talk)',
+    );
+  });
+
+  it('ptt_and_open with mix not gated puts the open mic on the Mix track', () => {
+    expect(micTrackSummary(audioCfg({ separate: true, ptt: true, gated: false }))).toBe(
+      'Mix (open mic), Microphone (open mic), Push to talk (push to talk)',
+    );
+  });
+
+  it('ptt_and_open without separate tracks adds no extra tracks', () => {
+    expect(micTrackSummary(audioCfg({ separate: false, ptt: true, gated: false }))).toBe('Mix (open mic)');
+  });
+
+  it('says so when the microphone is off', () => {
+    expect(micTrackSummary(audioCfg({ micOn: false }))).toBe(
+      'Microphone is off, so no microphone is recorded.',
+    );
   });
 });
