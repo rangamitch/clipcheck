@@ -48,6 +48,13 @@ export const selection = writable<string[]>([]);
 export const playhead = writable<Tick>(0);
 /** True while playback runs. */
 export const playing = writable<boolean>(false);
+/** Preview diagnostics, refreshed about once per second while playing (see preview/engine.ts). */
+export interface PreviewStats {
+  paintFps: number;
+  videoFps: number;
+  dropped: number;
+}
+export const previewStats = writable<PreviewStats>({ paintFps: 0, videoFps: 0, dropped: 0 });
 /** Active tool. */
 export const tool = writable<EditorTool>('select');
 /** Zoom in pixels per second. */

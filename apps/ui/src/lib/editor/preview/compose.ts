@@ -62,7 +62,7 @@ interface FrameState {
 const frameStates = new WeakMap<CanvasRenderingContext2D, FrameState>();
 
 /** Minimum interval between copies of the last good frame (ms). */
-const SNAPSHOT_MS = 250;
+const SNAPSHOT_MS = 1000;
 
 /** Number of generated title and solid canvases kept. Each is project sized, so keep it small. */
 const LAYER_CACHE_LIMIT = 6;
@@ -207,13 +207,8 @@ function cropRegion(srcW: number, srcH: number, t: Transform): { sx: number; sy:
 }
 
 /** Image smoothing for a quality value in 0.25..1. */
-function smoothingFor(quality: number): ImageSmoothingQuality {
-  if (quality >= 0.75) {
-    return 'high';
-  }
-  if (quality >= 0.4) {
-    return 'medium';
-  }
+function smoothingFor(_quality: number): ImageSmoothingQuality {
+  // Low is the cheapest filter and the preview does not need more.
   return 'low';
 }
 
@@ -691,6 +686,42 @@ function paintFrame(
   }
 }
 
+/**
+ * Fast path for the common case: one opaque media layer that exactly covers the canvas without
+ * crop, rotation, flip, dip or transition. Draws the source straight onto the context (no clear, no
+ * background, no backdrop). Returns false when the frame needs the general path.
+ */
+function paintFast(
+  ctx: CanvasRenderingContext2D,
+  cw: number,
+  ch: number,
+  project: Project,
+  resolved: ResolvedLayer[],
+  t: Tick,
+): boolean {
+  if (resolved.length !== 1) return false;
+  const only = resolved[0];
+  if (!only || only.res.kind !== 'ready') return false;
+  const { layer, res } = only;
+  if (layer.kind !== 'video' && layer.kind !== 'image') return false;
+  if (unitAlpha(layerOpacityAt(layer, t)) < 1 || dipAmount(layer, t)) return false;
+  const tr = layer.transform;
+  if (quarterTurns(tr.rotate_90) !== 0 || tr.flip_h || tr.flip_v) return false;
+  if (frac(tr.crop.left) > 0 || frac(tr.crop.right) > 0 || frac(tr.crop.top) > 0 || frac(tr.crop.bottom) > 0) {
+    return false;
+  }
+  const r = projectToCanvasRect(project, tr, res.size.w, res.size.h, cw, ch);
+  if (Math.abs(r.x) > 0.5 || Math.abs(r.y) > 0.5 || Math.abs(r.w - cw) > 1 || Math.abs(r.h - ch) > 1) return false;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.filter = 'none';
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'low';
+  ctx.drawImage(res.src, 0, 0, res.size.w, res.size.h, 0, 0, cw, ch);
+  return true;
+}
+
 /** Copies the target's current frame into the snapshot, at most once per SNAPSHOT_MS. */
 function refreshSnapshot(ctx: CanvasRenderingContext2D, st: FrameState, cw: number, ch: number, now: number): void {
   let snap = st.snapshot;
@@ -774,7 +805,7 @@ export function composeFrame(
     st.shown = false;
     ctx.save();
     try {
-      paintFrame(ctx, cw, ch, project, resolved, t, quality);
+      if (!paintFast(ctx, cw, ch, project, resolved, t)) paintFrame(ctx, cw, ch, project, resolved, t, quality);
     } finally {
       ctx.restore();
     }

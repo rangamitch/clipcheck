@@ -32,6 +32,7 @@ import { AudioGraph } from './audioGraph';
 import { gainRamp, segmentAt, sourceTimeFor, upcoming, upcomingStreams, type GainPoint } from './scheduler';
 import { editorApi } from '../api';
 import { composeFrame, type SourceFrames } from './compose';
+import { previewStats } from '../store';
 
 /** Preview resolution as a fraction of the project canvas. */
 export type PreviewQuality = 'full' | 'half' | 'quarter';
@@ -94,6 +95,14 @@ const MIN_RATE = 0.0625;
 const MAX_RATE = 8;
 /** Drift (seconds) above which a playing element is re-seeked. Smaller drift is nudged. */
 const DRIFT_SEEK_S = 0.25;
+/** Same for video elements: any seek while playing stalls WebView2, so only large drift seeks. */
+const DRIFT_SEEK_VIDEO_S = 0.5;
+/** Minimum gap between time notifications while playing (ms, about 30 Hz). */
+const TIME_EMIT_MS = 33;
+/** Without a new video frame for this long, the paint skipper paints every animation frame (ms). */
+const FRAME_STALL_MS = 100;
+/** Interval of the preview stats update (ms). */
+const STATS_MS = 1000;
 /** Drift (seconds) above which a playing element starts to be nudged. */
 const DRIFT_NUDGE_S = 0.1;
 /** Drift (seconds) below which a nudged element returns to its nominal rate (hysteresis). */
@@ -253,6 +262,36 @@ function setPreload(entry: PlayEntry, value: 'metadata' | 'auto'): void {
 }
 
 /** Detaches every handler of an image and releases its source. */
+/**
+ * Container that keeps pooled media elements attached to the document. Detached, display:none or
+ * 0x0 video elements are throttled by Chromium (few presented frames), so they live in a 1x1 px,
+ * almost transparent, click-through box instead.
+ */
+function mediaHost(): HTMLElement | null {
+  if (typeof document === 'undefined' || !document.body) return null;
+  const id = 'cc-preview-media-host';
+  let host = document.getElementById(id);
+  if (!host) {
+    host = document.createElement('div');
+    host.id = id;
+    host.setAttribute('aria-hidden', 'true');
+    host.style.cssText =
+      'position:fixed;left:0;top:0;width:1px;height:1px;overflow:hidden;opacity:0.01;pointer-events:none;z-index:-1;';
+    document.body.appendChild(host);
+  }
+  return host;
+}
+
+/** Attaches a media element to the host and sizes it 1x1 (never 0x0). */
+function hostElement(el: HTMLMediaElement): void {
+  try {
+    el.style.cssText = 'width:1px;height:1px;';
+    mediaHost()?.appendChild(el);
+  } catch {
+    // Playback still works detached, only slower.
+  }
+}
+
 function disposeImage(img: HTMLImageElement): void {
   img.onload = null;
   img.onerror = null;
@@ -296,6 +335,13 @@ class Engine implements PreviewEngine {
   private lastPaintFrames = -1;
   private lastPaintMs = 0;
   private lastResumeMs = 0;
+  private lastTimeEmitMs = 0;
+  private lastFrameChangeMs = 0;
+  private lastFrameTotalSeen = -1;
+  private statsStartMs = 0;
+  private statsPaints = 0;
+  private statsFrames0 = 0;
+  private statsDropped0 = 0;
   private readonly hasFrameCallback =
     typeof HTMLVideoElement !== 'undefined' && 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
   /** Audio source keys (clip ids) that currently have a gain curve. */
@@ -355,7 +401,7 @@ class Engine implements PreviewEngine {
   attach(canvas: HTMLCanvasElement): void {
     if (this.destroyed) return;
     this.canvas = canvas;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true }) as CanvasRenderingContext2D | null;
     if (!ctx) {
       this.ctx2d = null;
       this.reportError(new Error('canvas 2D context is unavailable'));
@@ -421,6 +467,7 @@ class Engine implements PreviewEngine {
     this.clock.start(from, this.rate);
     this.segStart = null;
     this.lastAudioMs = 0;
+    this.resetStats(performance.now());
     this.resetDropWindow(performance.now());
     this.updateHiddenTimer();
     if (this.rafId === null) this.rafId = requestAnimationFrame(this.loop);
@@ -673,12 +720,17 @@ class Engine implements PreviewEngine {
           this.lastPaintSeg = seg;
           this.lastPaintFrames = this.frameTotal();
           this.lastPaintMs = now;
+          this.statsPaints++;
           // Keep painting every tick until all sources have a frame.
           if (this.frameMissed) this.paintDirty = true;
           this.countFrame(this.frameMissed || performance.now() - started > DROP_STEP_MS, now);
         }
       }
-      this.emitTime(t);
+      if (now - this.lastTimeEmitMs >= TIME_EMIT_MS) {
+        this.lastTimeEmitMs = now;
+        this.emitTime(t);
+      }
+      if (paint) this.updateStats(now);
       if (now - this.lastLevelsMs >= LEVELS_MS) {
         this.lastLevelsMs = now;
         this.emitLevels(this.audio.levels());
@@ -701,13 +753,19 @@ class Engine implements PreviewEngine {
 
   /**
    * True when painting now can change the picture: something marked the canvas dirty, the segment
-   * changed, a video presented a new frame, a transition animates with time, or the last paint is
-   * older than two frames at 60 Hz (a floor in case frame callbacks under-fire for detached elements).
+   * changed, a video presented a new frame, a transition animates with time, or no frame callback
+   * fired for FRAME_STALL_MS (then every animation frame paints).
    */
   private needsPaint(seg: PlanSegment, now: number): boolean {
     if (!this.hasFrameCallback || this.paintDirty || seg !== this.lastPaintSeg) return true;
-    if (now - this.lastPaintMs >= 34) return true;
-    if (this.frameTotal() !== this.lastPaintFrames) return true;
+    const total = this.frameTotal();
+    if (total !== this.lastFrameTotalSeen) {
+      this.lastFrameTotalSeen = total;
+      this.lastFrameChangeMs = now;
+    }
+    if (total !== this.lastPaintFrames) return true;
+    // No frame callbacks for a while (detached or throttled element): paint every animation frame.
+    if (now - this.lastFrameChangeMs >= FRAME_STALL_MS) return true;
     for (const layer of seg.video) if (layer.transition !== null) return true;
     return false;
   }
@@ -898,6 +956,7 @@ class Engine implements PreviewEngine {
     el.preservesPitch = false;
     // Media comes from another origin. Web Audio needs CORS or the source is silent.
     el.crossOrigin = 'anonymous';
+    hostElement(el);
     const entry: ElementEntry = {
       mediaId,
       el,
@@ -1006,6 +1065,11 @@ class Engine implements PreviewEngine {
       }
     } catch {
       // The element may already be detached from its media: nothing to undo.
+    }
+    try {
+      el.remove();
+    } catch {
+      // Already detached.
     }
     entry.hasSrc = false;
   }
@@ -1252,7 +1316,7 @@ class Engine implements PreviewEngine {
     // Positive drift means the element is ahead of its source time.
     const drift = el.currentTime - target;
     const abs = Math.abs(drift);
-    if (abs > DRIFT_SEEK_S && now - entry.lastSeekMs >= entry.gapMs) {
+    if (abs > (audioOnly ? DRIFT_SEEK_S : DRIFT_SEEK_VIDEO_S) && now - entry.lastSeekMs >= entry.gapMs) {
       // Lead the target by the cost of the seek, since the element keeps playing while it loads.
       this.seekTo(entry, target + (entry.seekCostMs / 1000) * nominal, now);
       entry.gapMs = Math.min(SEEK_GAP_MAX_MS, entry.gapMs * 2);
@@ -1333,6 +1397,7 @@ class Engine implements PreviewEngine {
     el.preservesPitch = false;
     // The file comes from another origin. Web Audio needs CORS or the source is silent.
     el.crossOrigin = 'anonymous';
+    hostElement(el);
     const entry: AudioEntry = {
       key,
       mediaId,
@@ -1476,6 +1541,53 @@ class Engine implements PreviewEngine {
   }
 
   // ---- reporting --------------------------------------------------------------------------
+
+  private resetStats(now: number): void {
+    this.statsStartMs = now;
+    this.statsPaints = 0;
+    this.statsFrames0 = this.playbackFrames().total;
+    this.statsDropped0 = this.playbackFrames().dropped;
+    this.lastTimeEmitMs = 0;
+    this.lastFrameChangeMs = now;
+  }
+
+  /** Cumulative presented and dropped video frames over all pooled video elements. */
+  private playbackFrames(): { total: number; dropped: number } {
+    let total = 0;
+    let dropped = 0;
+    for (const entry of this.elements.values()) {
+      try {
+        if (this.hasFrameCallback) {
+          total += entry.frameSeq;
+        } else {
+          total += entry.el.getVideoPlaybackQuality().totalVideoFrames;
+        }
+        dropped += entry.el.getVideoPlaybackQuality().droppedVideoFrames;
+      } catch {
+        // Not available on this element.
+      }
+    }
+    return { total, dropped };
+  }
+
+  /** Publishes paint fps, distinct video frames per second and dropped frames, once per second. */
+  private updateStats(now: number): void {
+    const span = now - this.statsStartMs;
+    if (span < STATS_MS) return;
+    const cur = this.playbackFrames();
+    const secs = span / 1000;
+    const videoFps = Math.max(0, (cur.total - this.statsFrames0) / secs);
+    const dropped = Math.max(0, cur.dropped - this.statsDropped0);
+    previewStats.set({
+      paintFps: Math.round(this.statsPaints / secs),
+      videoFps: Math.round(videoFps),
+      dropped,
+    });
+    this.statsStartMs = now;
+    this.statsPaints = 0;
+    this.statsFrames0 = cur.total;
+    this.statsDropped0 = cur.dropped;
+  }
 
   private emitTime(t: Tick): void {
     notifyAll(this.timeCbs, t);

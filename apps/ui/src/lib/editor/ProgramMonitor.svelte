@@ -10,6 +10,7 @@
     dispatch,
     playhead,
     playing,
+    previewStats,
     project,
     seek,
     selectClips,
@@ -646,6 +647,11 @@
       onpointercancel={endDrag}
     >
       <canvas bind:this={canvasEl} class="picture" aria-label="Program picture"></canvas>
+      {#if $playing}
+        <div class="perf-stats" aria-hidden="true">
+          paint {$previewStats.paintFps} fps  video {$previewStats.videoFps} fps  dropped {$previewStats.dropped}
+        </div>
+      {/if}
 
       {#if showGuides}
         <div class="guides" aria-hidden="true">
@@ -862,6 +868,18 @@
     max-width: 100%;
     max-height: 100%;
     touch-action: none;
+  }
+
+  .perf-stats {
+    position: absolute;
+    left: 6px;
+    top: 4px;
+    font: 10px/1.2 ui-monospace, Consolas, monospace;
+    color: #fff;
+    opacity: 0.6;
+    pointer-events: none;
+    white-space: pre;
+    text-shadow: 0 0 2px #000;
   }
 
   .picture {
