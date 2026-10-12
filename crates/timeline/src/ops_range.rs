@@ -381,7 +381,8 @@ fn track_end(p: &Project, track_id: &str) -> Tick {
 /// Start for an `Append` paste. `targets[i]` is the track chosen for `clips[i]`. When any pasted
 /// clip goes on a video track, the anchor is the end of the latest video target track (audio
 /// lanes are not consulted). An audio-only paste anchors on the end of the first audio target.
-/// Like `place_media`, an occupied lane is refused by the overlap check, never shifted around.
+/// Like `place_media`, the pasted clips overwrite whatever is under them (see
+/// `ops_basic::overwrite_under`); an occupied lane is never shifted around.
 fn append_anchor(p: &Project, clips: &[Clip], targets: &[String]) -> Tick {
     let video_targets: Vec<&str> = clips
         .iter()

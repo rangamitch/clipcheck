@@ -155,21 +155,28 @@ fn trim_end_changes_dur_only() {
 }
 
 #[test]
-fn trim_end_into_neighbour_is_overlap_and_atomic() {
+fn trim_end_into_neighbour_overwrites_its_head() {
     let mut p = ab_project();
-    let before = p.clone();
-    let r = trim_edge(&mut p, "a", Edge::End, s(5), false);
-    assert!(matches!(r, Err(EditError::Overlap(_))), "got {r:?}");
-    assert_eq!(p, before);
+    trim_edge(&mut p, "a", Edge::End, s(5), false).expect("the trimmed clip goes on top");
+    assert_eq!(get(&p, "a").dur, s(5));
+    // b [4, 7) loses [4, 5): it now starts at 5 and its source moves on by one second.
+    let b = get(&p, "b");
+    assert_eq!(b.start, s(5));
+    assert_eq!(b.dur, s(2));
+    assert_eq!(b.src_in, s(3));
 }
 
 #[test]
-fn trim_start_into_previous_neighbour_is_overlap_and_atomic() {
+fn trim_start_into_previous_neighbour_overwrites_its_tail() {
     let mut p = ab_project();
-    let before = p.clone();
-    let r = trim_edge(&mut p, "b", Edge::Start, s(3), false);
-    assert!(matches!(r, Err(EditError::Overlap(_))), "got {r:?}");
-    assert_eq!(p, before);
+    trim_edge(&mut p, "b", Edge::Start, s(3), false).expect("the trimmed clip goes on top");
+    // b now covers [3, 7); a [0, 4) keeps [0, 3).
+    let a = get(&p, "a");
+    assert_eq!(a.start, s(0));
+    assert_eq!(a.dur, s(3));
+    let b = get(&p, "b");
+    assert_eq!(b.start, s(3));
+    assert_eq!(b.dur, s(4));
 }
 
 #[test]
@@ -692,12 +699,13 @@ fn set_speed_two_halves_duration_exactly() {
 }
 
 #[test]
-fn set_speed_half_without_ripple_into_neighbour_is_overlap_and_atomic() {
+fn set_speed_half_without_ripple_overwrites_the_neighbour() {
     let mut p = ab_project();
-    let before = p.clone();
-    let r = set_speed(&mut p, "a", 0.5, false);
-    assert!(matches!(r, Err(EditError::Overlap(_))), "got {r:?}");
-    assert_eq!(p, before);
+    set_speed(&mut p, "a", 0.5, false).expect("the slowed clip goes on top");
+    // a grows to [0, 8), which covers b [4, 7) completely.
+    assert_eq!(get(&p, "a").dur, s(8));
+    assert!(p.clip("b").is_none());
+    assert_eq!(p.clips.len(), 1);
 }
 
 #[test]

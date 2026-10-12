@@ -1311,12 +1311,13 @@ fn title_on_audio_track_is_wrong_kind() {
 }
 
 #[test]
-fn title_overlapping_existing_clip_is_overlap_error() {
+fn title_overlapping_existing_clip_overwrites_it() {
     let mut p = mixed_project();
     let vv = tid(&p, TrackKind::Video, 0);
-    let r = add_title(&mut p, &vv, secs(1), secs(2), TextSpec::default());
-    assert!(matches!(r, Err(EditError::Overlap(_))), "got {r:?}");
-    assert_eq!(p.clips.len(), 2);
+    add_title(&mut p, &vv, secs(1), secs(2), TextSpec::default()).expect("title goes on top");
+    // The video clip [0, 2) keeps only [0, 1); the title covers [1, 3).
+    assert_eq!(clip_ref(&p, "v").dur, secs(1));
+    assert_eq!(p.clips.len(), 3);
 }
 
 #[test]
@@ -1405,13 +1406,14 @@ fn add_solid_on_audio_track_is_wrong_kind() {
 }
 
 #[test]
-fn add_solid_overlap_is_refused() {
+fn add_solid_overlap_overwrites_the_first_solid() {
     let mut p = project();
     let vv = tid(&p, TrackKind::Video, 0);
-    add_solid(&mut p, &vv, secs(0), secs(2), Rgba::WHITE).expect("first");
-    let r = add_solid(&mut p, &vv, secs(1), secs(1), Rgba::BLACK);
-    assert!(matches!(r, Err(EditError::Overlap(_))), "got {r:?}");
-    assert_eq!(p.clips.len(), 1);
+    let first = add_solid(&mut p, &vv, secs(0), secs(2), Rgba::WHITE).expect("first");
+    let second = add_solid(&mut p, &vv, secs(1), secs(1), Rgba::BLACK).expect("second goes on top");
+    assert_eq!(clip_ref(&p, &first).dur, secs(1));
+    assert_eq!(clip_ref(&p, &second).start, secs(1));
+    assert_eq!(p.clips.len(), 2);
 }
 
 // ----- audio_clip_for --------------------------------------------------------------------------

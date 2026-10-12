@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{EditError, EditResult};
 use crate::model::{Clip, ClipKind, EnvPoint, Project, WorkArea};
+use crate::ops_basic::overwrite_under;
 use crate::ops_group::expand_selection;
 use crate::time::{Rate, Tick, MAX_TICK, TICKS_PER_SECOND};
 
@@ -24,8 +25,9 @@ pub enum Edge {
 /// Moves one edge of a clip to `new_time` on the timeline (and the edge of its group/link
 /// partners by the same delta). Rules: the clip keeps at least one frame (`canvas.fps` frame
 /// duration) of length; the source range may not go below 0 or beyond the media duration (images,
-/// titles and solids are unbounded); the edge may not cross a neighbour on the same track unless
-/// `ripple` is true.
+/// titles and solids are unbounded). An edge that runs into a neighbour on the same track
+/// overwrites it (the trimmed clip goes on top, see `ops_basic::overwrite_under`); `ripple` only
+/// adds the shift of the later clips.
 /// - Start edge, not ripple: `start` moves, `dur` shrinks/grows, `src_in` advances by
 ///   `delta * speed` (reverse: `src_in` unchanged, only dur changes).
 /// - End edge, not ripple: `dur` changes only.
@@ -45,12 +47,13 @@ pub fn trim_edge(
     let old_edge = edge_time(&main, edge);
     let delta = new_time.saturating_sub(old_edge);
     let mut np = p.clone();
-    for id in partner_ids(p, clip_id)? {
-        let c = get_clip(p, &id)?;
+    let ids = partner_ids(p, clip_id)?;
+    for id in &ids {
+        let c = get_clip(p, id)?;
         let target = edge_time(&c, edge).saturating_add(delta);
-        trim_one(&mut np, &id, edge, target, ripple)?;
+        trim_one(&mut np, id, edge, target, ripple)?;
     }
-    check_overlaps(&np)?;
+    settle(&mut np, &ids)?;
     *p = np;
     Ok(())
 }
@@ -120,7 +123,10 @@ pub fn roll_edit(p: &mut Project, left_id: &str, right_id: &str, new_cut: Tick) 
     for (pid, target) in right_targets {
         trim_one(&mut np, &pid, Edge::Start, target, false)?;
     }
-    check_overlaps(&np)?;
+    let mut incoming = vec![left_id.to_string(), right_id.to_string()];
+    incoming.extend(left_partners);
+    incoming.extend(right_partners);
+    settle(&mut np, &incoming)?;
     *p = np;
     Ok(())
 }
@@ -187,15 +193,16 @@ pub fn slide(p: &mut Project, clip_id: &str, delta: Tick) -> EditResult<()> {
         }
         commit(&mut np, r)?;
     }
-    check_overlaps(&np)?;
+    settle(&mut np, &partners)?;
     *p = np;
     Ok(())
 }
 
 /// Sets constant speed 0.1..=8.0 on the clip and its group/link partners, keeping the same
 /// source range (so `dur` becomes `src_len / speed`). With `ripple`, later clips on each affected
-/// track shift by the length change; without, the call fails with Overlap if the clip would run
-/// into its right neighbour. Envelope point times and fade lengths are rescaled/clamped.
+/// track shift by the length change; without, a lengthened clip overwrites the clips it runs into
+/// on its right (see `ops_basic::overwrite_under`). Envelope point times and fade lengths are
+/// rescaled/clamped.
 ///
 /// Fades scale with the timeline length. After scaling, `fade_in + fade_out` is clamped to the new
 /// `dur` by shrinking both fades by the same factor (see [`clamp_fade_pair`]), not by cutting only
@@ -209,8 +216,8 @@ pub fn set_speed(p: &mut Project, clip_id: &str, speed: f64, ripple: bool) -> Ed
     let fd = p.canvas.fps.frame_duration();
     let ids = partner_ids(p, clip_id)?;
     let mut np = p.clone();
-    for id in ids {
-        let c = get_clip(&np, &id)?;
+    for id in &ids {
+        let c = get_clip(&np, id)?;
         if c.speed <= 0.0 {
             return Err(EditError::Invalid(
                 "a freeze clip cannot take a speed".to_string(),
@@ -248,10 +255,10 @@ pub fn set_speed(p: &mut Project, clip_id: &str, speed: f64, ripple: bool) -> Ed
         }
         commit(&mut np, nc)?;
         if ripple && change != Tick::ZERO {
-            shift_later(&mut np, &c.track_id, old_end, &id, change)?;
+            shift_later(&mut np, &c.track_id, old_end, id, change)?;
         }
     }
-    check_overlaps(&np)?;
+    settle(&mut np, &ids)?;
     *p = np;
     Ok(())
 }
@@ -359,7 +366,7 @@ pub fn join_through_edit(p: &mut Project, left_id: &str, right_id: &str) -> Edit
             }
         }
     }
-    check_overlaps(&np)?;
+    settle(&mut np, &[left_id.to_string()])?;
     *p = np;
     Ok(left_id.to_string())
 }
@@ -617,7 +624,16 @@ fn shift_later(
     Ok(())
 }
 
-/// Fails with `Overlap` when two clips on one track share time (touching is fine).
+/// Makes the changed clips (`incoming`) overwrite whatever they now overlap, then runs the
+/// overlap check as a safety net. Overwriting never leaves an overlap, so `check_overlaps` only
+/// fails on a bug in `overwrite_under`.
+fn settle(p: &mut Project, incoming: &[String]) -> EditResult<()> {
+    p.clips = overwrite_under(std::mem::take(&mut p.clips), incoming);
+    check_overlaps(p)
+}
+
+/// Safety net after [`settle`]: fails with `Overlap` when two clips on one track share time
+/// (touching is fine).
 fn check_overlaps(p: &Project) -> EditResult<()> {
     for t in &p.tracks {
         let mut v: Vec<&Clip> = p.clips.iter().filter(|c| c.track_id == t.id).collect();

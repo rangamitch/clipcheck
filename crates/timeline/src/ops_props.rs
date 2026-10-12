@@ -13,6 +13,7 @@ use crate::model::{
     new_id, Canvas, Clip, ClipAudio, ClipKind, EnvPoint, FadeCurve, Marker, Project, Rgba,
     TextSpec, Track, TrackKind, Transform, Transition,
 };
+use crate::ops_basic::overwrite_under;
 use crate::time::{Tick, MAX_PROJECT_TICKS};
 
 /// Most video tracks a project may hold.
@@ -922,17 +923,13 @@ fn insert_generated(
             "project length is limited to 4 hours".to_string(),
         ));
     }
-    if p.clips
-        .iter()
-        .any(|c| c.track_id == track_id && c.start < end && c.end() > at)
-    {
-        return Err(EditError::Overlap(track_id.to_string()));
-    }
     let id = new_id();
     clip.id = id.clone();
     clip.track_id = track_id.to_string();
     clip.start = at;
     clip.dur = dur;
+    // The generated clip overwrites whatever is under it (see `overwrite_under`).
     p.clips.push(clip);
+    p.clips = overwrite_under(std::mem::take(&mut p.clips), std::slice::from_ref(&id));
     Ok(id)
 }
