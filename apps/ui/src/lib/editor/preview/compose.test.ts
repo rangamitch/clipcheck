@@ -748,16 +748,11 @@ describe('composeFrame: smoothing, sizes and the snapshot', () => {
     vi.useRealTimers();
   });
 
-  it.each([
-    [1, 'high'],
-    [0.75, 'high'],
-    [0.5, 'medium'],
-    [0.4, 'medium'],
-    [0.25, 'low'],
-  ])('quality %s selects %s smoothing', (q, expected) => {
+  // Deliberate design (see smoothingFor in compose.ts): every quality uses the cheapest 'low' filter.
+  it.each([1, 0.75, 0.5, 0.4, 0.25])('quality %s uses low smoothing', (q) => {
     const t = makeTarget(1080, 1920);
     composeFrame(t.ctx, 1080, 1920, p, segment([]), 0, NO_SOURCES, q);
-    expect(ops(t.rec, 'clearRect')[0]?.s.imageSmoothingQuality).toBe(expected);
+    expect(ops(t.rec, 'clearRect')[0]?.s.imageSmoothingQuality).toBe('low');
   });
 
   it('a backing store size that is fractional is rounded to whole pixels', () => {
@@ -787,16 +782,20 @@ describe('composeFrame: smoothing, sizes and the snapshot', () => {
     expect(ops(t.rec, 'fillRect').length).toBe(2);
   });
 
-  it('copies the frame into the snapshot at most once every 250 ms', () => {
+  // Deliberate design: SNAPSHOT_MS is 1000 ms (not 250 ms), so the copy costs at most once a second.
+  it('copies the frame into the snapshot at most once every 1000 ms', () => {
     const t = makeTarget(1080, 1920);
+    const copies = () => ops(t.rec, 'drawImage').filter((e) => e.args[0] === t.canvas).length;
     composeFrame(t.ctx, 1080, 1920, p, segment([]), 0, NO_SOURCES, 1);
-    const copiesAfterFirst = ops(t.rec, 'drawImage').filter((e) => e.args[0] === t.canvas).length;
-    expect(copiesAfterFirst).toBe(1);
+    expect(copies()).toBe(1);
     composeFrame(t.ctx, 1080, 1920, p, segment([]), 0, NO_SOURCES, 1);
-    expect(ops(t.rec, 'drawImage').filter((e) => e.args[0] === t.canvas).length).toBe(1);
-    vi.advanceTimersByTime(300);
+    expect(copies()).toBe(1);
+    vi.advanceTimersByTime(999);
     composeFrame(t.ctx, 1080, 1920, p, segment([]), 0, NO_SOURCES, 1);
-    expect(ops(t.rec, 'drawImage').filter((e) => e.args[0] === t.canvas).length).toBe(2);
+    expect(copies()).toBe(1);
+    vi.advanceTimersByTime(1);
+    composeFrame(t.ctx, 1080, 1920, p, segment([]), 0, NO_SOURCES, 1);
+    expect(copies()).toBe(2);
   });
 });
 
@@ -1003,17 +1002,20 @@ describe('composeFrame: failed media and dips', () => {
     expect(black?.args).toEqual([135, 0, 810, 1920]);
   });
 
+  // Source draws only: the snapshot copy of the target canvas is also a drawImage, so it is excluded.
+  const sourceDraws = (t: Target) => ops(t.rec, 'drawImage').filter((e) => e.args[0] !== t.canvas);
+
   it('a failed layer is not drawn with drawImage', () => {
     const t = makeTarget(1080, 1920);
     composeFrame(t.ctx, 1080, 1920, p, segment([layer({ media_id: 'bad' })]), 0, sourcesOf({}, ['bad']), 1);
-    expect(ops(t.rec, 'drawImage')).toEqual([]);
+    expect(sourceDraws(t)).toEqual([]);
   });
 
   it('a failed layer stays black over a ready layer below it when both are on the frame', () => {
     const t = makeTarget(1080, 1920);
     const seg = segment([layer({ clip_id: 'low', media_id: 'm1', z: 0 }), layer({ clip_id: 'top', media_id: 'bad', z: 1 })]);
     composeFrame(t.ctx, 1080, 1920, p, seg, 0, sourcesOf({ m1: FULL_HD }, ['bad']), 1);
-    expect(ops(t.rec, "drawImage")).toHaveLength(1);
+    expect(sourceDraws(t)).toHaveLength(1);
     const drawAt = t.rec.log.findIndex((e) => e.op === "drawImage");
     const blackAt = t.rec.log.findIndex((e) => e.op === "fillRect" && e.s.fillStyle === "rgb(0, 0, 0)");
     expect(drawAt).toBeGreaterThanOrEqual(0);
@@ -1082,7 +1084,7 @@ describe('composeFrame: failed media and dips', () => {
   it('a title that is not ready yet (no text) draws nothing', () => {
     const t = makeTarget(1080, 1920);
     composeFrame(t.ctx, 1080, 1920, p, segment([layer({ kind: 'title', media_id: null, text: null })]), 0, NO_SOURCES, 1);
-    expect(ops(t.rec, 'drawImage')).toEqual([]);
+    expect(sourceDraws(t)).toEqual([]);
   });
 });
 

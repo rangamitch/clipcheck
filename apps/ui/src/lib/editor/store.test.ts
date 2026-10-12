@@ -46,6 +46,7 @@ import {
   toast,
   tool,
   undo,
+  MIN_PX_PER_SEC,
   zoomBy,
   zoomToFit,
 } from './store';
@@ -190,9 +191,9 @@ describe('openSnapshot', () => {
     expect(get(pxPerSec)).toBe(120);
   });
 
-  it('clamps a too small zoom from ui_state to 2 px per second', () => {
-    openSnapshot(snapshotOf(project([], { ui_state: { zoom_px_per_sec: 0.5, scroll_x: 0, playhead: 0 } })));
-    expect(get(pxPerSec)).toBe(2);
+  it('clamps a too small zoom from ui_state to the minimum zoom', () => {
+    openSnapshot(snapshotOf(project([], { ui_state: { zoom_px_per_sec: MIN_PX_PER_SEC / 10, scroll_x: 0, playhead: 0 } })));
+    expect(get(pxPerSec)).toBe(MIN_PX_PER_SEC);
   });
 
   it('clamps a too large zoom from ui_state to 4000 px per second', () => {
@@ -730,10 +731,10 @@ describe('zoom', () => {
     expect(get(pxPerSec)).toBe(4000);
   });
 
-  it('zoomBy clamps to the minimum of 2 px per second', () => {
+  it('zoomBy clamps to the minimum zoom', () => {
     pxPerSec.set(3);
-    zoomBy(0.1);
-    expect(get(pxPerSec)).toBe(2);
+    zoomBy(0.001);
+    expect(get(pxPerSec)).toBe(MIN_PX_PER_SEC);
   });
 
   it('zoomBy ignores a zero factor', () => {
@@ -828,7 +829,7 @@ describe('zoom', () => {
   it('zoomToFit clamps the result to the minimum', () => {
     openSnapshot(snapshotOf(project([])));
     zoomToFit(20);
-    expect(get(pxPerSec)).toBe(2);
+    expect(get(pxPerSec)).toBe(MIN_PX_PER_SEC);
   });
 
   it('zoomToFit ignores a non-finite view width', () => {

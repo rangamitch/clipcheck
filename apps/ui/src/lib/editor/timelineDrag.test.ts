@@ -23,7 +23,7 @@ import {
   type RollDrag,
   type TrimDrag,
 } from './timelineDrag';
-import { clipRect, envelopeY, hitEnvelopePoint as layoutHitEnvelopePoint, tickToX, trackLayout, type HitResult, type View } from './layout';
+import { RULER_HEIGHT, clipRect, envelopeY, hitEnvelopePoint as layoutHitEnvelopePoint, tickToX, trackLayout, type HitResult, type View } from './layout';
 import type { Clip, EnvPoint, MediaRef, Project, Track, TrackKind } from './types';
 import { defaultCanvas, defaultClipAudio, defaultExportSettings, defaultTransform } from './types';
 
@@ -145,15 +145,18 @@ function movePartnerProject(): Project {
   ]);
 }
 
-/** A 0..2 s with an envelope of three points; A has a fade-out of 1.5 s and a fade-in of 0. */
+/**
+ * A 0..2 s audio clip on a1 with an envelope of three points; A has a fade-out of 1.5 s and a
+ * fade-in of 0. An empty video track sits above a1, so a1 (and A) row top is RULER_HEIGHT + 56 + gap = 86.
+ */
 function envProject(): Project {
   const env: EnvPoint[] = [
     { t: 0, db: 0 },
     { t: sec(1), db: -6 },
     { t: sec(1.8), db: -12 },
   ];
-  return project([track('v1', 'video')], [
-    clip('A', 'v1', 0, sec(2), { audio: { ...defaultClipAudio(), envelope: env, fade_out: sec(1.5) } }),
+  return project([track('v1', 'video'), track('a1', 'audio')], [
+    clip('A', 'a1', 0, sec(2), { kind: 'audio', audio: { ...defaultClipAudio(), envelope: env, fade_out: sec(1.5) } }),
   ]);
 }
 
@@ -449,7 +452,7 @@ describe('move drag updates', () => {
     const p = groupProject();
     const s = beginDrag({ kind: 'clip', clipId: 'B' }, pt(0, 100), p, []) as MoveDrag;
     const u = updateDrag(s, pt(50, 100), ctxFor(p));
-    expect(u.ghosts.find((g) => g.clipId === 'BG')?.rect).toEqual({ x: 650, y: 86, w: 100, h: 56 });
+    expect(u.ghosts.find((g) => g.clipId === 'BG')?.rect).toEqual({ x: 650, y: RULER_HEIGHT, w: 100, h: 56 });
   });
 
   it('moving up to the track above sets a track offset of minus one for a video clip', () => {
@@ -659,7 +662,8 @@ describe('trim drag', () => {
 
   it('a ripple trim-end (Shift) cannot pass the project length limit', () => {
     const s = beginDrag({ kind: 'edge-end', clipId: 'A' }, pt(200, 100), p, []) as TrimDrag;
-    const u = updateDrag(s, pt(1_000_000, 100, { shiftKey: true }), ctxFor(p));
+    // 2_000_000 px at 100 px/s is 20 000 s, past the 4 h (14 400 s) limit.
+    const u = updateDrag(s, pt(2_000_000, 100, { shiftKey: true }), ctxFor(p));
     expect((u.state as TrimDrag).newTime).toBe(4 * 3600 * TPS);
   });
 
@@ -736,8 +740,8 @@ describe('roll drag', () => {
   it('a roll draws both clips with the new edit point', () => {
     const s = beginDrag({ kind: 'edge-end', clipId: 'A' }, pt(200, 100, { altKey: true }), p, []);
     const u = updateDrag(s as DragState, pt(250, 100, { altKey: true }), ctxFor(p));
-    expect(u.ghosts.find((g) => g.clipId === 'A')?.rect).toEqual({ x: 0, y: 86, w: 250, h: 56 });
-    expect(u.ghosts.find((g) => g.clipId === 'R')?.rect).toEqual({ x: 250, y: 86, w: 150, h: 56 });
+    expect(u.ghosts.find((g) => g.clipId === 'A')?.rect).toEqual({ x: 0, y: RULER_HEIGHT, w: 250, h: 56 });
+    expect(u.ghosts.find((g) => g.clipId === 'R')?.rect).toEqual({ x: 250, y: RULER_HEIGHT, w: 150, h: 56 });
   });
 
   it('a roll cannot make the left clip shorter than a frame', () => {

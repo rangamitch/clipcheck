@@ -32,6 +32,7 @@ const uiState = { zoom_px_per_sec: 80, scroll_x: 0, playhead: 0 };
 type Row = [name: string, run: () => Promise<unknown>, cmd: string, args?: Record<string, unknown>];
 
 const rows: Row[] = [
+  ['listEncoders', () => editorApi.listEncoders('h264'), 'editor_list_encoders', { codec: 'h264' }],
   ['listProjects', () => editorApi.listProjects(), 'editor_list_projects'],
   ['newProject', () => editorApi.newProject('Demo', null, ['r1']), 'editor_new_project', { name: 'Demo', canvas: null, recordingIds: ['r1'] }],
   ['newProject', () => editorApi.newProject('Demo', canvas, []), 'editor_new_project', { name: 'Demo', canvas, recordingIds: [] }],
@@ -58,6 +59,7 @@ const rows: Row[] = [
   ['waveform', () => editorApi.waveform('m1', 0, 200), 'editor_waveform', { mediaId: 'm1', stream: 0, buckets: 200 }],
   ['thumbnails', () => editorApi.thumbnails('m1', [0, 1000], 90), 'editor_thumbnails', { mediaId: 'm1', timesMs: [0, 1000], height: 90 }],
   ['mediaUrl', () => editorApi.mediaUrl('m1'), 'editor_media_url', { mediaId: 'm1' }],
+  ['audioStreamUrl', () => editorApi.audioStreamUrl('m1', 1), 'editor_audio_stream_url', { mediaId: 'm1', stream: 1 }],
   ['measureClipLoudness', () => editorApi.measureClipLoudness('c1'), 'editor_measure_clip_loudness', { clipId: 'c1' }],
   ['exportDefaults', () => editorApi.exportDefaults(), 'editor_export_defaults'],
   ['estimateExport', () => editorApi.estimateExport(settings), 'editor_estimate_export', { settings }],
@@ -70,6 +72,7 @@ const rows: Row[] = [
   ['exportQueue', () => editorApi.exportQueue(), 'editor_export_queue'],
   ['exportDismiss', () => editorApi.exportDismiss('job-1'), 'editor_export_dismiss', { jobId: 'job-1' }],
   ['exportReorder', () => editorApi.exportReorder('job-1', 2), 'editor_export_reorder', { jobId: 'job-1', index: 2 }],
+  ['openExport', () => editorApi.openExport('D:/exports/a.mp4'), 'editor_open_export', { path: 'D:/exports/a.mp4' }],
   ['exportStill', () => editorApi.exportStill(5000, 'png', 90), 'editor_export_still', { at: 5000, format: 'png', quality: 90, dir: null, nameTemplate: null }],
   ['exportStill', () => editorApi.exportStill(5000, 'jpg', 80, 'D:/stills', '{project}_{time}'), 'editor_export_still', { at: 5000, format: 'jpg', quality: 80, dir: 'D:/stills', nameTemplate: '{project}_{time}' }],
   ['currentSnapshot', () => editorApi.currentSnapshot(), 'editor_current_snapshot'],
@@ -126,7 +129,7 @@ describe('editorApi command names and arguments', () => {
   it('the table covers every method of editorApi', () => {
     const covered = new Set(rows.map((r) => r[0]));
     const methods = Object.keys(editorApi).sort();
-    expect(methods.length).toBe(40);
+    expect(methods.length).toBe(43);
     expect(methods.every((m) => covered.has(m))).toBe(true);
   });
 });

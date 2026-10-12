@@ -16,7 +16,7 @@ export type EditorTool = 'select' | 'razor' | 'hand' | 'zoom';
 export type SelectMode = 'replace' | 'add' | 'toggle';
 
 /** Zoom limits in pixels per second. */
-const MIN_PX_PER_SEC = 0.05;
+export const MIN_PX_PER_SEC = 0.05;
 const MAX_PX_PER_SEC = 4000;
 /** Default zoom (pixels per second). */
 const DEFAULT_PX_PER_SEC = 80;
@@ -219,12 +219,16 @@ export function closeEditor(): void {
 	selection.set([]);
 	playhead.set(0);
 	playing.set(false);
+	scrubbing.set(false);
+	previewStats.set({ paintFps: 0, videoFps: 0, dropped: 0 });
 	tool.set('select');
 	pxPerSec.set(DEFAULT_PX_PER_SEC);
 	scrollX.set(0);
 	scrollY.set(0);
 	toast.set(null);
 	binDrag.set(null);
+	// busy follows the real edit counter: an edit still queued keeps it true, otherwise it is false.
+	busy.set(isBusy());
 	// exportJobs is deliberately kept: exports outlive the editor session.
 }
 

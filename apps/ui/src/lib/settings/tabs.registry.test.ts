@@ -2,12 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { SETTINGS_TABS } from './tabs';
 
 describe('SETTINGS_TABS registry', () => {
-  it('lists the eight tabs in display order', () => {
+  it('lists the nine tabs in display order', () => {
     expect(SETTINGS_TABS.map((t) => t.id)).toEqual([
       'general',
       'storage',
       'detection',
       'video',
+      'editor',
       'audio',
       'replay',
       'hotkeys',
@@ -25,6 +26,7 @@ describe('SETTINGS_TABS registry', () => {
     ['storage', 'Storage'],
     ['detection', 'Games'],
     ['video', 'Video'],
+    ['editor', 'Video editor'],
     ['audio', 'Audio'],
     ['replay', 'Recordings'],
     ['hotkeys', 'Hotkeys'],
@@ -33,7 +35,7 @@ describe('SETTINGS_TABS registry', () => {
     expect(SETTINGS_TABS.find((t) => t.id === id)?.label).toBe(label);
   });
 
-  it.each(['general', 'storage', 'detection', 'video', 'audio', 'replay', 'hotkeys', 'updates'])(
+  it.each(['general', 'storage', 'detection', 'video', 'editor', 'audio', 'replay', 'hotkeys', 'updates'])(
     'tab %s has a component (no Coming next placeholder)',
     (id) => {
       const tab = SETTINGS_TABS.find((t) => t.id === id);

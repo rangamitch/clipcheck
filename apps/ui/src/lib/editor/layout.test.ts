@@ -274,7 +274,8 @@ describe('hitTest', () => {
     expect(hitTest(empty, trackLayout(empty, 0), VIEW, 50, Y)).toMatchObject({ kind: 'track', trackId: 'V0' });
   });
   it('treats the gap below a row as part of that row', () => {
-    expect(hitTest(p, rows, VIEW, 50, 85)).toMatchObject({ kind: 'track', trackId: 'V0' });
+    // x 750 is past clip C (ends at 700), so no clip follows: plain track space. y 85 is the gap below row V0.
+    expect(hitTest(p, rows, VIEW, 750, 85)).toMatchObject({ kind: 'track', trackId: 'V0' });
   });
   it('reports empty below all rows', () => {
     expect(hitTest(p, rows, VIEW, 50, 200)).toEqual({ kind: 'empty' });

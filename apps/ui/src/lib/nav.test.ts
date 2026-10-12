@@ -32,7 +32,7 @@ describe('nav store', () => {
     expect(seen).toEqual(['gallery', 'settings', 'gallery', 'settings']);
   });
 
-  it('VIEWS contains exactly gallery and settings in order', () => {
-    expect([...VIEWS]).toEqual(['gallery', 'settings']);
+  it('VIEWS contains exactly gallery, editor and settings in order', () => {
+    expect([...VIEWS]).toEqual(['gallery', 'editor', 'settings']);
   });
 });

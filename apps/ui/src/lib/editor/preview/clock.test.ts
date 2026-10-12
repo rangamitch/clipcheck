@@ -361,12 +361,14 @@ describe('audio output latency', () => {
     const a = latent(10, { outputLatency: 0.5 });
     clock.start(0);
     wall = 1;
+    // Attaching re-bases on tick 1 s; then 2 s of audio minus 0.5 s latency adds 1.5 s.
     clock.attachAudio(a);
     a.currentTime = 12;
-    expect(clock.now()).toBe(Math.round(1.5 * S));
-    clock.attachAudio(null);
-    expect(clock.now()).toBe(Math.round(1.5 * S));
-    wall = 2;
     expect(clock.now()).toBe(Math.round(2.5 * S));
+    clock.attachAudio(null);
+    expect(clock.now()).toBe(Math.round(2.5 * S));
+    // Detached: wall time counts with no latency subtracted.
+    wall = 2;
+    expect(clock.now()).toBe(Math.round(3.5 * S));
   });
 });

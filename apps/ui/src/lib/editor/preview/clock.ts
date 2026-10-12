@@ -33,7 +33,10 @@ export interface AudioClockSource {
 export interface Clock {
   /** Current playhead in ticks. Never below 0. */
   now(): Tick;
-  /** Starts (or restarts) the clock at `from` with the given rate. Rate is clamped to -8..=8. */
+  /**
+   * Starts (or restarts) the clock at `from`. With a `rate` it sets the rate (clamped to -8..=8);
+   * without one it keeps the rate last set by `setRate` (or the initial 1).
+   */
   start(from: Tick, rate?: number): void;
   /** Stops the clock and returns the tick where it stopped. */
   stop(): Tick;
@@ -154,8 +157,8 @@ export function createClock(timeSource: TimeSource = defaultTimeSource): Clock {
       return nowTick();
     },
 
-    start(from: Tick, nextRate: number = 1): void {
-      rate = clampRate(nextRate);
+    start(from: Tick, nextRate?: number): void {
+      if (nextRate !== undefined) rate = clampRate(nextRate);
       anchorAt(toPlayTick(from));
       running = true;
     },

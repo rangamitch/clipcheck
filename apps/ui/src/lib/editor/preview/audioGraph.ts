@@ -247,7 +247,8 @@ export class AudioGraph {
     }
 
     if (chain.trackIndex !== trackIndex) {
-      safeDisconnect(chain.merger);
+      // Only a chain already routed to a bus has anything to disconnect (-1 means never routed).
+      if (chain.trackIndex !== -1) safeDisconnect(chain.merger);
       chain.merger.connect(this.trackBus(trackIndex).gain);
       chain.trackIndex = trackIndex;
     }
