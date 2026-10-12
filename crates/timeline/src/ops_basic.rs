@@ -107,14 +107,16 @@ pub fn relink_media(p: &mut Project, media_id: &str, mut new: MediaRef) -> EditR
 }
 
 /// Places media on the timeline. For a video media: one Video clip on `video_track` (the first
-/// unlocked video track when None) plus one linked Audio clip per audio stream on consecutive
-/// audio tracks starting at the first unlocked audio track (new audio tracks are added up to the
-/// limit of 8; streams beyond that are skipped). Only stream 0 is audible; the others have
-/// `audio.muted = true`. Audio media: Audio clips only. Image media: one Image clip of
-/// `src_len` (default 5 s when `src_len` is zero). `src_in`/`src_len` select the used range of the
-/// source (zero `src_len` means "to the end of the media"). All created clips share a fresh
-/// `link_id`. Returns the new clip ids (video first). `Append` places at the end of the video
-/// track (or the audio track for audio media). The project canvas size/fps is NOT changed.
+/// unlocked video track when None) plus one linked Audio clip per placed audio stream on
+/// consecutive audio tracks starting at the first unlocked audio track (new audio tracks are added
+/// up to the limit of 8; streams beyond that are skipped). The placed streams are all streams
+/// except the pre-mixed "Mix" stream (see [`placed_audio_streams`]); every placed clip is unmuted
+/// and its `audio.source_track` is the stream's index in `media.audio`. Audio media: Audio clips
+/// only (stream 0). Image media: one Image clip of `src_len` (default 5 s when `src_len` is zero).
+/// `src_in`/`src_len` select the used range of the source (zero `src_len` means "to the end of the
+/// media"). All created clips share a fresh `link_id`. Returns the new clip ids (video first).
+/// `Append` places at the end of the video track (or the audio track for audio media). The project
+/// canvas size/fps is NOT changed.
 pub fn place_media(
     p: &mut Project,
     media_id: &str,
@@ -200,12 +202,10 @@ pub fn place_media(
         Some(id)
     };
 
-    // Audio slots: one audio track per stream, consecutive from the first unlocked audio track.
-    let stream_count = match media.kind {
-        MediaKind::Video => media.audio.len(),
-        MediaKind::Audio => 1,
-        MediaKind::Image => 0,
-    };
+    // Audio slots: one audio track per placed stream, consecutive from the first unlocked audio
+    // track. `placed[i]` is the original stream index of slot `i`.
+    let placed = placed_audio_streams(&media);
+    let stream_count = placed.len();
     let mut slots: Vec<String> = Vec::new();
     if stream_count > 0 {
         let audio: Vec<(String, bool)> = w
@@ -263,7 +263,7 @@ pub fn place_media(
         PlaceMode::Append => {
             // Video/image media append after the chosen video track; audio-only media after the
             // first audio track. Audio lanes are not consulted: an occupied lane at that start is
-            // refused by the overlap check below (`EditError::Overlap`), never shifted around.
+            // overwritten by the new clips (see `overwrite_under`), never shifted around.
             let anchor = video_id.clone().or_else(|| slots.first().cloned());
             match anchor {
                 Some(tid) => w
@@ -304,8 +304,10 @@ pub fn place_media(
     }
 
     // Name each audio lane after what it carries (the stream title, such as "Game" or "Mic").
-    let labels: Vec<String> = (0..slots.len())
-        .map(|i| stream_label(&media, i, slots.len()))
+    let labels: Vec<String> = placed
+        .iter()
+        .take(slots.len())
+        .map(|&orig| stream_label(&media, orig, media.audio.len()))
         .collect();
     for (tid, label) in slots.iter().zip(&labels) {
         if label.is_empty() || w.clips.iter().any(|c| &c.track_id == tid) {
@@ -340,6 +342,9 @@ pub fn place_media(
         });
     }
     for (i, tid) in slots.iter().enumerate() {
+        let Some(&orig) = placed.get(i) else {
+            continue;
+        };
         created.push(Clip {
             id: new_id(),
             track_id: tid.clone(),
@@ -355,8 +360,8 @@ pub fn place_media(
             speed: 1.0,
             link_id: Some(link.clone()),
             audio: ClipAudio {
-                source_track: u32::try_from(i).unwrap_or(0),
-                muted: i > 0,
+                source_track: u32::try_from(orig).unwrap_or(0),
+                muted: false,
                 ..ClipAudio::default()
             },
             ..Clip::default()
@@ -365,12 +370,49 @@ pub fn place_media(
 
     let ids: Vec<String> = created.iter().map(|c| c.id.clone()).collect();
     w.clips.extend(created);
+    // The new clips overwrite whatever they land on (a no-op for Overwrite and Insert, which
+    // already cut or shifted the tracks above).
+    w.clips = overwrite_under(std::mem::take(&mut w.clips), &ids);
     check_project(&w)?;
     *p = w;
     Ok(ids)
 }
 
-/// Label of audio stream `i` of a media file: its title, else "Audio N" when the file has several.
+/// Original indices (into `media.audio`) of the audio streams placed for `media`, in order.
+/// Video media skip every stream whose trimmed title is "Mix" (case-insensitive): that stream is
+/// the pre-mixed combination of the individual sources, which are placed instead. If skipping
+/// would leave no stream (only a Mix stream, or one unnamed stream), all streams are placed.
+/// Audio media place stream 0 only (one lane, as before). Image media place none.
+fn placed_audio_streams(media: &MediaRef) -> Vec<usize> {
+    match media.kind {
+        MediaKind::Image => Vec::new(),
+        MediaKind::Audio => vec![0],
+        MediaKind::Video => {
+            let all: Vec<usize> = (0..media.audio.len()).collect();
+            let kept: Vec<usize> = all
+                .iter()
+                .copied()
+                .filter(|&i| !is_mix_stream(media, i))
+                .collect();
+            if kept.is_empty() {
+                all
+            } else {
+                kept
+            }
+        }
+    }
+}
+
+/// True when audio stream `i` of `media` is titled "Mix" (ignoring case and surrounding spaces).
+fn is_mix_stream(media: &MediaRef, i: usize) -> bool {
+    media
+        .audio
+        .get(i)
+        .is_some_and(|a| a.title.trim().eq_ignore_ascii_case("Mix"))
+}
+
+/// Label of audio stream `i` (an index into `media.audio`) of a media file: its title, else
+/// "Audio N" (N = i + 1) when the file has several streams (`count` = `media.audio.len()`).
 fn stream_label(media: &MediaRef, i: usize, count: usize) -> String {
     let title = media
         .audio
@@ -394,7 +436,8 @@ fn is_default_audio_name(name: &str) -> bool {
 
 /// Moves clips (and their group/link partners, which keep their relative offsets). In magnetic
 /// mode (`p.modes.magnetic`) gaps left behind are NOT closed by this function (only deletes
-/// ripple); overlaps with clips that are not being moved give `EditError::Overlap`.
+/// ripple). A moved clip that lands on clips that are not being moved overwrites them: those are
+/// trimmed, split or removed where the moved clips cover them (see [`overwrite_under`]).
 pub fn move_clips(p: &mut Project, moves: &[ClipMove]) -> EditResult<()> {
     if moves.is_empty() {
         return Ok(());
@@ -466,6 +509,14 @@ pub fn move_clips(p: &mut Project, moves: &[ClipMove]) -> EditResult<()> {
             }
         }
     }
+    // Clip order (not HashMap order) decides which of two moved clips wins an overlap.
+    let moved: Vec<String> = w
+        .clips
+        .iter()
+        .filter(|c| deltas.contains_key(&c.id))
+        .map(|c| c.id.clone())
+        .collect();
+    w.clips = overwrite_under(std::mem::take(&mut w.clips), &moved);
     check_project(&w)?;
     *p = w;
     Ok(())
@@ -632,7 +683,8 @@ pub fn split_at(p: &mut Project, time: Tick, ids: &[String]) -> EditResult<Vec<S
 }
 
 /// Copies clips (with partners) so the earliest starts at `earliest.start + offset`, on the same
-/// tracks. New ids, new link/group ids. Fails with Overlap if the copies collide.
+/// tracks. New ids, new link/group ids. Where the copies land on other clips they overwrite them
+/// (see [`overwrite_under`]); the copies themselves never cut each other.
 pub fn duplicate_clips(p: &mut Project, ids: &[String], offset: Tick) -> EditResult<Vec<String>> {
     if ids.is_empty() {
         return Ok(Vec::new());
@@ -667,6 +719,7 @@ pub fn duplicate_clips(p: &mut Project, ids: &[String], offset: Tick) -> EditRes
     let new_ids: Vec<String> = copies.iter().map(|c| c.id.clone()).collect();
     w.clips.extend(copies);
     w.groups.extend(remap.new_groups);
+    w.clips = overwrite_under(std::mem::take(&mut w.clips), &new_ids);
     check_project(&w)?;
     *p = w;
     Ok(new_ids)
@@ -770,9 +823,51 @@ fn piece_of(orig: &Clip, from: Tick, to: Tick) -> Option<Clip> {
 /// clips that span `from`). Clips on other tracks are kept in place. The first piece of a clip
 /// keeps its id, later pieces get new ids.
 fn cut(clips: Vec<Clip>, track_id: &str, from: Tick, to: Tick) -> Vec<Clip> {
+    cut_except(clips, track_id, from, to, &HashSet::new())
+}
+
+/// Lets the clips in `incoming` overwrite what is under them, the way an overwrite edit does.
+/// Ids in `incoming` are the clips that were just placed (moved, duplicated, pasted, trimmed or
+/// generated). For each incoming clip, in order, its time range is cut out of every clip on its
+/// track that is not incoming, so a clip spanning the range is split in two, a clip overlapping
+/// an edge is trimmed, and a clip fully covered is removed. Clips in `incoming` are never cut by
+/// the others, so a selection moved together keeps its relative positions. If two incoming clips
+/// overlap each other, the one later in `incoming` wins and cuts the earlier one.
+/// Zero-length leftovers are dropped; touching clips are not affected. Unknown ids are ignored.
+pub(crate) fn overwrite_under(clips: Vec<Clip>, incoming: &[String]) -> Vec<Clip> {
+    // Ranges come from the clips as they are now; an incoming clip is never cut before its own
+    // step, so these stay valid while the steps run.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut ranges: Vec<(String, Tick, Tick, String)> = Vec::with_capacity(incoming.len());
+    for id in incoming {
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        if let Some(c) = clips.iter().find(|c| &c.id == id) {
+            ranges.push((c.track_id.clone(), c.start, end_of(c), id.clone()));
+        }
+    }
+    // Step `i` protects the incoming clips `i..`; earlier incoming clips may be cut.
+    let mut protected: HashSet<String> = ranges.iter().map(|r| r.3.clone()).collect();
+    let mut out = clips;
+    for (track_id, from, to, id) in &ranges {
+        out = cut_except(out, track_id, *from, *to, &protected);
+        protected.remove(id);
+    }
+    out
+}
+
+/// [`cut`] that leaves alone every clip whose id is in `keep`.
+fn cut_except(
+    clips: Vec<Clip>,
+    track_id: &str,
+    from: Tick,
+    to: Tick,
+    keep: &HashSet<String>,
+) -> Vec<Clip> {
     let mut out = Vec::with_capacity(clips.len());
     for c in clips {
-        if c.track_id != track_id {
+        if c.track_id != track_id || keep.contains(&c.id) {
             out.push(c);
             continue;
         }

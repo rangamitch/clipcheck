@@ -304,7 +304,7 @@ fn place_video_with_two_streams_creates_one_video_and_two_linked_audio() {
 }
 
 #[test]
-fn place_video_stream_zero_audible_and_stream_one_muted() {
+fn place_video_every_stream_is_unmuted_and_keeps_its_source_index() {
     let mut p = project();
     let m = add(&mut p, video_media("C:/m/a.mp4", 10, 2));
     let ids = place_media(
@@ -321,7 +321,7 @@ fn place_video_stream_zero_audible_and_stream_one_muted() {
     let second = clip(&p, &ids[2]);
     assert!(!first.audio.muted);
     assert_eq!(first.audio.source_track, 0);
-    assert!(second.audio.muted);
+    assert!(!second.audio.muted);
     assert_eq!(second.audio.source_track, 1);
 }
 
@@ -489,12 +489,12 @@ fn place_append_lands_at_end_of_track() {
 }
 
 #[test]
-fn place_append_occupied_audio_lane_at_video_end_is_overlap() {
+fn place_append_occupied_audio_lane_at_video_end_overwrites_it() {
     // Doc: Append places at the end of the video track. A long clip on the audio lane the new
-    // media needs at that start is refused with Overlap, never shifted, and nothing changes.
+    // media needs at that start is overwritten: it is split around the new clip, never shifted.
     let mut p = project();
     let long_audio = add(&mut p, audio_media("C:/m/long-audio.wav", 20));
-    place_media(
+    let long_ids = place_media(
         &mut p,
         &long_audio,
         s(0),
@@ -507,8 +507,7 @@ fn place_append_occupied_audio_lane_at_video_end_is_overlap() {
     let t = v1(&p);
     raw(&mut p, &t, ClipKind::Video, s(0), s(10));
     let m = add(&mut p, video_media("C:/m/two-streams.mp4", 2, 2));
-    let before = p.clone();
-    let err = place_media(
+    place_media(
         &mut p,
         &m,
         s(0),
@@ -517,9 +516,17 @@ fn place_append_occupied_audio_lane_at_video_end_is_overlap() {
         None,
         PlaceMode::Append,
     )
-    .unwrap_err();
-    assert!(matches!(err, EditError::Overlap(_)), "got {err:?}");
-    assert_eq!(p, before);
+    .expect("append overwrites the occupied lane");
+    // The left piece keeps the long clip's id; the right piece [12, 20) gets a new one.
+    let lane = clip(&p, &long_ids[0]).track_id.clone();
+    assert_eq!(clip(&p, &long_ids[0]).start, s(0));
+    assert_eq!(clip(&p, &long_ids[0]).dur, s(10));
+    assert!(
+        p.clips
+            .iter()
+            .any(|c| c.track_id == lane && c.start == s(12) && c.dur == s(8)),
+        "right piece [12, 20) on the same lane"
+    );
 }
 
 #[test]
@@ -894,21 +901,25 @@ fn move_clip_to_free_space_changes_only_start() {
 }
 
 #[test]
-fn move_into_unmoved_clip_is_overlap() {
+fn move_onto_unmoved_clip_overwrites_its_head() {
     let mut p = project();
     let t = v1(&p);
     let a = raw(&mut p, &t, ClipKind::Video, s(0), s(2));
-    raw(&mut p, &t, ClipKind::Video, s(5), s(2));
-    let err = move_clips(
+    let b = raw(&mut p, &t, ClipKind::Video, s(5), s(2));
+    move_clips(
         &mut p,
         &[ClipMove {
-            clip_id: a,
+            clip_id: a.clone(),
             new_start: s(4),
             new_track: None,
         }],
     )
-    .unwrap_err();
-    assert!(matches!(err, EditError::Overlap(_)), "got {err:?}");
+    .expect("the moved clip goes on top");
+    assert_eq!(clip(&p, &a).start, s(4));
+    assert_eq!(clip(&p, &a).dur, s(2));
+    // b covered [5, 6): what is left is [6, 7).
+    assert_eq!(clip(&p, &b).start, s(6));
+    assert_eq!(clip(&p, &b).dur, s(1));
 }
 
 #[test]
@@ -1475,14 +1486,18 @@ fn duplicate_shifts_copy_by_offset_and_gives_new_ids() {
 }
 
 #[test]
-fn duplicate_onto_existing_clip_is_overlap_and_leaves_project_unchanged() {
+fn duplicate_onto_existing_clip_overwrites_the_original_tail() {
     let mut p = project();
     let t = v1(&p);
     let id = raw(&mut p, &t, ClipKind::Video, s(0), s(2));
-    let before = p.clone();
-    let err = duplicate_clips(&mut p, std::slice::from_ref(&id), s(1)).unwrap_err();
-    assert!(matches!(err, EditError::Overlap(_)), "got {err:?}");
-    assert_eq!(p, before);
+    let new_ids =
+        duplicate_clips(&mut p, std::slice::from_ref(&id), s(1)).expect("copy goes on top");
+    assert_eq!(clip(&p, &new_ids[0]).start, s(1));
+    assert_eq!(clip(&p, &new_ids[0]).dur, s(2));
+    // The copy covers [1, 3), so the original keeps only [0, 1).
+    assert_eq!(clip(&p, &id).start, s(0));
+    assert_eq!(clip(&p, &id).dur, s(1));
+    assert_eq!(p.clips.len(), 2);
 }
 
 #[test]
