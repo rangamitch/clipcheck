@@ -1,7 +1,8 @@
 <script lang="ts">
   // Time ruler above the track area: tick marks and labels, the work area (in/out) band with
   // draggable ends, marker flags, and the playhead handle. Pointer down or drag seeks.
-  import { dispatch, playhead } from './store';
+  import { onDestroy } from 'svelte';
+  import { beginScrub, dispatch, endScrub, playhead } from './store';
   import {
     RULER_HEIGHT,
     formatRulerLabel,
@@ -39,6 +40,22 @@
   let areaDrag: 'start' | 'end' | null = null;
   /** True while a pointer drag seeks the playhead. */
   let seeking = false;
+  /** True while a scrub is open in the store; keeps beginScrub/endScrub paired once per drag. */
+  let scrubActive = false;
+
+  function startScrub(): void {
+    if (scrubActive) return;
+    scrubActive = true;
+    beginScrub();
+  }
+
+  function stopScrub(): void {
+    if (!scrubActive) return;
+    scrubActive = false;
+    endScrub();
+  }
+
+  onDestroy(stopScrub);
   /** Tick where an Alt- or Shift-drag on empty ruler started; null when not creating a work area. */
   let createAnchor: Tick | null = null;
 
@@ -280,6 +297,7 @@
       return;
     }
     seeking = true;
+    startScrub();
     onseek(xToTick(x, view));
   }
 
@@ -313,6 +331,7 @@
       canvas.releasePointerCapture(e.pointerId);
     }
     seeking = false;
+    stopScrub();
     if (createAnchor !== null) {
       const anchor = createAnchor;
       createAnchor = null;
@@ -342,6 +361,12 @@
     }
   }
 
+  /** The canvas lost pointer capture: a seek drag cannot continue, so close it. */
+  function onLostCapture(): void {
+    seeking = false;
+    stopScrub();
+  }
+
   /** Double click on a marker flag removes that marker. */
   function onDoubleClick(e: MouseEvent): void {
     const rect = canvas?.getBoundingClientRect();
@@ -360,6 +385,7 @@
   onpointermove={onPointerMove}
   onpointerup={onPointerUp}
   onpointercancel={onPointerUp}
+  onlostpointercapture={onLostCapture}
   ondblclick={onDoubleClick}
 ></canvas>
 

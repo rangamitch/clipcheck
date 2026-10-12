@@ -2,6 +2,7 @@
   // Editor timeline: ruler, track headers and one canvas for the clips (drawn by drawClips.ts).
   // Pointer, wheel and drag-and-drop handling only. Edits go through the store `dispatch`; the
   // maths of a drag lives in timelineDrag.ts. Keyboard shortcuts belong to Editor.svelte.
+  import { onDestroy } from 'svelte';
   import { get } from 'svelte/store';
   import TrackHeader from './TrackHeader.svelte';
   import Ruler from './Ruler.svelte';
@@ -17,6 +18,8 @@
     expandWithGroups,
     isBusy,
     pasteAtPlayhead,
+    beginScrub,
+    endScrub,
     playhead,
     project as projectStore,
     pxPerSec,
@@ -610,6 +613,23 @@
    * Starts a drag. `immediate` drags (pan, playhead) run from the press; others wait for
    * DRAG_THRESHOLD_PX of movement so a click stays a click.
    */
+  /** True while a playhead drag holds a scrub open in the store. Keeps begin/end paired. */
+  let scrubActive = false;
+
+  function startScrub(): void {
+    if (scrubActive) return;
+    scrubActive = true;
+    beginScrub();
+  }
+
+  function stopScrub(): void {
+    if (!scrubActive) return;
+    scrubActive = false;
+    endScrub();
+  }
+
+  onDestroy(stopScrub);
+
   function beginState(state: DragState | null, e: PointerEvent, p: PointerLike, immediate: boolean): void {
     if (state === null) return;
     drag = state;
@@ -617,6 +637,7 @@
     pressX = p.x;
     pressY = p.y;
     armed = immediate || state.kind === 'playhead';
+    if (state.kind === 'playhead') startScrub();
     try {
       viewportEl?.setPointerCapture(e.pointerId);
     } catch {
@@ -634,6 +655,7 @@
       // Capture was already released.
     }
     stopAutoscroll();
+    stopScrub();
     drag = null;
     frame = EMPTY_FRAME;
     const wasArmed = armed;
@@ -695,6 +717,7 @@
    * The view keeps whatever preview the drag already showed.
    */
   function cancelActiveDrag(): void {
+    stopScrub();
     if (drag === null) return;
     try {
       if (viewportEl?.hasPointerCapture(pointerId)) viewportEl.releasePointerCapture(pointerId);
