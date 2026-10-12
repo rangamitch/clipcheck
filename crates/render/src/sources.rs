@@ -23,8 +23,14 @@ use crate::error::RenderError;
 use crate::frame::Frame;
 use crate::pipeline::{AudioProvider, VideoProvider};
 
-/// Open video decoders kept per provider (least recently used is closed first).
-const MAX_OPEN: usize = 4;
+/// Open video decoders kept per provider (least recently used is closed first). Slots are keyed by
+/// media id only, so the same file at two source offsets in one frame shares a decoder and seeks
+/// between them; the cap is raised so that a few such layers do not evict each other.
+const MAX_OPEN: usize = 8;
+/// Slack, in 100 ns units (0.2 us), when matching a frame's presentation time to a request.
+/// Media Foundation rounds frame timestamps of non-integer rates (23.976, 29.97, 59.94) to 100 ns,
+/// so a frame requested at the floored tick time can carry a pts 1 unit later.
+const TS_SLACK_100NS: i64 = 2;
 /// A request this far (100 ns units, 2 s) past the last decoded frame seeks instead of decoding on.
 const SEEK_AHEAD_100NS: i64 = 20_000_000;
 /// Open audio decoders kept per provider. A project can play many streams of one file at once
@@ -74,7 +80,7 @@ pub(crate) fn out_err(context: &str, e: windows::core::Error) -> RenderError {
 struct MediaSource {
     path: PathBuf,
     kind: MediaKind,
-    /// Frame rate used for the one-frame tolerance (30 when unknown).
+    /// Frame rate; sets the frame duration used to detect backward requests (30 when unknown).
     fps: f64,
 }
 
@@ -247,7 +253,7 @@ impl VideoSlot {
                 }
             }
             match self.pending.take() {
-                Some(p) if p.pts <= target => self.cur = Some(to_frame(p)?),
+                Some(p) if p.pts <= target + TS_SLACK_100NS => self.cur = Some(to_frame(p)?),
                 Some(p) => {
                     self.pending = Some(p);
                     break;
@@ -264,7 +270,7 @@ impl VideoSlot {
     }
 }
 
-/// Decodes video frames with `clipcheck_mfdec::VideoDecoder`. Keeps at most 4 decoders open (LRU),
+/// Decodes video frames with `clipcheck_mfdec::VideoDecoder`. Keeps at most `MAX_OPEN` decoders open (LRU),
 /// seeks only when the requested time is not the next frame of an open decoder, and reuses the
 /// previous frame when asked for the same or an earlier frame time within one frame duration.
 /// Still images are decoded once with WIC and cached. A media id that cannot be opened is
@@ -389,6 +395,34 @@ impl VideoProvider for MfVideoProvider {
     }
 }
 
+/// Stereo (left, right) for one source frame `fr`, whose length is the channel count.
+///
+/// Mono is duplicated. 6 channels (L R C LFE Ls Rs) and 8 channels (L R C LFE Lb Rb Ls Rs) are
+/// folded to stereo: the centre (dialogue) and the surrounds are mixed in at -3 dB (0.707), the
+/// LFE is dropped, and each side is divided by its coefficient sum so full-scale input stays within
+/// [-1, 1]. Any other count keeps the first two channels.
+fn downmix_frame(fr: &[f32]) -> (f32, f32) {
+    const K: f32 = 0.707;
+    let at = |i: usize| fr.get(i).copied().unwrap_or(0.0);
+    match fr.len() {
+        0 => (0.0, 0.0),
+        1 => (at(0), at(0)),
+        6 => {
+            let norm = 1.0 / (1.0 + 2.0 * K);
+            let l = at(0) + K * at(2) + K * at(4);
+            let r = at(1) + K * at(2) + K * at(5);
+            (l * norm, r * norm)
+        }
+        8 => {
+            let norm = 1.0 / (1.0 + 3.0 * K);
+            let l = at(0) + K * at(2) + K * at(4) + K * at(6);
+            let r = at(1) + K * at(2) + K * at(5) + K * at(7);
+            (l * norm, r * norm)
+        }
+        _ => (at(0), at(1)),
+    }
+}
+
 /// One open audio decoder with its resampling buffer.
 struct AudioSlot {
     media_id: String,
@@ -432,9 +466,7 @@ impl AudioSlot {
             self.fresh = false;
         }
         for fr in self.scratch.chunks_exact(c) {
-            let l = fr.first().copied().unwrap_or(0.0);
-            // Mono is duplicated; more than two channels keeps the first two.
-            let r = fr.get(1).copied().unwrap_or(l);
+            let (l, r) = downmix_frame(fr);
             self.buf.push(l);
             self.buf.push(r);
         }
@@ -507,6 +539,32 @@ impl AudioSlot {
     }
 }
 
+/// Deletes files in the remuxed audio-stream directory that were last written more than seven
+/// days ago. Runs once per process, before the directory is first used. Best effort: every error
+/// is ignored.
+fn prune_audio_stream_dir(dir: &Path) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok());
+        if age.is_some_and(|a| a > MAX_AGE) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Stream `stream` (0-based among the file's audio tracks in trak order) as a (file, stream) pair
 /// Media Foundation decodes unambiguously. For an MP4/MOV/M4V with several audio tracks the track
 /// is losslessly remuxed into its own single-track file in the temp dir (reused when present) and
@@ -549,6 +607,8 @@ fn isolate_audio_stream(path: &Path, stream: u32) -> (PathBuf, u32) {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
     let dir = std::env::temp_dir().join("clipcheck-audio-streams");
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    PRUNED.call_once(|| prune_audio_stream_dir(&dir));
     let out = dir.join(format!(
         "{:016x}-{}-{mtime}-{stream}.m4a",
         h.finish(),
@@ -580,9 +640,9 @@ fn isolate_audio_stream(path: &Path, stream: u32) -> (PathBuf, u32) {
 }
 
 /// Decodes audio with `clipcheck_mfdec::audio::AudioDecoder`, resamples to the requested rate and
-/// converts to stereo f32 (linear resampling; mono is duplicated, more than two channels keep the
-/// first two). Keeps at most 4 decoders open. Forward reads are contiguous; a read that goes back
-/// or more than one second ahead seeks.
+/// converts to stereo f32 (linear resampling; see `downmix_frame` for the channel mapping). Keeps
+/// at most `MAX_OPEN_AUDIO` decoders open. Forward reads are contiguous; a read that goes back or
+/// more than one second ahead seeks.
 pub struct MfAudioProvider {
     sources: HashMap<String, MediaSource>,
     slots: Vec<AudioSlot>,
@@ -694,5 +754,66 @@ impl AudioProvider for MfAudioProvider {
                 Ok(false)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod downmix_tests {
+    use super::downmix_frame;
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn stereo_passes_through() {
+        assert_eq!(downmix_frame(&[0.25, -0.5]), (0.25, -0.5));
+    }
+
+    #[test]
+    fn mono_is_duplicated() {
+        assert_eq!(downmix_frame(&[0.3]), (0.3, 0.3));
+    }
+
+    #[test]
+    fn five_one_centre_is_audible_in_both_channels() {
+        // Dialogue only on the centre channel must not be lost.
+        let (l, r) = downmix_frame(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+        let expected = 0.707 / (1.0 + 2.0 * 0.707);
+        assert!(close(l, expected), "left {l}");
+        assert!(close(r, expected), "right {r}");
+    }
+
+    #[test]
+    fn five_one_lfe_is_dropped() {
+        assert_eq!(downmix_frame(&[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]), (0.0, 0.0));
+    }
+
+    #[test]
+    fn five_one_full_scale_stays_within_unit_range() {
+        let (l, r) = downmix_frame(&[1.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+        assert!(close(l, 1.0), "left {l}");
+        assert!(close(r, 1.0), "right {r}");
+    }
+
+    #[test]
+    fn five_one_left_surround_only_hits_left() {
+        let (l, r) = downmix_frame(&[0.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+        assert!(l > 0.0);
+        assert!(close(r, 0.0));
+    }
+
+    #[test]
+    fn seven_one_centre_and_surrounds_map_to_both_sides() {
+        let (l, r) = downmix_frame(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let expected = 0.707 / (1.0 + 3.0 * 0.707);
+        assert!(close(l, expected) && close(r, expected));
+        let (l, r) = downmix_frame(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+        assert!(close(l, 1.0) && close(r, 1.0));
+    }
+
+    #[test]
+    fn other_layouts_keep_first_two_channels() {
+        assert_eq!(downmix_frame(&[0.1, 0.2, 0.9]), (0.1, 0.2));
     }
 }

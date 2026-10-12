@@ -1,4 +1,4 @@
-//! BGRA to NV12 conversion for the encoder input (BT.601, limited range).
+//! BGRA to NV12 conversion for the encoder input (BT.709, limited range, matching the GPU path).
 
 use crate::frame::Frame;
 
@@ -7,7 +7,7 @@ const MIN_PARALLEL_HEIGHT: usize = 128;
 /// Upper bound on worker threads for one conversion.
 const MAX_THREADS: usize = 8;
 
-/// Converts a BGRA frame to NV12 (BT.601, limited range) in `out`. Width and height are even.
+/// Converts a BGRA frame to NV12 (BT.709, limited range) in `out`. Width and height are even.
 ///
 /// Well-formed even-sized frames take the banded fast path. Odd-sized frames and frames whose
 /// `bgra` buffer is shorter than `width * height * 4` take the bounds-checked slow path, which
@@ -106,10 +106,21 @@ fn convert_band(src: &[u8], luma: &mut [u8], chroma: &mut [u8], w: usize) {
     }
 }
 
-/// Luma of one pixel (BT.601, limited range).
+/// Luma of one pixel (BT.709, limited range): Y = 16 + 219 * (0.2126 R + 0.7152 G + 0.0722 B) / 255,
+/// with the coefficients scaled by 256 (47 + 157 + 16 = 220, which is 219 * 256 / 255 rounded up).
 #[inline]
 fn luma_of(r: i32, g: i32, b: i32) -> u8 {
-    (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8
+    (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(0, 255) as u8
+}
+
+/// Averaged chroma (U, V) of one 2x2 block mean (BT.709, limited range). The coefficients are the
+/// BT.709 Pb/Pr matrix scaled to the 224-level chroma range and by 256: U uses -26, -87, +112
+/// (sum -1, so white reads U = 127, within the +-1 tolerance) and V uses +112, -102, -10 (sum 0).
+#[inline]
+fn uv_of(r: i32, g: i32, b: i32) -> (u8, u8) {
+    let u = (((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+    let v = (((112 * r - 102 * g - 10 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+    (u, v)
 }
 
 /// Luma of the four pixels of a 2x2 block (in order top-left, top-right, bottom-left,
@@ -125,9 +136,7 @@ fn block_values(quad: [(u8, u8, u8); 4]) -> ([u8; 4], u8, u8) {
         sum_b += b;
         *dst = luma_of(r, g, b);
     }
-    let (r, g, b) = (sum_r / 4, sum_g / 4, sum_b / 4);
-    let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-    let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+    let (u, v) = uv_of(sum_r / 4, sum_g / 4, sum_b / 4);
     (lumas, u, v)
 }
 
@@ -156,9 +165,7 @@ fn convert_slow(frame: &Frame, w: usize, h: usize, luma: &mut [u8], chroma: &mut
                     }
                 }
             }
-            let (r, g, b) = (sum_r / 4, sum_g / 4, sum_b / 4);
-            let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-            let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+            let (u, v) = uv_of(sum_r / 4, sum_g / 4, sum_b / 4);
             let at = by * w + bx * 2;
             if let Some(dst) = chroma.get_mut(at) {
                 *dst = u;
@@ -198,13 +205,11 @@ mod tests {
                         sum_b += b;
                         if let Some(dst) = luma.get_mut(y * w + x) {
                             *dst =
-                                (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
+                                (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
                         }
                     }
                 }
-                let (r, g, b) = (sum_r / 4, sum_g / 4, sum_b / 4);
-                let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-                let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
+                let (u, v) = uv_of(sum_r / 4, sum_g / 4, sum_b / 4);
                 let at = by * w + bx * 2;
                 if let Some(dst) = chroma.get_mut(at) {
                     *dst = u;
@@ -247,6 +252,55 @@ mod tests {
     #[test]
     fn fast_path_matches_reference_2x2() {
         assert_matches_reference(&pseudo_random_frame(2, 2, 7));
+    }
+
+    /// Float BT.709 limited-range YUV of one BGRA-ordered (r, g, b) colour.
+    fn float_bt709(r: u8, g: u8, b: u8) -> [f64; 3] {
+        let (r, g, b) = (f64::from(r), f64::from(g), f64::from(b));
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let yy = 16.0 + 219.0 * y / 255.0;
+        let u = 128.0 + 224.0 * ((b - y) / 255.0) / 1.8556;
+        let v = 128.0 + 224.0 * ((r - y) / 255.0) / 1.5748;
+        [yy, u, v]
+    }
+
+    /// Converts a 2x2 frame of one solid colour and returns its (Y, U, V) bytes.
+    fn solid_yuv(r: u8, g: u8, b: u8) -> [u8; 3] {
+        let frame = Frame {
+            width: 2,
+            height: 2,
+            bgra: [b, g, r, 255].repeat(4),
+        };
+        let mut out = Vec::new();
+        bgra_to_nv12(&frame, &mut out);
+        // Y plane is 4 bytes, then one interleaved U V pair.
+        [out[0], out[4], out[5]]
+    }
+
+    #[test]
+    fn bt709_solid_colours_match_float_within_one() {
+        let colours: [(&str, [u8; 3]); 6] = [
+            ("black", [0, 0, 0]),
+            ("white", [255, 255, 255]),
+            ("red", [255, 0, 0]),
+            ("green", [0, 255, 0]),
+            ("blue", [0, 0, 255]),
+            ("grey", [128, 128, 128]),
+        ];
+        for (name, [r, g, b]) in colours {
+            let got = solid_yuv(r, g, b);
+            let want = float_bt709(r, g, b);
+            for (k, (&a, &e)) in got.iter().zip(want.iter()).enumerate() {
+                let diff = (f64::from(a) - e.round()).abs();
+                assert!(diff <= 1.0, "{name} channel {k}: got {a}, float {e:.2}");
+            }
+        }
+    }
+
+    #[test]
+    fn bt709_differs_from_bt601_for_pure_green() {
+        // BT.601 would give Y = 149 for pure green; BT.709 gives 172 (float 172.6, within one).
+        assert_eq!(solid_yuv(0, 255, 0)[0], 172);
     }
 
     #[test]

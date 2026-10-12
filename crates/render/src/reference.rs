@@ -589,14 +589,25 @@ pub fn dip_to_color(frame: &Frame, color: Rgba, t: f64) -> Frame {
 }
 
 /// A background for fit-mode clips: `frame` scaled to cover `w` x `h` (fill) then blurred with a
-/// box blur of radius about `w / 40`, darkened by 40 %.
+/// box blur of radius about `w / 40`, darkened by 40 %. The blur is computed at 1/8 resolution
+/// (the radius scales with it, so the look is the same) and bilinearly upscaled, which is far
+/// cheaper and invisible on a blurred image.
 pub fn blurred_cover(frame: &Frame, w: u32, h: u32) -> Frame {
     let w = w.max(1);
     let h = h.max(1);
     if !is_valid(frame) {
         return solid_frame(w, h, [0, 0, 0, 255]);
     }
+    let sw = w.div_ceil(8).max(1);
+    let sh = h.div_ceil(8).max(1);
+    if (sw, sh) == (w, h) {
+        return blurred_cover_direct(frame, w, h);
+    }
+    resize(&blurred_cover_direct(frame, sw, sh), w, h)
+}
 
+/// [`blurred_cover`] computed at exactly `w` x `h` (no downscaling).
+fn blurred_cover_direct(frame: &Frame, w: u32, h: u32) -> Frame {
     // Cover: scale uniformly until both sides reach the target, then centre-crop.
     let fw = f64::from(frame.width);
     let fh = f64::from(frame.height);

@@ -1793,3 +1793,78 @@ fn crossfade_after_fade_shows_incoming_only() {
         .iter()
         .all(|px| near(*px, bgra(0, 0, 255), 1)));
 }
+
+// ---------------------------------------------------------------------------------------------
+// Cuts inside a block and sub-frame ranges
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn hard_cut_on_fractional_sample_frame_boundary_switches_clip_on_time() {
+    // At 30000/1001 fps frame 2 starts between samples at 48 kHz (about 3203.56), so the audio block
+    // that holds the cut also starts before it. Clip A (unity) ends at the cut, clip B (-6.02 dB)
+    // starts there; the first sample at or after the cut must already carry clip B.
+    let fps = Rate {
+        num: 30000,
+        den: 1001,
+    };
+    let cut = Tick::from_frame(2, fps);
+    let mut p = project(black_bg());
+    add_media(&mut p, "a1", MediaKind::Audio);
+    add_media(&mut p, "a2", MediaKind::Audio);
+    let c1 = with_audio(
+        audio_clip(&p, 0, "c1", "a1", Tick::ZERO, cut),
+        ClipAudio::default(),
+    );
+    let c2 = with_audio(
+        audio_clip(&p, 0, "c2", "a2", cut, sec(1) - cut),
+        ClipAudio {
+            gain_db: -6.02,
+            ..ClipAudio::default()
+        },
+    );
+    p.clips.push(c1);
+    p.clips.push(c2);
+    let mut c_cfg = cfg(48000);
+    c_cfg.fps = fps;
+    let r = go(
+        &plan_of(&p),
+        &c_cfg,
+        FakeVideo::default(),
+        FakeAudio::constant(0.5),
+        FakeTitles::default(),
+    );
+    ok(&r);
+    let s_cut = (0i64..)
+        .find(|&s| Tick::from_sample(s, 48000) >= cut)
+        .expect("a sample at or after the cut");
+    let track = r.sink.track(0);
+    let before = track[(s_cut as usize - 1) * 2];
+    let after = track[s_cut as usize * 2];
+    assert!((before - 0.5).abs() < 1e-3, "before cut: {before}");
+    assert!(
+        (after - 0.25).abs() < 1e-3,
+        "first sample after cut: {after}"
+    );
+}
+
+#[test]
+fn range_shorter_than_one_frame_still_gives_one_frame_and_its_audio() {
+    // 10 ms at 30 fps is 0.3 of a frame: one frame, and audio covering that frame (1600 samples).
+    let mut p = project(black_bg());
+    add_media(&mut p, "m1", MediaKind::Video);
+    add_media(&mut p, "a1", MediaKind::Audio);
+    p.clips
+        .push(video_clip(&p, 0, "c1", "m1", Tick::ZERO, Tick::from_ms(10)));
+    p.clips
+        .push(audio_clip(&p, 0, "c2", "a1", Tick::ZERO, Tick::from_ms(10)));
+    let r = go(
+        &plan_of(&p),
+        &cfg(48000),
+        FakeVideo::default(),
+        FakeAudio::constant(0.5),
+        FakeTitles::default(),
+    );
+    assert_eq!(ok(&r).frames, 1);
+    assert_eq!(r.sink.indices, vec![0]);
+    assert_eq!(r.sink.track_frames(0), 1600);
+}

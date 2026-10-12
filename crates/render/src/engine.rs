@@ -7,7 +7,9 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use clipcheck_aacenc::AacEncoder;
@@ -73,7 +75,8 @@ pub struct ExportReport {
 
 /// Runs an export end to end. Writes `<out_path>.part` and renames on success; removes the `.part`
 /// on cancel or error. Dispatches on `settings.kind`: Video (smart path when `settings.lossless`
-/// and eligible, else the full pipeline), Still (see `still`), AudioOnly (M4A).
+/// and eligible, else the full pipeline), Still (see `still`), AudioOnly (M4A, not supported yet:
+/// returns `RenderError::Unsupported`).
 /// For `QualityMode::TargetSize` it solves a bitrate, encodes, and when the result exceeds the
 /// target by more than 3 % re-encodes at a lower bitrate (at most 2 retries), then warns if still
 /// over. Encoder choice: `settings.encoder == "software"` = Microsoft software H.264; "auto" =
@@ -275,8 +278,13 @@ fn export_video(
     } else {
         (0.0, 100.0)
     };
-    // Two passes for a target size; a third only when the first missed by more than 10 %.
-    let mut attempts: u32 = if target_bytes.is_some() { 2 } else { 1 };
+    // Progress budget: a target-size job may run up to MAX_RETRIES + 1 passes, a single pass
+    // otherwise. The budget is fixed so the bar never moves backwards when a retry is added.
+    let budget: u32 = if target_bytes.is_some() {
+        MAX_RETRIES + 1
+    } else {
+        1
+    };
 
     let job = Job {
         project,
@@ -301,18 +309,24 @@ fn export_video(
     let mut first_miss = 1.0_f64;
     let mut used: String;
     let mut used_hw: bool;
+    // The highest percent reported so far. A pass that is restarted in software resumes from the
+    // same point, so the reported percent never goes back.
+    let mut high = 0.0_f32;
+    let mut monotone = |p: Progress| {
+        high = high.max(p.percent);
+        on_progress(Progress { percent: high, ..p });
+    };
     let bytes = loop {
         if req.ctl.is_cancelled() {
             return Err(RenderError::Cancelled);
         }
         let rate = rate_control(cbr, kbps);
         let pass_dir = req.work_dir.join(format!("pass-{attempt}"));
-        attempts = attempts.max(attempt + 1);
         let map = ProgressMap {
             offset,
             span,
             attempt,
-            attempts,
+            budget,
         };
         let pass = encode_pass(
             &job,
@@ -321,9 +335,13 @@ fn export_video(
             &part,
             map,
             &mut allow_hw,
-            on_progress,
+            &mut monotone,
             warnings,
         )?;
+        if pass.restart {
+            // The hardware encoder failed early and allow_hw is now false: redo this pass in software.
+            continue;
+        }
         let bytes = pass.bytes;
         used = pass.encoder;
         used_hw = pass.hardware;
@@ -365,6 +383,7 @@ fn export_video(
         let _ = fs::remove_file(&part);
         io_out("rename output", e)
     })?;
+    report_progress(&mut monotone, duration_secs, duration_secs, 100.0);
 
     Ok(ExportReport {
         out_path: req.out_path.to_path_buf(),
@@ -564,6 +583,21 @@ struct PassResult {
     /// Name of the encoder that produced the video.
     encoder: String,
     hardware: bool,
+    /// True when the hardware encoder failed within its first frames: nothing from this pass is
+    /// usable, and the caller must run the same pass again (now in software).
+    restart: bool,
+}
+
+impl PassResult {
+    /// The result of an abandoned pass that must be redone.
+    fn restart() -> PassResult {
+        PassResult {
+            bytes: 0,
+            encoder: String::new(),
+            hardware: false,
+            restart: true,
+        }
+    }
 }
 
 /// Runs one full encode into `part` (a flat faststart MP4). `allow_hw` is cleared when the
@@ -627,6 +661,8 @@ fn encode_pass(
     })
     .map_err(mp4_err)?;
 
+    // Set by the encoder thread when the hardware encoder fails within its first frames.
+    let early_hw_failure = Arc::new(AtomicBool::new(false));
     let mut sink = EncodeSink::start(
         ThreadSetup {
             primary,
@@ -635,11 +671,11 @@ fn encode_pass(
             muxer,
             tracks: job.audio_tracks,
             fps: job.fps,
-            width: job.width,
-            height: job.height,
+            early_hw_failure: Arc::clone(&early_hw_failure),
         },
         aacs,
         job.sample_rate,
+        (job.width, job.height),
     )?;
     let mut video = MfVideoProvider::new(job.project);
     let mut audio = MfAudioProvider::new(job.project);
@@ -650,7 +686,7 @@ fn encode_pass(
             ..p
         });
     };
-    let report = pipeline::run(
+    let run = pipeline::run(
         &job.plan,
         &job.cfg,
         &mut video,
@@ -659,10 +695,30 @@ fn encode_pass(
         &mut sink,
         job.ctl,
         &mut scaled,
-    )?;
+    );
+    let report = match run {
+        Ok(r) => r,
+        Err(e) => {
+            if early_hw_failure.load(Ordering::SeqCst) && !job.ctl.is_cancelled() {
+                drop(sink);
+                *allow_hw = false;
+                return Ok(PassResult::restart());
+            }
+            return Err(e);
+        }
+    };
     warnings.extend(report.warnings);
 
-    let done = sink.finish()?;
+    let done = match sink.finish() {
+        Ok(d) => d,
+        Err(e) => {
+            if early_hw_failure.load(Ordering::SeqCst) && !job.ctl.is_cancelled() {
+                *allow_hw = false;
+                return Ok(PassResult::restart());
+            }
+            return Err(e);
+        }
+    };
     warnings.extend(done.warnings);
     if done.fell_back {
         *allow_hw = false;
@@ -684,25 +740,29 @@ fn encode_pass(
         bytes,
         encoder: done.encoder,
         hardware: done.hardware,
+        restart: false,
     })
 }
 
 /// Maps one pass's own progress (0..=100) into the overall job percent: the job is
-/// `offset..offset+span` percent, split evenly across `attempts` passes.
+/// `offset..offset+span` percent, split evenly across a budget of `budget` passes.
 #[derive(Debug, Clone, Copy)]
 struct ProgressMap {
     offset: f32,
     span: f32,
+    /// Zero-based pass number.
     attempt: u32,
-    attempts: u32,
+    /// Passes the progress bar is divided into (fixed for the whole job).
+    budget: u32,
 }
 
 impl ProgressMap {
-    /// Overall percent (0..=100) for a pass percent `pass` (0..=100).
+    /// Overall percent (0..=100) for a pass percent `pass` (0..=100). Non-decreasing in both
+    /// `attempt` and `pass`, because a pass ends at `(attempt + 1) / budget` and the next starts there.
     fn apply(&self, pass: f32) -> f32 {
         let frac = (f64::from(self.attempt) + f64::from(pass.clamp(0.0, 100.0)) / 100.0)
-            / f64::from(self.attempts.max(1));
-        (self.offset + self.span * frac as f32).clamp(0.0, 100.0)
+            / f64::from(self.budget.max(1));
+        (self.offset + self.span * frac.min(1.0) as f32).clamp(0.0, 100.0)
     }
 }
 
@@ -747,9 +807,14 @@ fn wait_while_paused(
 
 /// Messages from the pipeline thread to the encoder thread.
 enum Msg {
-    /// A composed frame.
-    Video { index: u64, frame: Frame },
-    /// Encoded audio packets of one track.
+    /// A composed frame, with the audio packets (per track) that became ready since the previous
+    /// frame. Audio rides along with video so it never takes a channel slot of its own.
+    Video {
+        index: u64,
+        frame: Frame,
+        audio: Vec<(usize, Vec<AudioPacket>)>,
+    },
+    /// Encoded audio packets of one track, sent after the last frame.
     Audio {
         track: usize,
         packets: Vec<AudioPacket>,
@@ -758,8 +823,10 @@ enum Msg {
     End,
 }
 
-/// Messages in flight between the pipeline and the encoder thread.
+/// Frames in flight between the pipeline and the encoder thread (each holds a full frame).
 const CHANNEL_DEPTH: usize = 6;
+/// A hardware encoder failure before this many frames restarts the pass in software.
+const EARLY_HW_FRAMES: u64 = 60;
 
 /// What the encoder thread reports when it finishes.
 struct ThreadDone {
@@ -780,8 +847,8 @@ struct ThreadSetup {
     muxer: SegmentMuxer,
     tracks: usize,
     fps: Rate,
-    width: u32,
-    height: u32,
+    /// Set when the hardware encoder fails within `EARLY_HW_FRAMES` frames.
+    early_hw_failure: Arc<AtomicBool>,
 }
 
 /// Video encoder plus its input path.
@@ -835,6 +902,7 @@ struct Worker {
     frames: u64,
     fell_back: bool,
     warnings: Vec<String>,
+    early_hw_failure: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -890,12 +958,21 @@ impl Worker {
         let result = self.encode_one(frame, index);
         let packets = match result {
             Ok(p) => p,
-            // Only the first frame may fall back: nothing has been written yet.
+            // The first frame may switch encoders in place: nothing has been written yet.
             Err(e) if self.frames == 0 => {
                 self.switch_to_fallback(e)?;
                 self.encode_one(frame, index)?
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // An early hardware failure abandons the pass; the caller redoes it in software.
+                if self.frames < EARLY_HW_FRAMES
+                    && self.path.desc.hardware
+                    && self.fallback.is_some()
+                {
+                    self.early_hw_failure.store(true, Ordering::SeqCst);
+                }
+                return Err(e);
+            }
         };
         self.frames += 1;
         self.mux_video(packets)
@@ -961,10 +1038,8 @@ fn encoder_thread(
         muxer,
         tracks,
         fps,
-        width,
-        height,
+        early_hw_failure,
     } = setup;
-    let _ = (width, height);
     let mut warnings = Vec::new();
     let mut fell_back = false;
     let mut fallback = fallback;
@@ -993,10 +1068,20 @@ fn encoder_thread(
         frames: 0,
         fell_back,
         warnings,
+        early_hw_failure,
     };
     loop {
         match rx.recv() {
-            Ok(Msg::Video { index, frame }) => {
+            Ok(Msg::Video {
+                index,
+                frame,
+                audio,
+            }) => {
+                for (track, packets) in audio {
+                    if let Some(q) = worker.queues.get_mut(track) {
+                        q.extend(packets);
+                    }
+                }
                 worker.video(&frame, index)?;
                 let _ = free_tx.send(frame.bgra);
             }
@@ -1020,21 +1105,24 @@ struct EncodeSink {
     aacs: Vec<AacEncoder>,
     /// Samples per channel pushed so far, per track.
     audio_frames: Vec<u64>,
+    /// Encoded audio not yet sent, per track; it is sent with the next video frame.
+    pending_audio: Vec<Vec<AudioPacket>>,
     sample_rate: u32,
     width: u32,
     height: u32,
 }
 
 impl EncodeSink {
-    /// Spawns the encoder thread.
+    /// Spawns the encoder thread. `frame_size` is the (width, height) every video frame must have.
     fn start(
         setup: ThreadSetup,
         aacs: Vec<AacEncoder>,
         sample_rate: u32,
+        frame_size: (u32, u32),
     ) -> Result<Self, RenderError> {
         let (tx, rx) = sync_channel(CHANNEL_DEPTH);
         let (free_tx, free_rx) = std::sync::mpsc::channel();
-        let (width, height) = (setup.width, setup.height);
+        let (width, height) = frame_size;
         let tracks = aacs.len();
         let handle = std::thread::Builder::new()
             .name("export-encoder".to_string())
@@ -1046,10 +1134,21 @@ impl EncodeSink {
             free_rx,
             aacs,
             audio_frames: vec![0; tracks],
+            pending_audio: (0..tracks).map(|_| Vec::new()).collect(),
             sample_rate,
             width,
             height,
         })
+    }
+
+    /// Takes the audio packets waiting to be sent, as (track, packets) pairs.
+    fn take_pending_audio(&mut self) -> Vec<(usize, Vec<AudioPacket>)> {
+        self.pending_audio
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, p)| !p.is_empty())
+            .map(|(k, p)| (k, std::mem::take(p)))
+            .collect()
     }
 
     /// Sends a message; when the encoder thread is gone, returns the error it ended with.
@@ -1078,14 +1177,16 @@ impl EncodeSink {
     /// Flushes AAC, tells the encoder thread to finish and returns its result.
     fn finish(mut self) -> Result<ThreadDone, RenderError> {
         for k in 0..self.aacs.len() {
-            let packets = match self.aacs.get_mut(k) {
+            let flushed = match self.aacs.get_mut(k) {
                 Some(aac) => aac.flush().map_err(aac_err)?,
                 None => continue,
             };
-            if !packets.is_empty() {
-                let packets = packets.into_iter().map(to_audio_packet).collect();
-                self.send(Msg::Audio { track: k, packets })?;
+            if let Some(q) = self.pending_audio.get_mut(k) {
+                q.extend(flushed.into_iter().map(to_audio_packet));
             }
+        }
+        for (track, packets) in self.take_pending_audio() {
+            self.send(Msg::Audio { track, packets })?;
         }
         self.send(Msg::End)?;
         self.tx = None;
@@ -1121,6 +1222,7 @@ impl Sink for EncodeSink {
         let mut bgra = self.free_rx.try_recv().unwrap_or_default();
         bgra.clear();
         bgra.extend_from_slice(&frame.bgra);
+        let audio = self.take_pending_audio();
         self.send(Msg::Video {
             index,
             frame: Frame {
@@ -1128,6 +1230,7 @@ impl Sink for EncodeSink {
                 height: frame.height,
                 bgra,
             },
+            audio,
         })
     }
 
@@ -1143,11 +1246,10 @@ impl Sink for EncodeSink {
         if let Some(n) = self.audio_frames.get_mut(track) {
             *n = n.saturating_add((samples.len() / 2) as u64);
         }
-        if packets.is_empty() {
-            return Ok(());
+        if let Some(q) = self.pending_audio.get_mut(track) {
+            q.extend(packets.into_iter().map(to_audio_packet));
         }
-        let packets = packets.into_iter().map(to_audio_packet).collect();
-        self.send(Msg::Audio { track, packets })
+        Ok(())
     }
 }
 

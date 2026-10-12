@@ -128,8 +128,12 @@ pub fn run(
     validate_run(plan, cfg)?;
     let dur = plan.end.0.saturating_sub(plan.start.0);
     let total_secs = dur as f64 / TICKS_PER_SECOND as f64;
-    let frames = u64::try_from(Tick(dur).to_frame(cfg.fps)).unwrap_or(0);
-    let total = total_samples(dur, cfg.sample_rate);
+    let frames = frame_count(dur, cfg.fps);
+    let mut total = total_samples(dur, cfg.sample_rate);
+    if cfg.video {
+        // A range shorter than one frame still gets one frame; its audio must cover that frame.
+        total = total.max(sample_index(frames, cfg.sample_rate, cfg.fps));
+    }
     let mix = matches!(cfg.layout, AudioLayout::Mix);
     let n_tracks = if mix { 1 } else { cfg.audio_tracks.max(1) };
 
@@ -214,11 +218,7 @@ pub fn measure_loudness(
         if samples == 0 {
             continue;
         }
-        let block_t = plan
-            .start
-            .saturating_add(Tick::from_sample(s0, cfg.sample_rate));
-        let seg = seg_at(&plan.segments, &mut stage.cursor, block_t);
-        stage.mix_block(seg, block_t, samples, audio);
+        stage.mix_range(plan, s0, s1, audio);
         if let Some(buf) = stage.tracks.first() {
             meter.push(buf);
         }
@@ -329,6 +329,32 @@ fn sample_block(b: u64, total: i64) -> (i64, i64) {
         .saturating_mul(AUDIO_BLOCK);
     let s1 = s0.saturating_add(AUDIO_BLOCK).min(total).max(s0);
     (s0, s1)
+}
+
+/// Number of output frames for a range of `dur` ticks: the whole frames inside it, but at least
+/// one for a non-empty range (a shorter range would otherwise produce no video at all).
+fn frame_count(dur: i64, fps: Rate) -> u64 {
+    if dur <= 0 {
+        return 0;
+    }
+    u64::try_from(Tick(dur).to_frame(fps)).unwrap_or(0).max(1)
+}
+
+/// Smallest sample index `s >= lo` whose time `start + Tick::from_sample(s)` is at or after
+/// `boundary`. Samples before it lie before the boundary.
+fn sample_reaching(start: Tick, boundary: Tick, sr: u32, lo: i64) -> i64 {
+    let reached = |s: i64| start.saturating_add(Tick::from_sample(s, sr)) >= boundary;
+    // Start from the fractional estimate, then step to the exact first sample.
+    let rel = i128::from(boundary.0) - i128::from(start.0);
+    let guess = (rel * i128::from(sr)).div_euclid(i128::from(TICKS_PER_SECOND));
+    let mut s = clamp_i64(guess).max(lo);
+    while s > lo && reached(s - 1) {
+        s -= 1;
+    }
+    while !reached(s) {
+        s += 1;
+    }
+    s
 }
 
 fn total_blocks(total: i64) -> u64 {
@@ -536,17 +562,16 @@ impl VideoStage {
             sources.push((frame, opacity));
         }
 
-        // Blurred backdrop behind fit-mode clips when the canvas asks for it.
-        let blur_frame = if self.blur
-            && layers
-                .first()
-                .is_some_and(|l| l.transform.fit == FitMode::Fit)
-        {
-            sources
-                .first()
-                .map(|(f, _)| reference::blurred_cover(f, self.cw, self.ch))
-        } else {
-            None
+        // Blurred backdrop behind fit-mode clips when the canvas asks for it. It is skipped when the
+        // first layer would hide it completely.
+        let blur_frame = match (self.blur, layers.first(), sources.first()) {
+            (true, Some(layer), Some((frame, opacity)))
+                if layer.transform.fit == FitMode::Fit
+                    && !covers_canvas(frame, layer, *opacity, self.cw, self.ch) =>
+            {
+                Some(reference::blurred_cover(frame, self.cw, self.ch))
+            }
+            _ => None,
         };
         let fill = Transform {
             fit: FitMode::Fill,
@@ -713,28 +738,52 @@ impl AudioStage {
         audio: &mut dyn AudioProvider,
         sink: &mut dyn Sink,
     ) -> Result<(), RenderError> {
-        let samples = usize::try_from(s1.saturating_sub(s0)).unwrap_or(0);
-        if samples == 0 {
+        if s1.saturating_sub(s0) <= 0 {
             return Ok(());
         }
-        let block_t = plan.start.saturating_add(Tick::from_sample(s0, self.sr));
-        let seg = seg_at(&plan.segments, &mut self.cursor, block_t);
-        self.mix_block(seg, block_t, samples, audio);
+        self.mix_range(plan, s0, s1, audio);
         self.finish_block(sink)
     }
 
-    /// Zeroes the tracks and sums every audible source of `seg` into them.
-    fn mix_block(
-        &mut self,
-        seg: Option<&PlanSegment>,
-        block_t: Tick,
-        samples: usize,
-        audio: &mut dyn AudioProvider,
-    ) {
+    /// Zeroes the tracks and mixes the sample range `[s0, s1)` of the plan into them. The range is
+    /// split where the plan segments change, so every part is read and gained from the segment that
+    /// really contains it: a cut inside a block must not give the whole block the earlier clip.
+    fn mix_range(&mut self, plan: &RenderPlan, s0: i64, s1: i64, audio: &mut dyn AudioProvider) {
+        let samples = usize::try_from(s1.saturating_sub(s0)).unwrap_or(0);
         for t in self.tracks.iter_mut() {
             t.clear();
             t.resize(samples * 2, 0.0);
         }
+        let mut s = s0;
+        while s < s1 {
+            let t = plan.start.saturating_add(Tick::from_sample(s, self.sr));
+            let seg = seg_at(&plan.segments, &mut self.cursor, t);
+            // The part ends where the active segment ends, or where the next one starts in a gap.
+            let boundary = match seg {
+                Some(seg) => Some(seg.end),
+                None => plan.segments.get(self.cursor).map(|next| next.start),
+            };
+            let end = match boundary {
+                Some(b) => sample_reaching(plan.start, b, self.sr, s + 1).min(s1),
+                None => s1,
+            };
+            let off = usize::try_from(s - s0).unwrap_or(0);
+            let n = usize::try_from(end - s).unwrap_or(0);
+            self.mix_part(seg, t, n, off, audio);
+            s = end;
+        }
+    }
+
+    /// Sums every audible source of `seg` for the `n` samples starting at `block_t`, into the
+    /// tracks at sample offset `off`.
+    fn mix_part(
+        &mut self,
+        seg: Option<&PlanSegment>,
+        block_t: Tick,
+        n: usize,
+        off: usize,
+        audio: &mut dyn AudioProvider,
+    ) {
         let Some(seg) = seg else {
             return;
         };
@@ -750,9 +799,13 @@ impl AudioStage {
             } else {
                 (src.track_index as usize).min(last)
             };
-            self.read_source(src, seg.start, block_t, samples, audio);
-            apply_clip_gain(&mut self.read_buf, src, block_t, samples, self.sr);
-            if let Some(dst) = self.tracks.get_mut(idx) {
+            self.read_source(src, seg.start, block_t, n, audio);
+            apply_clip_gain(&mut self.read_buf, src, block_t, n, self.sr);
+            let dst = self
+                .tracks
+                .get_mut(idx)
+                .and_then(|t| t.get_mut(off * 2..(off + n) * 2));
+            if let Some(dst) = dst {
                 dsp::mix_into(dst, &self.read_buf, 1.0);
             }
         }
@@ -872,6 +925,18 @@ impl AudioStage {
         }
         Ok(())
     }
+}
+
+/// True when `layer` is opaque decoded video whose destination rectangle covers the whole canvas, so
+/// a blurred backdrop behind it would never be visible. Images and titles may carry alpha and are
+/// never treated as covering.
+fn covers_canvas(frame: &Frame, layer: &VideoLayer, opacity: f64, cw: u32, ch: u32) -> bool {
+    if !matches!(layer.kind, ClipKind::Video) || opacity < 1.0 {
+        return false;
+    }
+    let r = reference::dest_rect(frame.width, frame.height, cw, ch, &layer.transform);
+    const EPS: f64 = 1e-6;
+    r.x <= EPS && r.y <= EPS && r.x + r.w >= f64::from(cw) - EPS && r.y + r.h >= f64::from(ch) - EPS
 }
 
 /// Multiplies a block by the clip gain (interpolated between the block ends), the track fader
