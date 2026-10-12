@@ -20,7 +20,17 @@
   import Toolbar from './Toolbar.svelte';
   import ToolRail from './ToolRail.svelte';
   import { ACTIONS, resolveShortcut, type ActionId } from './shortcuts';
-  import { closeEditor, dispatch, openSnapshot, playing, snapshot, startAutosave, stopAutosave } from './store';
+  import {
+    closeEditor,
+    dispatch,
+    fitToContent,
+    needsFitOnOpen,
+    openSnapshot,
+    playing,
+    snapshot,
+    startAutosave,
+    stopAutosave,
+  } from './store';
   import { msToTick } from './ticks';
   import type { Command, EditorSnapshot } from './types';
   import { editorTarget, type EditorTarget } from '../nav';
@@ -94,6 +104,14 @@
   let timelineWidth = $state(0);
   /** Width of the track rows only (the cell minus the tool rail and the header column), used by zoom to fit. */
   const trackViewWidth = $derived(Math.max(0, timelineWidth - RAIL_W - HEADER_W));
+  /** Set when a project is opened: zoom to its content once the track width is known (never again). */
+  let needsInitialFit = $state(false);
+
+  $effect(() => {
+    if (!needsInitialFit || $snapshot === null || trackViewWidth <= 0) return;
+    needsInitialFit = false;
+    fitToContent(trackViewWidth);
+  });
 
   /** Clamps `v` into `lo..hi`. */
   function clamp(v: number, lo: number, hi: number): number {
@@ -339,6 +357,7 @@
               : await editorApi.newProject('New project', null, t.recordingIds);
         }
         if (cancelled) return;
+        needsInitialFit = t.projectId === null || needsFitOnOpen(snap);
         openSnapshot(snap);
         status = 'ready';
         if (t.projectId === null) {

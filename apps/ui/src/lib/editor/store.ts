@@ -22,8 +22,10 @@ const MAX_PX_PER_SEC = 4000;
 const DEFAULT_PX_PER_SEC = 80;
 /** Horizontal padding kept free when zooming to fit. */
 const FIT_PADDING_PX = 40;
-/** Minimum timeline length used by zoomToFit, in seconds. */
+/** Minimum timeline length used by zoomToFit and fitToContent, in seconds. */
 const FIT_MIN_SECONDS = 10;
+/** Timeline length that fitToContent shows for an empty project, in seconds. */
+export const DEFAULT_EMPTY_FIT_SECONDS = 15 * 60;
 /** Autosave interval limits, in seconds. */
 const MIN_AUTOSAVE_S = 10;
 const MAX_AUTOSAVE_S = 600;
@@ -145,6 +147,15 @@ export function timelineEndTick(project: Project | null): Tick {
 function clampZoom(px: number): number {
 	if (!Number.isFinite(px)) return DEFAULT_PX_PER_SEC;
 	return Math.min(MAX_PX_PER_SEC, Math.max(MIN_PX_PER_SEC, px));
+}
+
+/**
+ * True when a snapshot should be zoomed to its content on open: its saved zoom is missing or still
+ * the stock default, so the user never customised it.
+ */
+export function needsFitOnOpen(s: EditorSnapshot): boolean {
+	const z = s.project.ui_state.zoom_px_per_sec;
+	return !Number.isFinite(z) || z === DEFAULT_PX_PER_SEC;
 }
 
 /** Clamps a scroll offset to be non-negative and finite. */
@@ -373,6 +384,23 @@ export function zoomToFit(viewWidthPx: number): void {
 	const seconds = Math.max(FIT_MIN_SECONDS, tickToSec(timelineEndTick(p)));
 	pxPerSec.set(clampZoom((viewWidthPx - FIT_PADDING_PX) / seconds));
 	scrollX.set(0);
+}
+
+/**
+ * Sets the zoom so the content fits in `viewWidthPx`, and scrolls to 0. The content is the whole
+ * timeline (at least 10 s) for a project with clips, or 15 minutes for an empty project.
+ */
+export function fitToContent(viewWidthPx: number): void {
+	if (!Number.isFinite(viewWidthPx)) return;
+	const p = get(snapshot)?.project ?? null;
+	const seconds =
+		p === null || p.clips.length === 0
+			? DEFAULT_EMPTY_FIT_SECONDS
+			: Math.max(FIT_MIN_SECONDS, tickToSec(timelineEndTick(p)));
+	pxPerSec.set(clampZoom((viewWidthPx - FIT_PADDING_PX) / seconds));
+	scrollX.set(0);
+	// Persist the fitted zoom; the ui_state watchers skip the initial value of each subscribe.
+	scheduleUiStateSave();
 }
 
 // ---------------------------------------------------------------------------------------------
