@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -640,9 +640,18 @@ fn take_next(inner: &mut Inner, now: Instant) -> Option<Job> {
     }
 }
 
+/// Worker restarts in a row after abnormal worker exits. Reset after each job that returns
+/// normally and when the worker drains the queue.
+static WORKER_RESTARTS: AtomicU32 = AtomicU32::new(0);
+
+/// Most restarts in a row the guard performs before it gives up on the queue.
+const MAX_WORKER_RESTARTS: u32 = 3;
+
 /// Clears `worker_running` when the worker thread ends by panic or early exit, so the next queued
-/// job starts a new worker (and restarts one at once when jobs are still waiting). Disarmed on
-/// the normal exit, which clears the flag itself under the lock.
+/// job starts a new worker (and restarts one at once when jobs are still waiting). Running jobs
+/// are marked Failed, since nothing will finish them. Restarts are capped at
+/// [`MAX_WORKER_RESTARTS`] in a row. Disarmed on the normal exit, which clears the flag itself
+/// under the lock.
 struct WorkerGuard {
     app: AppHandle,
     client: Arc<DaemonClient>,
@@ -657,14 +666,29 @@ impl Drop for WorkerGuard {
         let Some(st) = self.app.try_state::<EditorState>() else {
             return;
         };
-        let restart = {
+        let (restart, list) = {
             let mut inner = lock(&st.exports.inner);
             inner.worker_running = false;
-            inner
-                .entries
-                .iter()
-                .any(|e| e.dto.state == JobState::Queued)
+            let mut changed = false;
+            for entry in inner.entries.iter_mut() {
+                if entry.dto.state == JobState::Running {
+                    entry.dto.state = JobState::Failed;
+                    entry.dto.error = Some("The export stopped unexpectedly".to_string());
+                    changed = true;
+                }
+            }
+            let restarts = WORKER_RESTARTS.fetch_add(1, Ordering::SeqCst) + 1;
+            let restart = restarts <= MAX_WORKER_RESTARTS
+                && inner
+                    .entries
+                    .iter()
+                    .any(|e| e.dto.state == JobState::Queued);
+            let list = changed.then(|| publish(&st.exports, &inner));
+            (restart, list)
         };
+        if let Some(list) = list {
+            emit_queue(&self.app, list);
+        }
         if restart {
             let mut inner = lock(&st.exports.inner);
             if !inner.worker_running {
@@ -699,17 +723,32 @@ fn worker_loop(app: AppHandle, client: Arc<DaemonClient>) {
                 None => {
                     inner.worker_running = false;
                     guard.armed = false;
+                    WORKER_RESTARTS.store(0, Ordering::SeqCst);
                     return;
                 }
             }
         };
         emit_queue(&app, list);
         run_job(&app, &client, job);
+        WORKER_RESTARTS.store(0, Ordering::SeqCst);
     }
 }
 
 /// Age after which a `*.part` file in the export folder counts as a leftover.
 const PART_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// True when `name` is a temp file this engine writes: `<stem>.<ext>.part` where `<ext>` is one of
+/// the export output extensions (mp4, m4a, png, jpg). Other apps' `.part`/`.crdownload` files
+/// in the same folder never match.
+fn is_our_part_file(name: &str) -> bool {
+    let Some(base) = name.strip_suffix(".part") else {
+        return false;
+    };
+    let Some((stem, ext)) = base.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty() && matches!(ext.to_ascii_lowercase().as_str(), "mp4" | "m4a" | "png" | "jpg")
+}
 
 /// Removes leftovers that no queued, running or paused job uses: folders in `export-work` whose
 /// name is not a live job id, and `*.part` files older than [`PART_MAX_AGE`] in the default export
@@ -758,7 +797,7 @@ fn sweep_leftovers(app: &AppHandle, client: &DaemonClient) {
     if let Ok(read) = fs::read_dir(&folder) {
         for item in read.flatten() {
             let path = item.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("part") || !path.is_file() {
+            if !path.is_file() || !is_our_part_file(&item.file_name().to_string_lossy()) {
                 continue;
             }
             if live_part_names.contains(&item.file_name()) {
@@ -1637,6 +1676,19 @@ pub async fn editor_list_encoders(codec: String) -> Result<Vec<EncoderInfo>, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn our_part_files_are_recognised_by_name() {
+        assert!(is_our_part_file("x.mp4.part"));
+        assert!(is_our_part_file("My Movie 2.m4a.part"));
+        assert!(is_our_part_file("still.PNG.part"));
+        assert!(is_our_part_file("still.jpg.part"));
+        assert!(!is_our_part_file("movie.mkv.part"));
+        assert!(!is_our_part_file("a.part"));
+        assert!(!is_our_part_file("a.crdownload"));
+        assert!(!is_our_part_file(".mp4.part"));
+        assert!(!is_our_part_file("x.mp4"));
+    }
 
     #[test]
     fn verbatim_prefix_is_stripped_for_the_shell() {

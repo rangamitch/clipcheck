@@ -205,7 +205,8 @@ pub async fn editor_thumbnails(
     }
     let height = height.clamp(MIN_THUMB_HEIGHT, MAX_THUMB_HEIGHT);
     let Some(project_id) = open_project_id(&state) else {
-        return Err("no project is open".to_string());
+        // Empty, not an error: the UI marks a failed request as failed for good.
+        return Ok(Vec::new());
     };
     tauri::async_runtime::spawn_blocking(move || {
         let still_open = || {
@@ -683,14 +684,22 @@ fn compute_peaks(
     Ok((peaks, true))
 }
 
+/// FNV-1a 64-bit hash. Unlike `DefaultHasher` its value is fixed across Rust versions, so
+/// on-disk cache names stay valid after a toolchain upgrade.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes
+        .iter()
+        .fold(OFFSET_BASIS, |h, b| (h ^ u64::from(*b)).wrapping_mul(PRIME))
+}
+
 /// Short hex tag of a source file's canonical path (case-folded), so two files with the same size
 /// and modification time never share a cache entry.
 fn source_tag(path: &Path) -> String {
     let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let text = canon.to_string_lossy().to_ascii_lowercase();
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    format!("{:016x}", h.finish())[..12].to_string()
+    format!("{:016x}", fnv1a64(text.as_bytes()))[..12].to_string()
 }
 
 /// Peaks cache file of one stream of `path`: the `paths::peaks_file` name with the source tag
@@ -768,8 +777,9 @@ fn write_peaks(file: &Path, peaks: &[f32]) -> Result<(), String> {
 // Thumbnails.
 // ---------------------------------------------------------------------------------------------
 
-/// Key of the in-memory thumbnail cache: media path, time in ms, pixel height.
-type ThumbKey = (String, i64, u32);
+/// Key of the in-memory thumbnail cache: media path, time in ms, pixel height, file size and
+/// modification time (ms). The last two make an overwritten file miss instead of serving old frames.
+type ThumbKey = (String, i64, u32, u64, i64);
 
 /// Bounded in-memory cache of data-URI thumbnails, least recently used first.
 #[derive(Default)]
@@ -807,7 +817,8 @@ fn thumb_put(key: ThumbKey, value: String) {
 }
 
 /// Computes the thumbnails of one media entry (blocking). `still_open` reports whether the
-/// project the request was made for is still open; the loop stops with an error when it is not.
+/// project the request was made for is still open. When it is not, the result is an empty list:
+/// the UI treats missing entries as placeholders and does not mark the media as failed.
 fn thumbnails_blocking(
     media: &MediaRef,
     times_ms: &[i64],
@@ -830,15 +841,16 @@ fn thumbnails_blocking(
 
     let dir = cache_root().join("thumbs");
     let mtime = mtime_ms(&meta);
+    let size = meta.len();
     // One heavy-job lock for the whole call, not one per frame.
     let _heavy = HeavyIo::enter();
     let mut out = Vec::with_capacity(times_ms.len());
     for &ms in times_ms {
         if !still_open() {
-            return Err("the project was closed before the thumbnails were made".to_string());
+            return Ok(Vec::new());
         }
         let ms = ms.max(0);
-        let key: ThumbKey = (media.path.clone(), ms, height);
+        let key: ThumbKey = (media.path.clone(), ms, height, size, mtime);
         if let Some(hit) = thumb_get(&key) {
             out.push(hit);
             continue;
@@ -1150,6 +1162,12 @@ mod tests {
         png.extend_from_slice(&640u32.to_be_bytes());
         png.extend_from_slice(&480u32.to_be_bytes());
         assert_eq!(image_header(&png), Some(("png", "image/png", 640, 480)));
+    }
+
+    #[test]
+    fn fnv1a64_matches_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
     }
 
     #[test]
