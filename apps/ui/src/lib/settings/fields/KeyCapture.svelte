@@ -3,9 +3,11 @@
   import {
     chordLabel,
     eventToChord,
+    formatChord,
     heldModifiersLabel,
     isReservedChord,
     modifiersOf,
+    mouseButtonKey,
   } from '../hotkeys';
   import { beginHotkeyCapture } from '../hotkeySuspend';
 
@@ -14,6 +16,8 @@
     value: string;
     /** Whether Backspace or Delete may clear the binding (session hotkeys only). */
     allowClear?: boolean;
+    /** Whether the middle and side mouse buttons (Mouse3-5) may be captured. Push-to-talk rows only. */
+    allowMouse?: boolean;
     disabled?: boolean;
     id?: string;
     labelId?: string;
@@ -24,12 +28,20 @@
   let {
     value,
     allowClear = false,
+    allowMouse = false,
     disabled = false,
     id,
     labelId,
     describedBy,
     onchange,
   }: Props = $props();
+
+  /** The capture hint, which names the mouse only on rows that accept it. */
+  const hint = $derived(allowMouse ? 'Press a key or a mouse button' : 'Press a key or shortcut');
+
+  /** Mouse button whose mouseup and auxclick are swallowed, so the browser does not navigate. */
+  let swallowButton: number | null = null;
+  let swallowTimer: ReturnType<typeof setTimeout> | undefined;
 
   let listening = $state(false);
   /** Modifiers held right now, shown while listening. */
@@ -53,7 +65,9 @@
     problem = null;
     // Pause the daemon's global hotkeys, so the chord being recorded does not fire a clip.
     releaseHotkeys ??= beginHotkeyCapture();
-    announce = 'Listening. Press a key or shortcut, or Escape to cancel.';
+    announce = allowMouse
+      ? 'Listening. Press a key or a mouse button, or Escape to cancel.'
+      : 'Listening. Press a key or shortcut, or Escape to cancel.';
   }
 
   function stop(): void {
@@ -78,11 +92,54 @@
     };
   });
 
+  // Mouse buttons are read on the window while listening, so a click anywhere reaches the capture.
+  $effect(() => {
+    if (!listening) return;
+    window.addEventListener('mousedown', onmousedown, true);
+    return () => window.removeEventListener('mousedown', onmousedown, true);
+  });
+
+  // A captured side button must not also go Back or Forward in the browser. Its mouseup and
+  // auxclick are swallowed for a short moment after the press. Always installed, since the
+  // press may commit (and stop listening) before the release arrives.
+  $effect(() => {
+    const block = (e: MouseEvent): void => {
+      if (swallowButton === null || e.button !== swallowButton) return;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    window.addEventListener('mouseup', block, true);
+    window.addEventListener('auxclick', block, true);
+    return () => {
+      window.removeEventListener('mouseup', block, true);
+      window.removeEventListener('auxclick', block, true);
+    };
+  });
+
   // Component destroyed mid-capture: the daemon must not stay paused.
   onDestroy(() => {
     releaseHotkeys?.();
     releaseHotkeys = null;
+    clearTimeout(swallowTimer);
   });
+
+  /** Middle (1), back (3) and forward (4) buttons bind on press. Left and right are ignored. */
+  function onmousedown(e: MouseEvent): void {
+    if (!listening) return;
+    if (e.button === 0 || e.button === 2) return;
+    const key = mouseButtonKey(e.button);
+    if (key === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    swallowButton = e.button;
+    clearTimeout(swallowTimer);
+    swallowTimer = setTimeout(() => (swallowButton = null), 500);
+    if (!allowMouse) {
+      refuse('Mouse buttons cannot be used for this shortcut. Press a key, or Esc to cancel.');
+      return;
+    }
+    commit(formatChord(modifiersOf(e), key));
+  }
 
   function cancel(): void {
     if (!listening) return;
@@ -173,7 +230,7 @@
     onkeyup={onkeyup}
   >
     {#if listening}
-      <span class="hint">{held || 'Press a key or shortcut'}</span>
+      <span class="hint">{held || hint}</span>
     {:else}
       <span class="chord">{shown}</span>
     {/if}

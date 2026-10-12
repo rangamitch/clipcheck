@@ -759,6 +759,9 @@ impl Audio {
         }
         if self.mic.enabled {
             out.push(SourceRef::Mic);
+            if self.mic.ptt_separate_track {
+                out.push(SourceRef::MicPtt);
+            }
         }
         out.extend(
             self.apps
@@ -791,7 +794,11 @@ impl Audio {
         let mut plan = Vec::with_capacity(enabled.len() + 1);
         plan.push(TrackPlan {
             title: "Mix".to_owned(),
-            sources: enabled.clone(),
+            sources: enabled
+                .iter()
+                .filter(|s| **s != SourceRef::MicPtt)
+                .cloned()
+                .collect(),
         });
         if self.separate_tracks {
             for source in enabled {
@@ -808,7 +815,7 @@ impl Audio {
     pub fn gain_for(&self, source: &SourceRef) -> f32 {
         match source {
             SourceRef::Game => self.game.gain_db,
-            SourceRef::Mic => self.mic.gain_db,
+            SourceRef::Mic | SourceRef::MicPtt => self.mic.gain_db,
             SourceRef::OtherApps => self.other_apps.gain_db,
             SourceRef::App(exe) => self
                 .apps
@@ -823,6 +830,7 @@ impl Audio {
         match source {
             SourceRef::Game => "Game".to_owned(),
             SourceRef::Mic => "Microphone".to_owned(),
+            SourceRef::MicPtt => "Push to talk".to_owned(),
             SourceRef::OtherApps => "Other apps".to_owned(),
             SourceRef::App(exe) => self
                 .apps
@@ -866,6 +874,14 @@ pub struct MicAudio {
     pub gate_enabled: bool,
     /// Noise gate threshold in dB, -100.0..=-20.0.
     pub gate_db: f32,
+    /// Push-to-talk only (`hotkeys.session.mute_mic_mode = "push_to_talk"`): record the
+    /// push-to-talk microphone on its own "Push to talk" track and keep a normal, always-open
+    /// "Microphone" track. The Mix track gets the push-to-talk version. Needs
+    /// `audio.separate_tracks`.
+    pub ptt_separate_track: bool,
+    /// Push-to-talk only: how long the mic stays open after the key is released, in
+    /// milliseconds, 0..=2000.
+    pub ptt_release_ms: u32,
 }
 
 impl Default for MicAudio {
@@ -876,6 +892,8 @@ impl Default for MicAudio {
             gain_db: 0.0,
             gate_enabled: false,
             gate_db: -50.0,
+            ptt_separate_track: false,
+            ptt_release_ms: 250,
         }
     }
 }
@@ -932,6 +950,10 @@ pub enum SourceRef {
     Game,
     /// The microphone.
     Mic,
+    /// The microphone as heard through push to talk, on its own track. Only present when
+    /// `audio.mic.ptt_separate_track` is set. Never part of the Mix track (the Mix track carries
+    /// `Mic`, which the daemon push-to-talk gates).
+    MicPtt,
     /// Everything that is not the game or a listed app.
     OtherApps,
     /// One listed app, by executable.
@@ -1092,6 +1114,10 @@ pub struct SessionHotkeys {
     pub mute_mic: Option<KeyChord>,
     /// Toggle or push-to-talk behaviour for `mute_mic`.
     pub mute_mic_mode: MuteMode,
+    /// Push-to-talk keys, at most 4. The mic records while ANY of them is held (keyboard keys
+    /// or the mouse buttons `Mouse3`, `Mouse4`, `Mouse5`). Empty (the default) means no push to
+    /// talk. Independent of `mute_mic`, which stays a toggle.
+    pub push_to_talk: Vec<KeyChord>,
 }
 
 impl Default for SessionHotkeys {
@@ -1102,6 +1128,7 @@ impl Default for SessionHotkeys {
             toggle_buffer: Some(KeyChord::alt(VK_F8)),
             mute_mic: Some(KeyChord::alt(VK_F7)),
             mute_mic_mode: MuteMode::Toggle,
+            push_to_talk: Vec::new(),
         }
     }
 }
@@ -1718,6 +1745,9 @@ const NAMED_KEYS: &[(&str, u16)] = &[
     ("CapsLock", 0x14),
     ("Space", 0x20),
     ("AppsKey", 0x5D),
+    ("Mouse3", 0x04),
+    ("Mouse4", 0x05),
+    ("Mouse5", 0x06),
     ("VolumeMute", 0xAD),
     ("VolumeDown", 0xAE),
     ("VolumeUp", 0xAF),
@@ -2021,6 +2051,8 @@ device = "default"              # "default" or a capture endpoint id from the de
 gain_db = 0.0                   # -60.0..=12.0
 gate_enabled = false            # noise gate
 gate_db = -50.0                 # -100.0..=-20.0
+ptt_separate_track = false      # push to talk only: also record a "Push to talk" track; "Microphone" stays always open
+ptt_release_ms = 250            # push to talk only: mic stays open this long after release, 0..=2000
 
 [audio.other_apps]
 enabled = false                 # everything that is not the game or a listed app
@@ -2057,7 +2089,8 @@ split = "Alt+F11"
 stop_start = "Alt+F12"
 toggle_buffer = "Alt+F8"
 mute_mic = "Alt+F7"
-mute_mic_mode = "toggle"        # "toggle" | "push_to_talk"
+mute_mic_mode = "toggle"        # "toggle" | "push_to_talk" (legacy: push_to_talk makes mute_mic a hold-to-talk key)
+push_to_talk = []               # hold-to-talk keys, up to 4, e.g. ["Mouse4", "Ctrl+Space"]; the mic records only while one is held
 
 [notifications]
 enabled = true

@@ -24,7 +24,7 @@ use clipcheck_audio::{AudioChunk, OUT_CHANNELS, OUT_RATE};
 #[cfg(windows)]
 use clipcheck_audio::{LoopbackMode, Microphone, ProcessLoopback, SystemMix};
 
-use crate::audiomix::{db_to_gain, LevelTap, Mixer, NoiseGate, SourceEdge, BLOCK_MS};
+use crate::audiomix::{db_to_gain, LevelTap, MicGate, Mixer, NoiseGate, SourceEdge, BLOCK_MS};
 use crate::procs::{lock, AppWatcher};
 
 /// Length of one generated silence block, in milliseconds.
@@ -58,6 +58,18 @@ pub enum AudioSourceKind {
     },
     /// A capture endpoint. `device: None` selects the default microphone.
     Microphone {
+        /// Endpoint ID, or `None` for the default capture endpoint.
+        device: Option<String>,
+    },
+    /// The same capture as `Microphone` (one shared stream), but its edge obeys only the mute
+    /// flag of the feeder's [`MicGate`], not push to talk. Without a gate it behaves like
+    /// `Microphone`.
+    MicrophoneMuted {
+        /// Endpoint ID, or `None` for the default capture endpoint.
+        device: Option<String>,
+    },
+    /// Like `MicrophoneMuted` but also follows push to talk (hold-to-talk keys and release tail).
+    MicrophoneGated {
         /// Endpoint ID, or `None` for the default capture endpoint.
         device: Option<String>,
     },
@@ -134,7 +146,9 @@ fn source_key(kind: &AudioSourceKind) -> SourceKey {
         AudioSourceKind::GameProcess => SourceKey::Game,
         AudioSourceKind::AllExceptGame | AudioSourceKind::OtherApps => SourceKey::ExceptGame,
         AudioSourceKind::App { exe } => SourceKey::App(exe.to_ascii_lowercase()),
-        AudioSourceKind::Microphone { device } => SourceKey::Mic(device.clone()),
+        AudioSourceKind::Microphone { device }
+        | AudioSourceKind::MicrophoneMuted { device }
+        | AudioSourceKind::MicrophoneGated { device } => SourceKey::Mic(device.clone()),
     }
 }
 
@@ -190,7 +204,9 @@ fn open_source(
                 .map(|(s, rx)| (Box::new(s) as Box<dyn StopSource>, rx))
                 .map_err(|e| e.to_string())
         }
-        AudioSourceKind::Microphone { device } => Microphone::start(device.clone())
+        AudioSourceKind::Microphone { device }
+        | AudioSourceKind::MicrophoneMuted { device }
+        | AudioSourceKind::MicrophoneGated { device } => Microphone::start(device.clone())
             .map(|(s, rx)| (Box::new(s) as Box<dyn StopSource>, rx))
             .map_err(|e| e.to_string()),
         AudioSourceKind::App { .. } => Err("app sources are not opened directly".to_string()),
@@ -238,6 +254,16 @@ impl AudioFeeder {
     pub fn start(
         tracks: &[AudioTrackConfig],
         target_pid: u32,
+    ) -> io::Result<(AudioFeeder, Vec<Receiver<Vec<f32>>>)> {
+        Self::start_with_gate(tracks, target_pid, None)
+    }
+
+    /// Like [`AudioFeeder::start`], but edges of `MicrophoneGated` sources follow `mic_gate`
+    /// (push to talk or mute). With `None` those sources behave like plain microphones.
+    pub fn start_with_gate(
+        tracks: &[AudioTrackConfig],
+        target_pid: u32,
+        mic_gate: Option<Arc<MicGate>>,
     ) -> io::Result<(AudioFeeder, Vec<Receiver<Vec<f32>>>)> {
         let mut feeder = AudioFeeder {
             stop: Arc::new(AtomicBool::new(false)),
@@ -291,13 +317,26 @@ impl AudioFeeder {
                     }
                 };
                 let gate = match (&src.kind, src.gate_db) {
-                    (AudioSourceKind::Microphone { .. }, Some(db)) => Some(NoiseGate::new(db)),
+                    (
+                        AudioSourceKind::Microphone { .. }
+                        | AudioSourceKind::MicrophoneMuted { .. }
+                        | AudioSourceKind::MicrophoneGated { .. },
+                        Some(db),
+                    ) => Some(NoiseGate::new(db)),
+                    _ => None,
+                };
+                let gate_ctl = match &src.kind {
+                    AudioSourceKind::MicrophoneGated { .. } => mic_gate.clone(),
+                    AudioSourceKind::MicrophoneMuted { .. } => {
+                        mic_gate.as_ref().map(|g| g.mute_only_view())
+                    }
                     _ => None,
                 };
                 track_edges.push(SourceEdge {
                     source: idx,
                     gain: db_to_gain(src.gain_db),
                     gate,
+                    gate_ctl,
                 });
             }
             edges.push(track_edges);

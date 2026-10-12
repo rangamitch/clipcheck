@@ -30,6 +30,7 @@ use clipcheck_detect::{AllowRule, DetectConfig};
 #[cfg(windows)]
 use clipcheck_encode::probe::probe_native;
 use clipcheck_encode::probe::ProbeReport;
+use clipcheck_engine::audiomix::MicGate;
 use clipcheck_engine::catalog::{
     commit_prepared, find_registered, prepare_recording, RegisterMeta,
 };
@@ -56,7 +57,7 @@ use crate::events::EventBus;
 use crate::library_service::{LibraryOptions, LibraryService};
 use crate::logging;
 use crate::salvage::{self, SalvageOutcome};
-use crate::settings_map::{self, EncoderChoiceInfo};
+use crate::settings_map::{self, mic_gating, EncoderChoiceInfo};
 
 /// Encoder probe cache file name inside the data directory.
 pub const PROBE_CACHE_FILE: &str = "encoder-cache.json";
@@ -477,6 +478,9 @@ struct Core {
     recorder_cfg: Option<RecorderConfig>,
     encoder: Option<EncoderChoiceInfo>,
     recorder: Option<Recorder>,
+    /// Mic gate shared with every recorder built here. Push to talk and mic mute
+    /// drive it from the hotkey events (see [`Core::sync_mic_gate`]).
+    mic_gate: Arc<MicGate>,
     /// Probe report, kept so the recorder can be rebuilt.
     probe: Option<ProbeReport>,
     /// Recorder settings changed and are waiting until the recorder is idle (no session
@@ -543,6 +547,7 @@ impl Core {
             recorder_cfg: None,
             encoder: None,
             recorder: None,
+            mic_gate: MicGate::new(),
             probe: None,
             settings_pending: None,
             recorder_enabled,
@@ -576,6 +581,7 @@ impl Core {
 
     /// Thread body: starts the background work, then handles messages until stop.
     fn run(&mut self, rx: Receiver<Msg>) {
+        self.sync_mic_gate();
         self.start_detection();
         self.start_hotkeys();
         self.start_probe();
@@ -601,7 +607,7 @@ impl Core {
         match msg {
             Msg::Probe(result) => self.on_probe(result),
             Msg::Detector(event) => self.on_detector(event),
-            Msg::Hotkey(event) => self.on_hotkey(event.action),
+            Msg::Hotkey(event) => self.on_hotkey(event.action, event.pressed),
             Msg::Recorder(event) => self.on_recorder(event),
             Msg::Salvaged(outcomes) => self.on_salvaged(outcomes),
             Msg::LevelsTick => {
@@ -774,7 +780,7 @@ impl Core {
             info.encoder_name
         ));
 
-        self.recorder = Some(Recorder::new(rc.clone(), tx));
+        self.recorder = Some(self.new_recorder(rc.clone(), tx));
         self.recorder_cfg = Some(rc);
         self.encoder = Some(info);
         self.libraries.set_ready();
@@ -1198,7 +1204,14 @@ impl Core {
 
     // ----- hotkeys ----------------------------------------------------------
 
-    fn on_hotkey(&mut self, action: HotkeyAction) {
+    fn on_hotkey(&mut self, action: HotkeyAction, pressed: bool) {
+        // A push-to-talk release always applies, even while suspended, so the mic cannot
+        // stay open after a suspension or a missed key-up. A press while suspended is
+        // ignored below.
+        if matches!(action, HotkeyAction::PushToTalk) && !pressed {
+            self.mic_gate.release();
+            return;
+        }
         // Belt and braces: the hotkey service already ignores chords while suspended, so an
         // event that was queued before the suspension started must not act.
         if self.hotkeys_suspended() {
@@ -1233,10 +1246,41 @@ impl Core {
                     );
                 }
             }
-            HotkeyAction::ToggleBuffer | HotkeyAction::MuteMic => {
+            // Releases returned above, so this is a press.
+            HotkeyAction::PushToTalk => self.mic_gate.press(),
+            HotkeyAction::MuteMic => {
+                if pressed {
+                    let muted = self.mic_gate.toggle_muted();
+                    let state = if muted { "muted" } else { "unmuted" };
+                    logging::info(&format!("microphone {state}"));
+                }
+            }
+            HotkeyAction::ToggleBuffer => {
                 logging::info("hotkey action not implemented in this build; ignored");
             }
         }
+    }
+
+    /// Pushes the mic gating settings into the shared mic gate: push-to-talk mode when any
+    /// push-to-talk key is bound, and the release tail. Without a toggle mute key the mute
+    /// is cleared, so a stale mute does not carry over.
+    fn sync_mic_gate(&self) {
+        let gating = mic_gating(&self.config);
+        if self.mic_gate.is_ptt_mode() != gating.ptt {
+            self.mic_gate.set_ptt_mode(gating.ptt);
+        }
+        if !gating.mute_key {
+            self.mic_gate.set_muted(false);
+        }
+        self.mic_gate
+            .set_tail_ms(self.config.audio.mic.ptt_release_ms);
+    }
+
+    /// Builds a recorder that shares the service's mic gate.
+    fn new_recorder(&self, rc: RecorderConfig, tx: Sender<RecorderEvent>) -> Recorder {
+        let mut recorder = Recorder::new(rc, tx);
+        recorder.set_mic_gate(Arc::clone(&self.mic_gate));
+        recorder
     }
 
     // ----- settings ---------------------------------------------------------
@@ -1286,6 +1330,7 @@ impl Core {
     fn apply_config(&mut self, new: Config) -> (ApplyClass, bool) {
         self.resume_hotkeys("config changed; hotkey suspension ended");
         let old = std::mem::replace(&mut self.config, new);
+        self.sync_mic_gate();
         let class = apply_class(&old, &self.config);
         if old.storage != self.config.storage {
             self.libraries.storage_changed(self.config.storage.clone());
@@ -1345,7 +1390,7 @@ impl Core {
         forward("recorder-events", rx, self.tx.clone(), Msg::Recorder);
         // Drop the old recorder first so its threads and buffer are released.
         self.recorder = None;
-        self.recorder = Some(Recorder::new(rc.clone(), tx));
+        self.recorder = Some(self.new_recorder(rc.clone(), tx));
         self.recorder_cfg = Some(rc);
         self.bus.publish(Event::EncoderSelected {
             codec: codec_name(self.config.video.codec).to_owned(),
@@ -1975,10 +2020,14 @@ impl Core {
             fps_target: self.recorder_cfg.as_ref().map_or(0, |c| c.fps),
             bitrate_kbps: self.recorder_cfg.as_ref().map(|c| c.bitrate_kbps),
             // The DTO has no unknown state for these fields, so each value must be the
-            // real state. There is no mute feature (MuteMic is ignored), and capture runs
+            // real state. `mic_muted` is the mic gate state while a mic key is bound: true
+            // while the mic is closed (muted, or push to talk not held). Capture runs
             // in-process on threads, so there is no worker process to report or restart.
             // `autostart` and `uptime_s` are overwritten by the app layer (`AppState::status`).
-            mic_muted: false,
+            mic_muted: {
+                let gating = mic_gating(&self.config);
+                (gating.ptt || gating.mute_key) && self.mic_gate.is_silenced()
+            },
             // Detection runs from startup until the service stops it, so this is true only
             // when no detector is running.
             detection_paused: self.detector.is_none(),
@@ -2165,6 +2214,8 @@ fn recorder_settings_changed(old: &Config, new: &Config) -> bool {
         || old.audio != new.audio
         || old.replay != new.replay
         || old.storage != new.storage
+        // The mute key decides which mic sources are gated, so it changes the tracks.
+        || mic_gating(old) != mic_gating(new)
 }
 
 /// Builds the detector configuration from `detection.*` and `advanced.*`.

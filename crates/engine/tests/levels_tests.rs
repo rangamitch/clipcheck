@@ -170,6 +170,7 @@ fn mixer_single_source_unity_gain_reaches_meter_at_minus_12_db() {
         source: 0,
         gain: 1.0,
         gate: None,
+        gate_ctl: None,
     }]];
     let mut mixer = Mixer::new(1, edges);
     mixer.push(0, &vec![0.25f32; BLOCK_SAMPLES]);

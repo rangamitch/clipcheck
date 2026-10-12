@@ -110,7 +110,8 @@ fn fires_on_sendinput() {
     assert_eq!(
         event,
         Ok(HotkeyEvent {
-            action: HotkeyAction::SessionSplit
+            action: HotkeyAction::SessionSplit,
+            pressed: true,
         }),
         "expected SessionSplit event within 3s (SendInput returned {sent})"
     );
@@ -180,6 +181,7 @@ fn apply_swaps_bindings() {
     if new_event
         != Ok(HotkeyEvent {
             action: HotkeyAction::ToggleBuffer,
+            pressed: true,
         })
     {
         svc.stop();
@@ -306,21 +308,24 @@ fn shared_chord_fires_in_every_service() {
     assert_eq!(
         event_a,
         Ok(HotkeyEvent {
-            action: HotkeyAction::SessionSplit
+            action: HotkeyAction::SessionSplit,
+            pressed: true,
         }),
         "service A should get F21 (SendInput returned {sent})"
     );
     assert_eq!(
         event_b,
         Ok(HotkeyEvent {
-            action: HotkeyAction::ToggleBuffer
+            action: HotkeyAction::ToggleBuffer,
+            pressed: true,
         }),
         "service B should also get F21"
     );
     assert_eq!(
         event_b2,
         Ok(HotkeyEvent {
-            action: HotkeyAction::MuteMic
+            action: HotkeyAction::MuteMic,
+            pressed: true,
         }),
         "service B should get F22 (SendInput returned {sent_22})"
     );

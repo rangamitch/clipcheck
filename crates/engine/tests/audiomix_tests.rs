@@ -12,7 +12,12 @@ fn block(v: f32) -> Vec<f32> {
 }
 
 fn edge(source: usize, gain: f32, gate: Option<NoiseGate>) -> SourceEdge {
-    SourceEdge { source, gain, gate }
+    SourceEdge {
+        source,
+        gain,
+        gate,
+        gate_ctl: None,
+    }
 }
 
 // ---------------------------------------------------------------------------

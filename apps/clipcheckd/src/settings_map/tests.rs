@@ -1,7 +1,7 @@
 //! Unit tests for `settings_map`. Written by the tester agent (task D1a).
 
 use super::*;
-use clipcheck_core::config::schema::{AudioApp, ExeName, Fps, Modifiers};
+use clipcheck_core::config::schema::{AudioApp, ExeName, Fps, Modifiers, MuteMode};
 use clipcheck_encode::probe::EncoderInfo;
 use std::cell::RefCell;
 
@@ -1390,8 +1390,12 @@ fn build_places_audio_tracks_in_recorder_config() {
     cfg.audio.game.gain_db = -6.0;
     cfg.audio.mic.gate_enabled = true;
     let (rc, _) = build(&cfg, &full_probe());
-    assert_eq!(rc.audio_tracks, audio_tracks_of(&cfg.audio));
+    // The default config binds the toggle mute key, so the mic edges are gated.
     assert_eq!(rc.audio_tracks.len(), 4);
+    assert_eq!(
+        rc.audio_tracks,
+        audio_tracks_gated(&cfg.audio, gating(true, false))
+    );
 }
 
 // ------------------------------------------------- canvas aspect (tester)
@@ -1490,4 +1494,217 @@ fn no_border_capture_is_passed_through_for_all_presets() {
             );
         }
     }
+}
+
+// ------------------------------------------------- push to talk gating (D65)
+
+fn gated_mic_kind(device: Option<&str>) -> AudioSourceKind {
+    AudioSourceKind::MicrophoneGated {
+        device: device.map(str::to_owned),
+    }
+}
+
+/// Only the microphone is enabled. `separate` turns on `ptt_separate_track`, which adds
+/// the "Push to talk" source (MicPtt) to the plan.
+fn mic_only_audio(separate: bool) -> Audio {
+    let mut audio = Audio::default();
+    audio.game.enabled = false;
+    audio.other_apps.enabled = false;
+    audio.apps.clear();
+    audio.mic.enabled = true;
+    audio.mic.ptt_separate_track = separate;
+    audio
+}
+
+fn gating(mute_key: bool, ptt: bool) -> MicGating {
+    MicGating { mute_key, ptt }
+}
+
+#[test]
+fn gating_default_leaves_mic_tracks_plain() {
+    let audio = mic_only_audio(false);
+    let tracks = audio_tracks_gated(&audio, MicGating::default());
+    assert_eq!(tracks, audio_tracks_of(&audio));
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].title, "Mix");
+    assert_eq!(tracks[0].sources[0].kind, mic_kind(None));
+    assert_eq!(tracks[1].title, "Microphone");
+    assert_eq!(tracks[1].sources[0].kind, mic_kind(None));
+}
+
+#[test]
+fn gating_mute_only_gates_every_mic_edge() {
+    let tracks = audio_tracks_gated(&mic_only_audio(false), gating(true, false));
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].sources[0].kind, gated_mic_kind(None));
+    assert_eq!(tracks[1].sources[0].kind, gated_mic_kind(None));
+}
+
+#[test]
+fn gating_ptt_only_gates_mix_and_microphone() {
+    let tracks = audio_tracks_gated(&mic_only_audio(false), gating(false, true));
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].sources[0].kind, gated_mic_kind(None));
+    assert_eq!(tracks[1].sources[0].kind, gated_mic_kind(None));
+}
+
+#[test]
+fn gating_ptt_with_separate_track_keeps_microphone_open() {
+    let tracks = audio_tracks_gated(&mic_only_audio(true), gating(false, true));
+    let titles: Vec<&str> = tracks.iter().map(|t| t.title.as_str()).collect();
+    assert_eq!(titles, ["Mix", "Microphone", "Push to talk"]);
+    assert_eq!(tracks[0].sources[0].kind, gated_mic_kind(None));
+    assert_eq!(tracks[1].sources[0].kind, mic_kind(None));
+    assert_eq!(tracks[2].sources[0].kind, gated_mic_kind(None));
+}
+
+#[test]
+fn gating_mute_and_ptt_with_separate_track_makes_microphone_mute_only() {
+    // A toggle mute still closes the standalone Microphone track, but push to talk does not.
+    let tracks = audio_tracks_gated(&mic_only_audio(true), gating(true, true));
+    let titles: Vec<&str> = tracks.iter().map(|t| t.title.as_str()).collect();
+    assert_eq!(titles, ["Mix", "Microphone", "Push to talk"]);
+    assert_eq!(tracks[0].sources[0].kind, gated_mic_kind(None));
+    assert_eq!(
+        tracks[1].sources[0].kind,
+        AudioSourceKind::MicrophoneMuted { device: None }
+    );
+    assert_eq!(tracks[2].sources[0].kind, gated_mic_kind(None));
+}
+
+#[test]
+fn gating_mute_only_with_separate_track_gates_push_to_talk_track() {
+    // Toggle mode has one gate for every mic edge, so the push to talk track follows the mute.
+    let tracks = audio_tracks_gated(&mic_only_audio(true), gating(true, false));
+    assert_eq!(tracks.len(), 3);
+    for track in &tracks {
+        assert_eq!(
+            track.sources[0].kind,
+            gated_mic_kind(None),
+            "{}",
+            track.title
+        );
+    }
+}
+
+#[test]
+fn gating_without_any_key_leaves_push_to_talk_track_plain() {
+    let tracks = audio_tracks_gated(&mic_only_audio(true), MicGating::default());
+    assert_eq!(tracks.len(), 3);
+    assert_eq!(tracks[2].title, "Push to talk");
+    assert_eq!(tracks[2].sources[0].kind, mic_kind(None));
+}
+
+#[test]
+fn gating_applies_noise_gate_to_push_to_talk_track() {
+    let mut audio = mic_only_audio(true);
+    audio.mic.gate_enabled = true;
+    audio.mic.gate_db = -40.0;
+    let tracks = audio_tracks_gated(&audio, gating(false, true));
+    assert_eq!(tracks[2].title, "Push to talk");
+    assert_eq!(tracks[2].sources[0].gate_db, Some(-40.0));
+    assert_eq!(tracks[1].sources[0].gate_db, Some(-40.0));
+}
+
+#[test]
+fn gating_uses_mic_device_on_gated_sources() {
+    let mut audio = mic_only_audio(true);
+    audio.mic.device = "Headset".to_owned();
+    let tracks = audio_tracks_gated(&audio, gating(false, true));
+    assert_eq!(tracks[2].sources[0].kind, gated_mic_kind(Some("Headset")));
+}
+
+#[test]
+fn mic_gating_default_is_toggle_mute_only() {
+    assert_eq!(mic_gating(&Config::default()), gating(true, false));
+}
+
+#[test]
+fn mic_gating_legacy_push_to_talk_mode_is_hold_key() {
+    let mut cfg = Config::default();
+    cfg.hotkeys.session.mute_mic_mode = MuteMode::PushToTalk;
+    assert_eq!(mic_gating(&cfg), gating(false, true));
+}
+
+#[test]
+fn mic_gating_legacy_mode_without_key_gates_nothing() {
+    let mut cfg = Config::default();
+    cfg.hotkeys.session.mute_mic = None;
+    cfg.hotkeys.session.mute_mic_mode = MuteMode::PushToTalk;
+    assert_eq!(mic_gating(&cfg), gating(false, false));
+}
+
+#[test]
+fn mic_gating_push_to_talk_list_sets_ptt() {
+    let mut cfg = Config::default();
+    cfg.hotkeys.session.mute_mic = None;
+    cfg.hotkeys.session.push_to_talk = vec!["Mouse4".parse().expect("chord")];
+    assert_eq!(mic_gating(&cfg), gating(false, true));
+}
+
+#[test]
+fn mic_gating_list_and_toggle_key_both_apply() {
+    let mut cfg = Config::default();
+    cfg.hotkeys.session.push_to_talk = vec!["Mouse4".parse().expect("chord")];
+    assert_eq!(mic_gating(&cfg), gating(true, true));
+}
+
+#[test]
+fn push_to_talk_list_gives_one_binding_per_chord() {
+    let mut cfg = Config::default();
+    cfg.hotkeys.session.push_to_talk = vec![
+        "Mouse4".parse().expect("chord"),
+        "Alt+F6".parse().expect("chord"),
+    ];
+    let (bindings, warnings) = clip_hotkey_bindings(&cfg);
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    // The default six, then the two push to talk chords after the mute key.
+    assert_eq!(bindings.len(), 8);
+    assert!(matches!(bindings[5].action, HotkeyAction::MuteMic));
+    assert!(matches!(bindings[6].action, HotkeyAction::PushToTalk));
+    assert_eq!(bindings[6].chord.to_string(), "Mouse4");
+    assert!(matches!(bindings[7].action, HotkeyAction::PushToTalk));
+    assert_eq!(bindings[7].chord.to_string(), "Alt+F6");
+    assert!(bindings[6..]
+        .iter()
+        .all(|b| b.enabled && b.press == PressKind::Tap));
+}
+
+#[test]
+fn legacy_push_to_talk_mode_maps_mute_key_to_push_to_talk() {
+    let mut cfg = Config::default();
+    cfg.hotkeys.session.mute_mic_mode = MuteMode::PushToTalk;
+    let (bindings, warnings) = clip_hotkey_bindings(&cfg);
+    assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    assert_eq!(bindings.len(), 6);
+    assert!(matches!(bindings[5].action, HotkeyAction::PushToTalk));
+    assert_eq!(bindings[5].chord.to_string(), "Alt+F7");
+}
+
+#[test]
+fn toggle_mute_key_stays_mute_mic_with_push_to_talk_list() {
+    let mut cfg = Config::default();
+    cfg.hotkeys.session.push_to_talk = vec!["Mouse5".parse().expect("chord")];
+    let (bindings, _) = clip_hotkey_bindings(&cfg);
+    assert!(matches!(bindings[5].action, HotkeyAction::MuteMic));
+    assert!(matches!(bindings[6].action, HotkeyAction::PushToTalk));
+}
+
+#[test]
+fn recorder_config_gates_mic_when_push_to_talk_key_is_bound() {
+    let mut cfg = Config::default();
+    cfg.audio.mic.ptt_separate_track = true;
+    cfg.hotkeys.session.mute_mic = None;
+    cfg.hotkeys.session.push_to_talk = vec!["Mouse4".parse().expect("chord")];
+    let (rc, _) = build(&cfg, &full_probe());
+    let kinds: Vec<AudioSourceKind> = rc
+        .audio_tracks
+        .iter()
+        .flat_map(|t| t.sources.iter().map(|s| s.kind.clone()))
+        .collect();
+    assert!(kinds.contains(&gated_mic_kind(None)));
+    assert!(
+        kinds.contains(&mic_kind(None)),
+        "Microphone track stays open"
+    );
 }

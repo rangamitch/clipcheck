@@ -46,11 +46,17 @@
 
   /** The gate slider writes at most once per frame while it is dragged. */
   const dragGateDb = frameCoalesced((db: number) => setPath('audio.mic.gate_db', db));
+  /** The push-to-talk release slider writes at most once per frame while it is dragged. */
+  const dragPttReleaseMs = frameCoalesced((ms: number) => setPath('audio.mic.ptt_release_ms', ms));
 
   const audio = $derived($settings.draft?.audio);
   const diagnostics = $derived($settings.diagnostics);
   const connected = $derived($liveStatus.connected);
   const muteMode = $derived($settings.draft?.hotkeys?.session?.mute_mic_mode ?? 'toggle');
+  /** Push-to-talk keys set on the Hotkeys tab. */
+  const pttKeyCount = $derived($settings.draft?.hotkeys?.session?.push_to_talk?.length ?? 0);
+  /** PTT is active with keys set, or with the legacy mute-key hold mode (which still works). */
+  const pttActive = $derived(pttKeyCount > 0 || muteMode === 'push_to_talk');
 
   const CODEC_OPTIONS: { value: AudioCodec; label: string; disabled?: boolean; title?: string }[] = [
     { value: 'aac', label: 'AAC-LC' },
@@ -497,12 +503,65 @@
       <div class="toggle-text">
         <span class="toggle-label">Push to talk</span>
         <p class="help">
-          Current mode: {muteMode === 'push_to_talk' ? 'Hold to talk (push to talk)' : 'Press to toggle'}.
-          The mode is set with the mute mic hotkey.
+          {#if pttKeyCount > 0}
+            {pttKeyCount} push-to-talk {pttKeyCount === 1 ? 'key is' : 'keys are'} set. The mic records only while one is held.
+          {:else if muteMode === 'push_to_talk'}
+            The mute key is set to hold-to-talk (older setting).
+          {:else}
+            Off. No push-to-talk keys are set.
+          {/if}
         </p>
       </div>
       <button type="button" class="link" onclick={() => selectTab('hotkeys')}>Configure in Hotkeys</button>
     </div>
+
+    {#if pttActive}
+      <div class="toggle-row">
+        <div class="toggle-text">
+          <span class="toggle-label" id="audio-ptt-track-label">Record push to talk on its own track</span>
+          <p class="help" id="audio-ptt-track-help">
+            {#if audio.separate_tracks}
+              Adds a Push to talk track that only has your voice while the key is held. The Microphone track keeps
+              recording normally. The Mix track gets the push-to-talk version.
+            {:else}
+              Needs "Separate audio tracks" on. Turn that on above first.
+            {/if}
+          </p>
+        </div>
+        <Toggle
+          checked={audio.mic.ptt_separate_track}
+          labelId="audio-ptt-track-label"
+          describedBy="audio-ptt-track-help"
+          disabled={disabled || !audio.separate_tracks}
+          onchange={(v) => setPath('audio.mic.ptt_separate_track', v)}
+        />
+      </div>
+
+      <FieldRow
+        label="Keep mic open after release"
+        path="audio.mic.ptt_release_ms"
+        help="Keeps the mic recording for this long after you let go of the key, so the end of a phrase is not cut off."
+      >
+        {#snippet children(ctl)}
+          <div class="gate-slider">
+            <input
+              id={ctl.id}
+              type="range"
+              min="0"
+              max="2000"
+              step="50"
+              value={audio.mic.ptt_release_ms}
+              disabled={disabled}
+              aria-labelledby={ctl.labelId}
+              aria-describedby={ctl.describedBy}
+              aria-valuetext={`${audio.mic.ptt_release_ms} ms`}
+              oninput={(e) => dragPttReleaseMs(Number(e.currentTarget.value))}
+            />
+            <span class="value">{audio.mic.ptt_release_ms} ms</span>
+          </div>
+        {/snippet}
+      </FieldRow>
+    {/if}
   </section>
 
   <section class="card" aria-labelledby="audio-encoding-heading">

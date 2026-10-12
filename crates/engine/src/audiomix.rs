@@ -10,7 +10,8 @@
 //! pacing and the samples, which keeps the arithmetic testable.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 use clipcheck_audio::{OUT_CHANNELS, OUT_RATE};
 
@@ -36,6 +37,141 @@ pub fn db_to_gain(db: f32) -> f32 {
         return 1.0;
     }
     10f32.powf(db / 20.0)
+}
+
+/// Live microphone gate shared between the hotkey thread and the mixer thread (D65).
+///
+/// Two modes. In toggle mode the mic is open unless muted. In push-to-talk mode it is open
+/// while the key is held and for the release tail after it. Every setter and reader is a
+/// relaxed atomic access, so the hotkey thread never blocks the mixer.
+///
+/// Only mixer edges that carry the gate (see [`SourceEdge::gate_ctl`]) are affected.
+#[derive(Debug)]
+pub struct MicGate {
+    s: Arc<GateState>,
+    /// A view that obeys only the mute flag, not push to talk (see [`MicGate::mute_only_view`]).
+    mute_only: bool,
+}
+
+#[derive(Debug)]
+struct GateState {
+    ptt_mode: AtomicBool,
+    /// Number of push-to-talk keys currently down (several keys can be bound).
+    held: AtomicU32,
+    muted: AtomicBool,
+    tail_ms: AtomicU32,
+}
+
+/// Default push-to-talk release tail in milliseconds (`audio.mic.ptt_release_ms`).
+pub const DEFAULT_PTT_TAIL_MS: u32 = 250;
+
+impl PartialEq for MicGate {
+    /// Gates are shared handles: equal only when they are the same gate.
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl MicGate {
+    /// A gate in toggle mode, unmuted, with the default tail.
+    pub fn new() -> Arc<MicGate> {
+        Arc::new(MicGate {
+            s: Arc::new(GateState {
+                ptt_mode: AtomicBool::new(false),
+                held: AtomicU32::new(0),
+                muted: AtomicBool::new(false),
+                tail_ms: AtomicU32::new(DEFAULT_PTT_TAIL_MS),
+            }),
+            mute_only: false,
+        })
+    }
+
+    /// A second handle on the same state that ignores push to talk: it is open unless the mute
+    /// flag is set, with no release tail. Used for the always-open Microphone track, which a
+    /// mute should still silence.
+    pub fn mute_only_view(&self) -> Arc<MicGate> {
+        Arc::new(MicGate {
+            s: self.s.clone(),
+            mute_only: true,
+        })
+    }
+
+    /// Switches between push-to-talk (`true`) and toggle (`false`) mode. Clears `held`.
+    pub fn set_ptt_mode(&self, ptt: bool) {
+        self.s.ptt_mode.store(ptt, Ordering::Relaxed);
+        self.s.held.store(0, Ordering::Relaxed);
+    }
+
+    /// True in push-to-talk mode.
+    pub fn is_ptt_mode(&self) -> bool {
+        self.s.ptt_mode.load(Ordering::Relaxed)
+    }
+
+    /// Sets the release tail in milliseconds. Only used in push-to-talk mode.
+    pub fn set_tail_ms(&self, ms: u32) {
+        self.s.tail_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// A push-to-talk key went down.
+    pub fn press(&self) {
+        self.s.held.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A push-to-talk key came up. Never goes below zero.
+    pub fn release(&self) {
+        let _ = self
+            .s
+            .held
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
+
+    /// Forgets every held key (config change, hotkeys stopped).
+    pub fn release_all(&self) {
+        self.s.held.store(0, Ordering::Relaxed);
+    }
+
+    /// True while at least one push-to-talk key is down.
+    pub fn is_held(&self) -> bool {
+        self.s.held.load(Ordering::Relaxed) > 0
+    }
+
+    /// Sets the toggle-mode mute flag.
+    pub fn set_muted(&self, muted: bool) {
+        self.s.muted.store(muted, Ordering::Relaxed);
+    }
+
+    /// Flips the toggle-mode mute flag and returns the new value.
+    pub fn toggle_muted(&self) -> bool {
+        !self.s.muted.fetch_xor(true, Ordering::Relaxed)
+    }
+
+    /// The toggle-mode mute flag.
+    pub fn is_muted(&self) -> bool {
+        self.s.muted.load(Ordering::Relaxed)
+    }
+
+    /// True when the mic should be open right now, ignoring the release tail.
+    pub fn wants_open(&self) -> bool {
+        !self.is_muted() && (self.mute_only || !self.is_ptt_mode() || self.is_held())
+    }
+
+    /// Whole mixer blocks the mic stays open after `wants_open` turns false. Zero unless push to
+    /// talk is on; a mute always cuts at once.
+    pub fn tail_blocks(&self) -> u32 {
+        if self.is_ptt_mode() && !self.mute_only {
+            self.s
+                .tail_ms
+                .load(Ordering::Relaxed)
+                .div_ceil(BLOCK_MS as u32)
+        } else {
+            0
+        }
+    }
+
+    /// True when gated mic audio is currently not being recorded (for status displays).
+    pub fn is_silenced(&self) -> bool {
+        !self.wants_open()
+    }
 }
 
 /// Per-source queue of interleaved stereo samples.
@@ -341,6 +477,28 @@ pub struct SourceEdge {
     pub gain: f32,
     /// Optional noise gate, applied before the gain.
     pub gate: Option<NoiseGate>,
+    /// Optional push-to-talk / mute gate. Applied after the noise gate and before the gain, as a
+    /// smooth ramp across each block. `None` leaves the source alone.
+    pub gate_ctl: Option<Arc<MicGate>>,
+}
+
+/// Runtime state of one edge's push-to-talk / mute gate. Kept inside the mixer, parallel to
+/// the track edges, so [`SourceEdge`] stays a plain description.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EdgeCtl {
+    /// Gate gain at the end of the last processed block, in `[0.0, 1.0]`.
+    gain: f32,
+    /// Blocks of release tail still owed after `wants_open` turned false.
+    tail_left: u32,
+}
+
+impl Default for EdgeCtl {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            tail_left: 0,
+        }
+    }
 }
 
 /// Mixes several source rings into one block per track on every tick.
@@ -348,6 +506,8 @@ pub struct SourceEdge {
 pub struct Mixer {
     rings: Vec<SourceRing>,
     tracks: Vec<Vec<SourceEdge>>,
+    /// One entry per edge of `tracks`, same shape. Holds the gate state of each edge.
+    edge_ctl: Vec<Vec<EdgeCtl>>,
     clipped: u64,
     /// One block per ring, refilled on every tick. Never sent out.
     scratch: Vec<Vec<f32>>,
@@ -356,14 +516,53 @@ pub struct Mixer {
     gate_buf: Vec<f32>,
 }
 
+/// Gain target for one block of a push-to-talk / mute gate. Advances the release tail.
+fn ctl_target(gate: &MicGate, tail_left: &mut u32) -> f32 {
+    if gate.wants_open() {
+        *tail_left = gate.tail_blocks();
+        1.0
+    } else if *tail_left > 0 && !gate.is_muted() {
+        *tail_left -= 1;
+        1.0
+    } else {
+        // A mute cuts at once: it does not wait out the push-to-talk tail.
+        *tail_left = 0;
+        0.0
+    }
+}
+
+/// Scales each frame of an interleaved block by a factor that moves linearly from `from`
+/// (before the first frame) to `to` (after the last frame). Both channels of a frame share it.
+fn ramp_frames(block: &mut [f32], from: f32, to: f32) {
+    if from == 1.0 && to == 1.0 {
+        return;
+    }
+    let frames = block.len() / OUT_CHANNELS;
+    if frames == 0 {
+        return;
+    }
+    for f in 0..frames {
+        let k = (f + 1) as f32 / frames as f32;
+        let g = from + (to - from) * k;
+        for s in &mut block[f * OUT_CHANNELS..(f + 1) * OUT_CHANNELS] {
+            *s *= g;
+        }
+    }
+}
+
 impl Mixer {
     /// Creates a mixer with `source_count` empty rings and the given tracks.
     ///
     /// An edge whose source index is out of range contributes silence.
     pub fn new(source_count: usize, tracks: Vec<Vec<SourceEdge>>) -> Self {
+        let edge_ctl = tracks
+            .iter()
+            .map(|edges| vec![EdgeCtl::default(); edges.len()])
+            .collect();
         Self {
             rings: vec![SourceRing::new(); source_count],
             tracks,
+            edge_ctl,
             clipped: 0,
             scratch: vec![vec![0.0; BLOCK_SAMPLES]; source_count],
             gate_buf: vec![0.0; BLOCK_SAMPLES],
@@ -391,6 +590,7 @@ impl Mixer {
         let Mixer {
             rings,
             tracks,
+            edge_ctl,
             clipped,
             scratch,
             gate_buf,
@@ -399,26 +599,35 @@ impl Mixer {
             ring.pop_into(block);
         }
         let mut out = Vec::with_capacity(tracks.len());
-        for edges in tracks.iter_mut() {
+        for (edges, ctls) in tracks.iter_mut().zip(edge_ctl.iter_mut()) {
             let mut mixed = vec![0.0f32; BLOCK_SAMPLES];
-            for edge in edges.iter_mut() {
-                match edge.gate.as_mut() {
-                    Some(gate) => {
-                        match scratch.get(edge.source) {
-                            Some(block) => gate_buf.copy_from_slice(block),
-                            None => gate_buf.fill(0.0),
-                        }
-                        gate.process(gate_buf);
-                        add_scaled(&mut mixed, gate_buf, edge.gain);
+            for (edge, ctl) in edges.iter_mut().zip(ctls.iter_mut()) {
+                // Plain edge: no gate of either kind. Adds its source directly.
+                // A missing source adds nothing. Gains come from `db_to_gain`,
+                // so this matches adding a zero block.
+                if edge.gate.is_none() && edge.gate_ctl.is_none() {
+                    if let Some(block) = scratch.get(edge.source) {
+                        add_scaled(&mut mixed, block, edge.gain);
                     }
-                    // A missing source adds nothing. Gains come from `db_to_gain`,
-                    // so this matches adding a zero block.
-                    None => {
-                        if let Some(block) = scratch.get(edge.source) {
-                            add_scaled(&mut mixed, block, edge.gain);
-                        }
-                    }
+                    continue;
                 }
+                match scratch.get(edge.source) {
+                    Some(block) => gate_buf.copy_from_slice(block),
+                    None => gate_buf.fill(0.0),
+                }
+                if let Some(gate) = edge.gate.as_mut() {
+                    gate.process(gate_buf);
+                }
+                if let Some(mic) = edge.gate_ctl.as_deref() {
+                    let target = ctl_target(mic, &mut ctl.tail_left);
+                    let from = ctl.gain;
+                    ctl.gain = target;
+                    if from == 0.0 && target == 0.0 {
+                        continue;
+                    }
+                    ramp_frames(gate_buf, from, target);
+                }
+                add_scaled(&mut mixed, gate_buf, edge.gain);
             }
             let mut n_clipped = 0u64;
             for s in mixed.iter_mut() {
@@ -515,5 +724,102 @@ mod tests {
     fn block_size_is_20ms_stereo() {
         assert_eq!(BLOCK_SAMPLES, 1920);
         assert_eq!(BACKLOG_SAMPLES, 24000);
+    }
+
+    /// A mixer with one source (index 0) feeding one track through one gated edge.
+    fn gated_mixer(gate: &Arc<MicGate>) -> Mixer {
+        Mixer::new(
+            1,
+            vec![vec![SourceEdge {
+                source: 0,
+                gain: 1.0,
+                gate: None,
+                gate_ctl: Some(gate.clone()),
+            }]],
+        )
+    }
+
+    /// Pushes one block of constant `0.5` and ticks once.
+    fn tick_constant(mixer: &mut Mixer) -> Vec<f32> {
+        mixer.push(0, &vec![0.5; BLOCK_SAMPLES]);
+        mixer.tick().remove(0)
+    }
+
+    #[test]
+    fn gate_toggle_muted_is_silent_after_the_ramp() {
+        let gate = MicGate::new();
+        let mut mixer = gated_mixer(&gate);
+        gate.set_muted(true);
+        // The first muted block ramps down from unity, so it may carry signal.
+        let _ramp = tick_constant(&mut mixer);
+        let second = tick_constant(&mut mixer);
+        assert!(second.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn gate_ptt_held_passes_full_signal() {
+        let gate = MicGate::new();
+        gate.set_ptt_mode(true);
+        gate.set_tail_ms(0);
+        gate.press();
+        let mut mixer = gated_mixer(&gate);
+        let block = tick_constant(&mut mixer);
+        assert!(block.iter().all(|&s| (s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn gate_ptt_release_without_tail_goes_silent() {
+        let gate = MicGate::new();
+        gate.set_ptt_mode(true);
+        gate.set_tail_ms(0);
+        gate.press();
+        let mut mixer = gated_mixer(&gate);
+        tick_constant(&mut mixer);
+        gate.release_all();
+        // The release block ramps down, then the next block is silent.
+        let _ramp = tick_constant(&mut mixer);
+        let silent = tick_constant(&mut mixer);
+        assert!(silent.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn gate_ptt_release_tail_keeps_audio_for_five_blocks() {
+        let gate = MicGate::new();
+        gate.set_ptt_mode(true);
+        gate.set_tail_ms(100); // 5 blocks
+        gate.press();
+        let mut mixer = gated_mixer(&gate);
+        tick_constant(&mut mixer);
+        gate.release_all();
+        for block_no in 1..=5 {
+            let block = tick_constant(&mut mixer);
+            assert!(
+                block.iter().all(|&s| (s - 0.5).abs() < 1e-6),
+                "tail block {block_no} should be full"
+            );
+        }
+        // Tail exhausted: this block ramps down to zero at its end.
+        let ramp = tick_constant(&mut mixer);
+        assert_eq!(ramp[BLOCK_SAMPLES - 1], 0.0);
+        assert!(ramp[0] > 0.0);
+        let silent = tick_constant(&mut mixer);
+        assert!(silent.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn gate_opening_ramps_instead_of_stepping() {
+        let gate = MicGate::new();
+        gate.set_muted(true);
+        let mut mixer = gated_mixer(&gate);
+        tick_constant(&mut mixer);
+        tick_constant(&mut mixer);
+        gate.set_muted(false);
+        let block = tick_constant(&mut mixer);
+        let first = block[0];
+        let last = block[BLOCK_SAMPLES - 1];
+        assert!(first > 0.0 && first < last, "first {first} last {last}");
+        assert!(last <= 0.5 + 1e-6, "last {last}");
+        // Both channels of a frame share the same factor.
+        assert_eq!(block[0], block[1]);
     }
 }

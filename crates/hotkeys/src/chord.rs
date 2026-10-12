@@ -177,6 +177,9 @@ define_keys! {
     BrowserSearch = "BrowserSearch" => 0xAA,
     BrowserFavorites = "BrowserFavorites" => 0xAB,
     BrowserHome = "BrowserHome" => 0xAC,
+    Mouse3 = "Mouse3" => 0x04,
+    Mouse4 = "Mouse4" => 0x05,
+    Mouse5 = "Mouse5" => 0x06,
 }
 
 impl Key {
@@ -433,5 +436,49 @@ mod vk_tests {
     fn key_table_uses_the_shared_core_vk_codes() {
         assert_eq!("F4".parse::<Chord>().unwrap().vk_code(), VK_F4 as u32);
         assert_eq!(Key::parse("Escape").unwrap().vk_code(), VK_ESCAPE as u32);
+    }
+
+    #[test]
+    fn mouse_buttons_map_to_their_virtual_key_codes() {
+        assert_eq!(Key::Mouse3.vk_code(), 0x04);
+        assert_eq!(Key::Mouse4.vk_code(), 0x05);
+        assert_eq!(Key::Mouse5.vk_code(), 0x06);
+    }
+
+    #[test]
+    fn mouse_button_names_parse_case_insensitively() {
+        assert_eq!(Key::parse("Mouse4"), Some(Key::Mouse4));
+        assert_eq!(Key::parse("mouse5"), Some(Key::Mouse5));
+        assert_eq!("MOUSE3".parse::<Key>().unwrap(), Key::Mouse3);
+    }
+
+    #[test]
+    fn left_and_right_mouse_buttons_are_not_keys() {
+        assert_eq!(Key::parse("Mouse1"), None);
+        assert_eq!(Key::parse("Mouse2"), None);
+        assert!("Ctrl+Mouse1".parse::<Chord>().is_err());
+    }
+
+    #[test]
+    fn mouse_button_chord_parses_with_modifiers() {
+        let chord: Chord = "Ctrl+Mouse5".parse().unwrap();
+        assert!(chord.ctrl);
+        assert_eq!(chord.key, Key::Mouse5);
+        assert_eq!(chord.vk_code(), 0x06);
+
+        let bare: Chord = "Mouse4".parse().unwrap();
+        assert_eq!(bare, Chord::bare(Key::Mouse4));
+        assert_eq!(bare.vk_code(), 0x05);
+    }
+
+    #[test]
+    fn mouse_button_chord_display_round_trips() {
+        for text in ["Mouse3", "Mouse4", "Alt+Mouse4", "Ctrl+Shift+Mouse5"] {
+            let chord: Chord = text.parse().unwrap();
+            assert_eq!(chord.to_string(), text);
+            assert_eq!(chord.to_string().parse::<Chord>().unwrap(), chord);
+        }
+        let chord: Chord = "ctrl+mouse5".parse().unwrap();
+        assert_eq!(chord.to_string(), "Ctrl+Mouse5");
     }
 }

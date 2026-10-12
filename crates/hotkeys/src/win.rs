@@ -30,12 +30,15 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
     PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK, HWND_MESSAGE,
-    KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_KEYDOWN,
-    WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_KEYDOWN, WM_KEYUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN, WM_XBUTTONUP,
 };
 
+use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
 use crate::gesture::ChordId;
-use crate::hook_state::{Fired, HookState};
+use crate::hook_state::{Fired, HoldEvent, HookState};
 use crate::{Chord, HotkeyAction, PressKind, Registry};
 
 /// Thread message posted by [`HotkeyService::apply`]; `lParam` owns an [`ApplyRequest`].
@@ -48,6 +51,16 @@ const APPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Hold threshold used by [`HotkeyService::start`]. The daemon passes the core
 /// `LONG_PRESS_MS` (400) to [`HotkeyService::start_with_threshold`] instead.
 pub const DEFAULT_LONG_PRESS_MS: u32 = 400;
+
+/// Virtual-key codes used for mouse buttons in chords: middle, back (XBUTTON1)
+/// and forward (XBUTTON2). Left and right buttons are not hotkey keys.
+const VK_MOUSE3: u32 = 0x04;
+const VK_MOUSE4: u32 = 0x05;
+const VK_MOUSE5: u32 = 0x06;
+
+/// `XBUTTON1` / `XBUTTON2` values in the high word of `MSLLHOOKSTRUCT.mouseData`.
+const XBUTTON1: u32 = 1;
+const XBUTTON2: u32 = 2;
 
 /// Timer id that drives long-press ticks while a hold is pending.
 const GESTURE_TIMER: usize = 1;
@@ -71,6 +84,9 @@ fn now_ms() -> u64 {
 pub struct HotkeyEvent {
     /// The action bound to the pressed chord.
     pub action: HotkeyAction,
+    /// `true` when the chord fired (tap, long press, or the key going down for
+    /// [`HotkeyAction::PushToTalk`]); `false` only for the release of a push-to-talk chord.
+    pub pressed: bool,
 }
 
 /// Why a binding could not be registered.
@@ -253,6 +269,8 @@ struct Slot {
     chord: Chord,
     tap: Option<HotkeyAction>,
     long: Option<HotkeyAction>,
+    /// Push-to-talk action: a hold chord that reports press and release.
+    hold: Option<HotkeyAction>,
 }
 
 /// Groups the enabled bindings of `registry` into one slot per chord, with ids 1..=n.
@@ -267,11 +285,16 @@ fn build_slots(registry: &Registry) -> Vec<Slot> {
                     chord: binding.chord,
                     tap: None,
                     long: None,
+                    hold: None,
                 });
                 slots.len() - 1
             }
         };
         let slot = &mut slots[index];
+        if matches!(binding.action, HotkeyAction::PushToTalk) {
+            slot.hold = Some(binding.action.clone());
+            continue;
+        }
         match binding.press {
             PressKind::Tap => slot.tap = Some(binding.action.clone()),
             PressKind::Long => slot.long = Some(binding.action.clone()),
@@ -284,6 +307,9 @@ fn build_slots(registry: &Registry) -> Vec<Slot> {
 struct HookCtx {
     hwnd: HWND,
     hook: HHOOK,
+    /// Low-level mouse hook, installed only while a binding uses `Mouse3`/`Mouse4`/`Mouse5`.
+    /// Null when not installed.
+    mouse_hook: HHOOK,
     tx: Sender<HotkeyEvent>,
     long_press_ms: u32,
     slots: Vec<Slot>,
@@ -311,6 +337,7 @@ impl HookCtx {
         HookCtx {
             hwnd,
             hook: HHOOK(std::ptr::null_mut()),
+            mouse_hook: HHOOK(std::ptr::null_mut()),
             tx,
             long_press_ms,
             slots,
@@ -334,14 +361,54 @@ impl HookCtx {
         self.dispatch(fired);
     }
 
-    /// Handles one `WM_TIMER` tick.
-    fn tick(&mut self) {
+    /// Handles one mouse-button event from the mouse hook callback. `vk` is one
+    /// of [`VK_MOUSE3`], [`VK_MOUSE4`], [`VK_MOUSE5`].
+    fn mouse(&mut self, vk: u32, down: bool) {
         self.sync_suspension();
-        let fired = self.state.tick(now_ms());
+        let fired = self.state.on_mouse(vk, down, now_ms());
         self.dispatch(fired);
     }
 
-    /// Sends the action for each fired chord, then keeps the timer in step with pending holds.
+    /// Installs the mouse hook when an enabled binding uses a mouse-button key,
+    /// and removes it when none does. A failed install is skipped silently: the
+    /// keyboard service keeps running, and the install is retried on the next
+    /// `replace`.
+    fn sync_mouse_hook(&mut self) {
+        let want = self.slots.iter().any(|s| is_mouse_vk(s.chord.vk_code()));
+        if want && self.mouse_hook.0.is_null() {
+            if let Ok(hook) = install_mouse_hook() {
+                self.mouse_hook = hook;
+            }
+        } else if !want {
+            self.unhook_mouse();
+        }
+    }
+
+    /// Removes the mouse hook if it is installed.
+    fn unhook_mouse(&mut self) {
+        if !self.mouse_hook.0.is_null() {
+            // SAFETY: `mouse_hook` was returned by SetWindowsHookExW on this
+            // thread and is cleared here, so it is removed once.
+            let _ = unsafe { UnhookWindowsHookEx(self.mouse_hook) };
+            self.mouse_hook = HHOOK(std::ptr::null_mut());
+        }
+    }
+
+    /// Handles one `WM_TIMER` tick. Also releases push-to-talk holds whose key
+    /// is no longer physically down, in case a key-up was missed.
+    fn tick(&mut self) {
+        self.sync_suspension();
+        let fired = self.state.tick(now_ms());
+        self.state.check_holds(|vk| {
+            // SAFETY: GetAsyncKeyState has no preconditions.
+            let state = unsafe { GetAsyncKeyState(vk as i32) };
+            (state as u16) & 0x8000 != 0
+        });
+        self.dispatch(fired);
+    }
+
+    /// Sends the action for each fired chord and each push-to-talk press or
+    /// release, then keeps the timer in step with pending holds.
     fn dispatch(&mut self, fired: Vec<Fired>) {
         for Fired { id, press } in fired {
             let Some(slot) = self.slots.iter().find(|s| s.id == id) else {
@@ -352,15 +419,34 @@ impl HookCtx {
                 PressKind::Long => slot.long.clone(),
             };
             if let Some(action) = action {
-                let _ = self.tx.send(HotkeyEvent { action });
+                let _ = self.tx.send(HotkeyEvent {
+                    action,
+                    pressed: true,
+                });
             }
         }
+        self.dispatch_holds();
         self.sync_timer();
     }
 
-    /// Starts the tick timer while a hold is pending, and stops it when none is.
+    /// Sends a push-to-talk event for each hold press or release queued in the state.
+    fn dispatch_holds(&mut self) {
+        for HoldEvent { id, pressed } in self.state.take_hold_events() {
+            let action = self
+                .slots
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.hold.clone());
+            if let Some(action) = action {
+                let _ = self.tx.send(HotkeyEvent { action, pressed });
+            }
+        }
+    }
+
+    /// Starts the tick timer while a hold is pending or a push-to-talk hold is
+    /// down, and stops it when neither is.
     fn sync_timer(&mut self) {
-        let want = self.state.is_pending();
+        let want = self.state.is_pending() || self.state.has_active_holds();
         if want && !self.timer {
             // SAFETY: hwnd is the live message window owned by this thread. A
             // null callback makes WM_TIMER arrive as a normal message.
@@ -373,20 +459,46 @@ impl HookCtx {
         }
     }
 
-    /// Replaces the bindings. Pending holds are dropped with the old state.
+    /// Replaces the bindings. Active push-to-talk holds are released first, using
+    /// the old slots so the release reaches the right action. Pending taps and
+    /// long presses are dropped with the old state.
     fn replace(&mut self, registry: &Registry) {
+        self.state.release_all_holds();
+        self.dispatch_holds();
         self.slots = build_slots(registry);
         self.state = make_state(self.long_press_ms, &self.slots);
+        self.sync_mouse_hook();
         self.sync_timer();
     }
 }
 
+/// True for the virtual-key codes of the mouse buttons a chord may use.
+fn is_mouse_vk(vk: u32) -> bool {
+    matches!(vk, VK_MOUSE3 | VK_MOUSE4 | VK_MOUSE5)
+}
+
 fn make_state(long_press_ms: u32, slots: &[Slot]) -> HookState {
+    // A push-to-talk slot is a hold chord: it gets no tap or long gesture.
     let entries: Vec<(ChordId, Chord, bool, bool)> = slots
         .iter()
-        .map(|s| (s.id, s.chord, s.tap.is_some(), s.long.is_some()))
+        .map(|s| {
+            let is_hold = s.hold.is_some();
+            (
+                s.id,
+                s.chord,
+                !is_hold && s.tap.is_some(),
+                !is_hold && s.long.is_some(),
+            )
+        })
         .collect();
-    HookState::new(u64::from(long_press_ms), &entries)
+    let holds: Vec<ChordId> = slots
+        .iter()
+        .filter(|s| s.hold.is_some())
+        .map(|s| s.id)
+        .collect();
+    let mut state = HookState::new(u64::from(long_press_ms), &entries);
+    state.set_holds(&holds);
+    state
 }
 
 /// Runs `f` on the thread's hook context, if one is set. Skips the call if the
@@ -570,7 +682,10 @@ fn message_thread(
             return;
         }
     };
-    with_ctx(|ctx| ctx.hook = hook);
+    with_ctx(|ctx| {
+        ctx.hook = hook;
+        ctx.sync_mouse_hook();
+    });
 
     // SAFETY: GetCurrentThreadId has no preconditions.
     let thread_id = unsafe { GetCurrentThreadId() };
@@ -578,8 +693,12 @@ fn message_thread(
 
     pump();
 
-    // Teardown: the hook must go before the window and the context.
+    // Teardown: the hooks must go before the window and the context. Active
+    // push-to-talk holds are released first so a held key cannot stay stuck.
     with_ctx(|ctx| {
+        ctx.state.release_all_holds();
+        ctx.dispatch_holds();
+        ctx.unhook_mouse();
         // SAFETY: `hook` was returned by SetWindowsHookExW on this thread and is removed once.
         let _ = unsafe { UnhookWindowsHookEx(ctx.hook) };
         ctx.hook = HHOOK(std::ptr::null_mut());
@@ -598,6 +717,61 @@ fn install_hook() -> Result<HHOOK, u32> {
     // is the running executable and dwThreadId 0 makes a global hook.
     unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), module, 0) }
         .map_err(|e| win32_code(&e))
+}
+
+/// Installs the `WH_MOUSE_LL` hook on this thread. Returns the Win32 code on failure.
+fn install_mouse_hook() -> Result<HHOOK, u32> {
+    // SAFETY: GetModuleHandleW(None) returns the handle of the running executable.
+    let module = unsafe { GetModuleHandleW(None) }
+        .map(|m| HINSTANCE(m.0))
+        .unwrap_or(HINSTANCE(std::ptr::null_mut()));
+    // SAFETY: mouse_proc has the HOOKPROC signature. The module handle is the
+    // running executable and dwThreadId 0 makes a global hook.
+    unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), module, 0) }
+        .map_err(|e| win32_code(&e))
+}
+
+/// Maps a mouse message to the chord key it reports: `(vk, down)`. Returns
+/// `None` for every message that is not a middle or X button press/release
+/// (including `WM_MOUSEMOVE`), and for X buttons other than XBUTTON1/2.
+fn mouse_button(message: u32, lparam: LPARAM) -> Option<(u32, bool)> {
+    match message {
+        WM_MBUTTONDOWN => Some((VK_MOUSE3, true)),
+        WM_MBUTTONUP => Some((VK_MOUSE3, false)),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            // SAFETY: for WH_MOUSE_LL with code >= 0, lParam points to an
+            // MSLLHOOKSTRUCT that stays valid for the duration of this call.
+            let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+            let button = (info.mouseData >> 16) & 0xFFFF;
+            let vk = match button {
+                XBUTTON1 => VK_MOUSE4,
+                XBUTTON2 => VK_MOUSE5,
+                _ => return None,
+            };
+            Some((vk, message == WM_XBUTTONDOWN))
+        }
+        _ => None,
+    }
+}
+
+/// Low-level mouse hook procedure. Runs on the `hotkey-msg` thread inside the
+/// message loop. It reacts only to middle and X button events and always calls
+/// the next hook, so no click is swallowed.
+unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if code >= 0 && lparam.0 != 0 {
+        if let Some((vk, down)) = mouse_button(wparam.0 as u32, lparam) {
+            with_ctx(|ctx| ctx.mouse(vk, down));
+        }
+    }
+    let hook = CTX.with(|cell| {
+        cell.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|ctx| ctx.mouse_hook))
+    });
+    // SAFETY: CallNextHookEx passes the event on. A null handle is accepted,
+    // because the hook handle argument is ignored on current Windows versions.
+    let hook = hook.unwrap_or(HHOOK(std::ptr::null_mut()));
+    unsafe { CallNextHookEx(hook, code, wparam, lparam) }
 }
 
 /// Low-level keyboard hook procedure. Runs on the `hotkey-msg` thread inside

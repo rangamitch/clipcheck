@@ -602,6 +602,12 @@ fn check_bitrate(out: &mut Vec<Diagnostic>, path: &str, kbps: u32) {
     }
 }
 
+/// Most push-to-talk keys that can be bound at once.
+const MAX_PTT_KEYS: usize = 4;
+
+/// Longest allowed push-to-talk release tail, in milliseconds.
+const PTT_RELEASE_MAX_MS: u32 = 2000;
+
 fn check_audio(config: &Config, out: &mut Vec<Diagnostic>) {
     let a = &config.audio;
     if a.codec == AudioCodec::Opus {
@@ -636,6 +642,39 @@ fn check_audio(config: &Config, out: &mut Vec<Diagnostic>) {
                 a.mic.gate_db
             ),
         );
+    }
+    if a.mic.ptt_release_ms > PTT_RELEASE_MAX_MS {
+        error(
+            out,
+            "CFG-A014",
+            "audio.mic.ptt_release_ms",
+            format!(
+                "audio.mic.ptt_release_ms = {} is outside 0..={PTT_RELEASE_MAX_MS}",
+                a.mic.ptt_release_ms
+            ),
+        );
+    }
+    if a.mic.ptt_separate_track {
+        let session = &config.hotkeys.session;
+        let ptt_mode = !session.push_to_talk.is_empty()
+            || (session.mute_mic_mode == MuteMode::PushToTalk && session.mute_mic.is_some());
+        let problem = if !a.mic.enabled {
+            Some("audio.mic.enabled = true")
+        } else if !a.separate_tracks {
+            Some("audio.separate_tracks = true")
+        } else if !ptt_mode {
+            Some("a key in hotkeys.session.push_to_talk")
+        } else {
+            None
+        };
+        if let Some(needs) = problem {
+            error(
+                out,
+                "CFG-A015",
+                "audio.mic.ptt_separate_track",
+                format!("audio.mic.ptt_separate_track = true needs {needs}"),
+            );
+        }
     }
     let n_apps = a.apps.len();
     if n_apps > MAX_AUDIO_APPS {
@@ -862,6 +901,33 @@ fn check_hotkeys(config: &Config, out: &mut Vec<Diagnostic>) {
             add_binding(out, &mut bound, chord, None, HotkeySite::Session(name));
         }
     }
+    if s.push_to_talk.len() > MAX_PTT_KEYS {
+        error(
+            out,
+            "CFG-H009",
+            "hotkeys.session.push_to_talk",
+            format!(
+                "hotkeys.session.push_to_talk has {} keys. Allowed: 0..={MAX_PTT_KEYS}",
+                s.push_to_talk.len()
+            ),
+        );
+    }
+    for (i, chord) in s.push_to_talk.iter().enumerate() {
+        let path = format!("hotkeys.session.push_to_talk[{i}]");
+        check_chord_named(out, chord, &path);
+        if is_reserved(chord) {
+            error(
+                out,
+                "CFG-H003",
+                &path,
+                format!(
+                    "hotkeys: '{}' is reserved by Windows or ClipCheck (for example Alt+F4, Win+L, \n                     Ctrl+Alt+Del)",
+                    chord_text(chord)
+                ),
+            );
+        }
+        add_binding(out, &mut bound, *chord, None, HotkeySite::PushToTalk(i));
+    }
     if s.mute_mic_mode == MuteMode::PushToTalk && s.mute_mic.is_none() {
         error(
             out,
@@ -883,6 +949,8 @@ enum HotkeySite<'a> {
     },
     /// `hotkeys.session.<name>`.
     Session(&'static str),
+    /// `hotkeys.session.push_to_talk[index]`.
+    PushToTalk(usize),
 }
 
 impl HotkeySite<'_> {
@@ -902,6 +970,10 @@ impl HotkeySite<'_> {
             HotkeySite::Session(name) => (
                 format!("the session {name} hotkey"),
                 format!("hotkeys.session.{name}"),
+            ),
+            HotkeySite::PushToTalk(index) => (
+                "a push-to-talk hotkey".to_owned(),
+                format!("hotkeys.session.push_to_talk[{index}]"),
             ),
         }
     }

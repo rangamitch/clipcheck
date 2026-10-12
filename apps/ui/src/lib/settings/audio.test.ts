@@ -32,7 +32,7 @@ function plan(over: Partial<TrackPlanInput> = {}): TrackPlanInput {
   return {
     separate_tracks: true,
     game: { enabled: true, gain_db: 0 },
-    mic: { enabled: true, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50 },
+    mic: { enabled: true, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50, ptt_separate_track: false, ptt_release_ms: 250 },
     other_apps: { enabled: false, gain_db: 0 },
     apps: [],
     ...over,
@@ -76,7 +76,7 @@ describe('trackPlanPreview (mirrors Audio::track_plan)', () => {
     const p = trackPlanPreview(
       plan({
         game: { enabled: false, gain_db: 0 },
-        mic: { enabled: false, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50 },
+        mic: { enabled: false, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50, ptt_separate_track: false, ptt_release_ms: 250 },
       }),
     );
     expect(p.titles).toEqual(['Mix']);
@@ -327,7 +327,7 @@ describe('enabledTrackKbps (one entry per recorded track)', () => {
   it('nothing enabled: one silent Mix entry', () => {
     const silent = plan({
       game: { enabled: false, gain_db: 0 },
-      mic: { enabled: false, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50 },
+      mic: { enabled: false, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50, ptt_separate_track: false, ptt_release_ms: 250 },
     });
     expect(enabledTrackKbps({ ...silent, bitrate_kbps: 128 })).toEqual([128]);
   });

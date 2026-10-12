@@ -34,7 +34,7 @@ function savedDoc(): ConfigDoc {
       separate_tracks: true,
       output_device: 'default',
       game: { enabled: true, gain_db: 0 },
-      mic: { enabled: true, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50 },
+      mic: { enabled: true, device: 'default', gain_db: 0, gate_enabled: false, gate_db: -50, ptt_separate_track: false, ptt_release_ms: 250 },
       other_apps: { enabled: false, gain_db: 0 },
       apps: [{ exe: 'discord.exe', name: 'Discord', enabled: true, gain_db: 0 }],
     } as ConfigDoc['audio'],
@@ -44,7 +44,14 @@ function savedDoc(): ConfigDoc {
         { name: 'Clip 1', keys: 'Alt+F9', seconds: 30 },
         { name: 'Clip 2', keys: 'Alt+F10', seconds: 60 },
       ],
-      session: { split: 'Alt+F8', stop_start: 'Alt+F7', toggle_buffer: 'Alt+F6', mute_mic: '', mute_mic_mode: 'toggle' },
+      session: {
+        split: 'Alt+F8',
+        stop_start: 'Alt+F7',
+        toggle_buffer: 'Alt+F6',
+        mute_mic: '',
+        mute_mic_mode: 'toggle',
+        push_to_talk: [],
+      },
     },
   } as ConfigDoc;
 }
@@ -148,6 +155,28 @@ describe('Hotkeys tab: hotkeys.session keys', () => {
     const saved = savedDoc();
     const draft = setPath(draftOf(saved), 'hotkeys.session.mute_mic_mode', 'push_to_talk');
     expect(diffPatch(saved, draft)).toEqual({ hotkeys: { session: { mute_mic_mode: 'push_to_talk' } } });
+  });
+
+  it('adding a push-to-talk key sends the whole push_to_talk array', () => {
+    const saved = savedDoc();
+    const draft = setPath(draftOf(saved), 'hotkeys.session.push_to_talk', ['Mouse4']);
+    expect(diffPatch(saved, draft)).toEqual({ hotkeys: { session: { push_to_talk: ['Mouse4'] } } });
+  });
+
+  it('a second push-to-talk key sends both keys in order', () => {
+    const saved = savedDoc();
+    saved.hotkeys!.session.push_to_talk = ['Mouse4'];
+    const draft = setPath(draftOf(saved), 'hotkeys.session.push_to_talk', ['Mouse4', 'Ctrl+Space']);
+    expect(diffPatch(saved, draft)).toEqual({
+      hotkeys: { session: { push_to_talk: ['Mouse4', 'Ctrl+Space'] } },
+    });
+  });
+
+  it('removing the only push-to-talk key sends an empty array, not null', () => {
+    const saved = savedDoc();
+    saved.hotkeys!.session.push_to_talk = ['Mouse5'];
+    const draft = setPath(draftOf(saved), 'hotkeys.session.push_to_talk', []);
+    expect(diffPatch(saved, draft)).toEqual({ hotkeys: { session: { push_to_talk: [] } } });
   });
 });
 

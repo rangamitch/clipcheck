@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 
 use clipcheck_core::config::schema::Press;
 use clipcheck_core::config::schema::{
-    Audio, Codec, Config, EncoderChoice, EncoderSpeed, KeyChord, Preset, RateControl, Resolution,
-    SourceRef, Video,
+    Audio, Codec, Config, EncoderChoice, EncoderSpeed, KeyChord, MuteMode, Preset, RateControl,
+    Resolution, SourceRef, Video,
 };
 use clipcheck_encode::probe::{Backend, CodecKind, ProbeReport};
 use clipcheck_encode::select::{self, Preference};
@@ -257,11 +257,33 @@ fn mic_device_of(device: &str) -> Option<String> {
     }
 }
 
-/// Capture source for one track source.
-fn source_kind_of(source: &SourceRef, mic_device: Option<&str>) -> AudioSourceKind {
+/// How the shared mic gate affects one microphone edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EdgeGate {
+    /// Always recorded.
+    Open,
+    /// Silenced by the toggle mute key only.
+    MuteOnly,
+    /// Silenced by the mute key, and open only while a push-to-talk key is held.
+    PttAndMute,
+}
+
+/// Capture source for one track source. `gate` selects the gated microphone kinds for `Mic`
+/// and `MicPtt`; other sources ignore it.
+fn source_kind_of(source: &SourceRef, mic_device: Option<&str>, gate: EdgeGate) -> AudioSourceKind {
     match source {
         SourceRef::Game => AudioSourceKind::GameProcess,
-        SourceRef::Mic => AudioSourceKind::Microphone {
+        SourceRef::Mic | SourceRef::MicPtt if gate == EdgeGate::PttAndMute => {
+            AudioSourceKind::MicrophoneGated {
+                device: mic_device.map(str::to_owned),
+            }
+        }
+        SourceRef::Mic | SourceRef::MicPtt if gate == EdgeGate::MuteOnly => {
+            AudioSourceKind::MicrophoneMuted {
+                device: mic_device.map(str::to_owned),
+            }
+        }
+        SourceRef::Mic | SourceRef::MicPtt => AudioSourceKind::Microphone {
             device: mic_device.map(str::to_owned),
         },
         SourceRef::OtherApps => AudioSourceKind::OtherApps,
@@ -271,27 +293,93 @@ fn source_kind_of(source: &SourceRef, mic_device: Option<&str>) -> AudioSourceKi
     }
 }
 
+/// Which mic gates are in effect, from `hotkeys.session` (see [`mic_gating`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MicGating {
+    /// The toggle mute key is bound (`mute_mic` with `mute_mic_mode = toggle`).
+    pub mute_key: bool,
+    /// At least one push-to-talk key is bound (`push_to_talk`, or `mute_mic` with
+    /// `mute_mic_mode = push_to_talk`).
+    pub ptt: bool,
+}
+
+/// Mic gating from `hotkeys.session`. The toggle mute key is `mute_mic` in toggle mode.
+/// Push-to-talk keys are the `push_to_talk` list plus `mute_mic` in push-to-talk mode
+/// (the legacy setting).
+pub fn mic_gating(cfg: &Config) -> MicGating {
+    let session = &cfg.hotkeys.session;
+    let legacy_ptt = session.mute_mic.is_some() && session.mute_mic_mode == MuteMode::PushToTalk;
+    MicGating {
+        mute_key: session.mute_mic.is_some() && session.mute_mic_mode == MuteMode::Toggle,
+        ptt: legacy_ptt || !session.push_to_talk.is_empty(),
+    }
+}
+
+/// How the mic gate affects the microphone edge of `source` in track `track_index` (see
+/// [`audio_tracks_gated`]).
+fn mic_gate_of(
+    source: &SourceRef,
+    track_index: usize,
+    audio: &Audio,
+    gating: MicGating,
+) -> EdgeGate {
+    let any = gating.ptt || gating.mute_key;
+    match source {
+        // With a separate push-to-talk track, the standalone Microphone track ignores push to
+        // talk (always open) but a toggle mute still silences it.
+        SourceRef::Mic if gating.ptt && audio.mic.ptt_separate_track && track_index > 0 => {
+            if gating.mute_key {
+                EdgeGate::MuteOnly
+            } else {
+                EdgeGate::Open
+            }
+        }
+        SourceRef::Mic | SourceRef::MicPtt if any => EdgeGate::PttAndMute,
+        _ => EdgeGate::Open,
+    }
+}
+
 /// Recorded audio tracks from `[audio]`, in the order of
 /// [`Audio::track_plan`]. Each source gets its gain. The microphone also gets
 /// the noise gate when `audio.mic.gate_enabled` is set. Each track uses
 /// `audio.bitrate_kbps`. Tracks with no sources (a silent Mix when nothing is
 /// enabled) are dropped, so nothing is recorded in that case.
 pub fn audio_tracks_of(audio: &Audio) -> Vec<AudioTrackConfig> {
+    audio_tracks_gated(audio, MicGating::default())
+}
+
+/// [`audio_tracks_of`] with the mic gates in effect (see [`mic_gating`]). A gated mic edge
+/// is `AudioSourceKind::MicrophoneGated`, which the shared `MicGate` opens and closes.
+/// With no gate every mic edge is `Microphone`.
+///
+/// Gating rules. With a push-to-talk key the mic is gated in the Mix track and the
+/// `Microphone` track. The exception is `audio.mic.ptt_separate_track`: the separate
+/// `Microphone` track then stays open, unless a toggle mute key is also bound. `Push to
+/// talk` (`SourceRef::MicPtt`) is gated whenever any gate is set. The track indexes come
+/// from the full [`Audio::track_plan`], before empty tracks are dropped.
+pub fn audio_tracks_gated(audio: &Audio, gating: MicGating) -> Vec<AudioTrackConfig> {
     let mic_device = mic_device_of(&audio.mic.device);
     audio
         .track_plan()
         .into_iter()
-        .filter(|track| !track.sources.is_empty())
-        .map(|track| AudioTrackConfig {
+        .enumerate()
+        .filter(|(_, track)| !track.sources.is_empty())
+        .map(|(index, track)| AudioTrackConfig {
             title: track.title,
             sources: track
                 .sources
                 .iter()
                 .map(|source| TrackSource {
-                    kind: source_kind_of(source, mic_device.as_deref()),
+                    kind: source_kind_of(
+                        source,
+                        mic_device.as_deref(),
+                        mic_gate_of(source, index, audio, gating),
+                    ),
                     gain_db: audio.gain_for(source),
                     gate_db: match source {
-                        SourceRef::Mic if audio.mic.gate_enabled => Some(audio.mic.gate_db),
+                        SourceRef::Mic | SourceRef::MicPtt if audio.mic.gate_enabled => {
+                            Some(audio.mic.gate_db)
+                        }
                         _ => None,
                     },
                 })
@@ -383,7 +471,8 @@ pub fn build_recorder_config(
 /// - Speed and B-frames: `[video] encoder_speed` and `[video] b_frames`.
 /// - GPU index: always `None`. The probe report has no adapter list, so the
 ///   NVENC `-gpu` index cannot be worked out here. The driver chooses.
-/// - Audio: [`audio_tracks_of`] from `[audio]`.
+/// - Audio: [`audio_tracks_gated`] from `[audio]`, with [`mic_gating`] from
+///   `hotkeys.session` so the mic is gated when a push-to-talk or mute key is bound.
 /// - Buffer: `replay.enabled` and `replay.max_seconds`. The folder is
 ///   `replay.location`, or `<data_dir>/buffer` when that is empty.
 /// - Clips and sessions: `storage.root\Clips` and `storage.root\Sessions` base
@@ -463,7 +552,7 @@ where
         sessions_dir: root.join("Sessions"),
         per_game_folders: cfg.storage.per_game_folders,
         session_auto_start: cfg.detection.auto_record && cfg.detection.record_sessions,
-        audio_tracks: audio_tracks_of(&cfg.audio),
+        audio_tracks: audio_tracks_gated(&cfg.audio, mic_gating(cfg)),
         tuning,
         no_border_capture: video.no_border_capture,
     };
@@ -477,12 +566,15 @@ where
 /// Converts clip and session hotkeys into bindings.
 ///
 /// Clips come first in config order, then session split, start/stop, buffer
-/// toggle and mic mute. Unbound session keys are skipped silently. A chord that
-/// cannot be turned into a [`Chord`] is skipped and a message is added to the
-/// returned warnings. Duplicate chords and clip limits are left to
-/// `HotkeyRegistry::build`.
+/// toggle and mic mute, then each `push_to_talk` chord. Unbound session keys are
+/// skipped silently. A chord that cannot be turned into a [`Chord`] is skipped and a
+/// message is added to the returned warnings. Duplicate chords and clip limits are
+/// left to `HotkeyRegistry::build`.
 ///
-/// `mute_mic_mode` is not represented: [`Binding`] has no mode field.
+/// `mute_mic_mode = push_to_talk` (legacy) maps the mute key to
+/// [`HotkeyAction::PushToTalk`], which the hotkey service reports on press and on
+/// release. `toggle` (the default) maps it to [`HotkeyAction::MuteMic`]. Each
+/// `push_to_talk` chord is a [`HotkeyAction::PushToTalk`] binding.
 ///
 /// Each clip maps its `press` (`tap` or `long`) to the binding's [`PressKind`]. Session
 /// bindings are always `Tap`. A clip chord shared by a tap clip and a long clip is kept
@@ -512,6 +604,10 @@ pub fn clip_hotkey_bindings(cfg: &Config) -> (Vec<Binding>, Vec<String>) {
     }
 
     let session = &hotkeys.session;
+    let (mute_action, mute_label) = match session.mute_mic_mode {
+        MuteMode::Toggle => (HotkeyAction::MuteMic, "mute microphone"),
+        MuteMode::PushToTalk => (HotkeyAction::PushToTalk, "push to talk"),
+    };
     let session_keys = [
         (session.split, HotkeyAction::SessionSplit, "session split"),
         (
@@ -524,7 +620,7 @@ pub fn clip_hotkey_bindings(cfg: &Config) -> (Vec<Binding>, Vec<String>) {
             HotkeyAction::ToggleBuffer,
             "toggle buffer",
         ),
-        (session.mute_mic, HotkeyAction::MuteMic, "mute microphone"),
+        (session.mute_mic, mute_action, mute_label),
     ];
     for (keys, action, label) in session_keys {
         let Some(keys) = keys else {
@@ -534,6 +630,17 @@ pub fn clip_hotkey_bindings(cfg: &Config) -> (Vec<Binding>, Vec<String>) {
             bindings.push(Binding {
                 chord,
                 action,
+                press: PressKind::Tap,
+                enabled: true,
+            });
+        }
+    }
+
+    for keys in &session.push_to_talk {
+        if let Some(chord) = to_chord(keys, "push to talk", &mut warnings) {
+            bindings.push(Binding {
+                chord,
+                action: HotkeyAction::PushToTalk,
                 press: PressKind::Tap,
                 enabled: true,
             });

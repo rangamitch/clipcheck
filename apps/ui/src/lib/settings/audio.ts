@@ -46,14 +46,16 @@ export interface TrackPlanPreview {
 }
 
 /**
- * Mirrors `Audio::track_plan`. Track 1 is "Mix" and holds every enabled source. With
- * `separate_tracks`, one more track follows per enabled source in the order game, microphone,
- * enabled apps in list order, other apps. With no enabled source the result is one silent Mix.
+ * Mirrors `Audio::track_plan`. Track 1 is "Mix" and holds every enabled source except the
+ * push-to-talk track. With `separate_tracks`, one more track follows per enabled source in the
+ * order game, microphone, push to talk (when `mic.ptt_separate_track`), enabled apps in list
+ * order, other apps. With no enabled source the result is one silent Mix.
  */
 export function trackPlanPreview(audio: TrackPlanInput): TrackPlanPreview {
   const sources: string[] = [];
   if (audio.game.enabled) sources.push('Game');
   if (audio.mic.enabled) sources.push('Microphone');
+  if (audio.mic.enabled && audio.mic.ptt_separate_track) sources.push('Push to talk');
   for (const app of audio.apps) if (app.enabled) sources.push(app.name);
   if (audio.other_apps.enabled) sources.push('Other apps');
 

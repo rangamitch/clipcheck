@@ -215,8 +215,8 @@ canvas should follow the source aspect ratio (ultrawide) instead of fixed 16:9; 
 (v2); UWP windows resolve to `ApplicationFrameHost` (detect `win.rs`); pinned app does not displace an already-recording
 unpinned game (decide); the first `WinSource::snapshots()` does a synchronous library scan (~1 s; consider pre-warm).
 
-**F. Settings/product polish.** "Why wasn't my game detected?" panel (expose `dump_candidates` logic over IPC); push-to-talk needs
-the opt-in low-level keyboard hook (not built; `hotkeys.mute_mic_mode` unused); real noise suppression beyond the gate;
+**F. Settings/product polish.** "Why wasn't my game detected?" panel (expose `dump_candidates` logic over IPC); push-to-talk and mic mute are built (D65:
+`hotkeys.session.push_to_talk` key list incl. mouse buttons, optional own track; needs a manual check with a real game focused); real noise suppression beyond the gate;
 config save rewrites the file (comments lost; consider `toml_edit`); doc 10 still mentions `updates.check_interval_hours`
 (authoritative key is `updates.interval_hours`, doc 11 §8); docs 06/09/10 need the decisions below recorded.
 

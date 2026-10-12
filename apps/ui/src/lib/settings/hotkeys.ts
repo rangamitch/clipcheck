@@ -104,13 +104,31 @@ const NAMED_KEY_NAMES: readonly string[] = [
 ];
 
 /**
- * Every key name a chord may end with, in canonical spelling. Escape is not here: it cancels
- * capture and can never be bound. Mouse input is never captured.
+ * Every keyboard key name a chord may end with, in canonical spelling. Escape is not here: it
+ * cancels capture and can never be bound. Mouse buttons are not in this list (see
+ * MOUSE_KEY_NAMES), so the key-name contract table still matches this list exactly.
  */
 export const SUPPORTED_KEYS: readonly string[] = [...LETTERS, ...DIGITS, ...FKEYS, ...NAMED_KEY_NAMES];
 
-/** Upper-cased name to canonical name, so the parser accepts any case. */
-const KEY_BY_UPPER = new Map<string, string>(SUPPORTED_KEYS.map((k) => [k.toUpperCase(), k]));
+/**
+ * Mouse buttons a chord may end with. Only the middle and side buttons: left and right are never
+ * allowed. The daemon reads these as VK 0x04-0x06 (crates/core/src/config/schema.rs). The
+ * settings UI captures them only on rows that pass `allowMouse` (the push-to-talk rows).
+ */
+export const MOUSE_KEY_NAMES: readonly string[] = ['Mouse3', 'Mouse4', 'Mouse5'];
+
+/** Upper-cased name to canonical name, so the parser accepts any case. Keyboard and mouse names. */
+const KEY_BY_UPPER = new Map<string, string>([...SUPPORTED_KEYS, ...MOUSE_KEY_NAMES].map((k) => [k.toUpperCase(), k]));
+
+/** `MouseEvent.button` to mouse key name. Only the middle (1), back (3) and forward (4) buttons. */
+const MOUSE_BUTTON_KEY: ReadonlyMap<number, string> = new Map<number, string>([
+  [1, 'Mouse3'],
+  [3, 'Mouse4'],
+  [4, 'Mouse5'],
+]);
+
+/** Most push-to-talk keys one user may set. Mirrors CFG-H009 (validate.rs MAX_PTT_KEYS). */
+export const MAX_PUSH_TO_TALK_KEYS = 4;
 
 /** Alternative spellings the daemon also reads, mapped to the canonical name (upper-cased keys). */
 const KEY_ALIASES: ReadonlyMap<string, string> = new Map<string, string>([['MENU', 'AppsKey']]);
@@ -225,10 +243,32 @@ const MODIFIER_CODE = /^(Control|Shift|Alt|Meta|OS)(Left|Right)?$|^AltGraph$/;
 /**
  * True when a key may be bound with no modifier. Every supported key may be bound alone, as the
  * key-name contract (docs/design/hotkey-key-names.md) allows. A bare letter or Space will also
- * fire while the user types in other apps, so the Settings help warns about it.
+ * fire while the user types in other apps, so the Settings help warns about it. Mouse buttons
+ * (Mouse3, Mouse4, Mouse5) may be bound alone too, like function and media keys.
  */
 export function isBareAllowed(key: string): boolean {
   return KEY_BY_UPPER.has(key.toUpperCase());
+}
+
+/** True for a mouse button key name (Mouse3, Mouse4, Mouse5). */
+export function isMouseKey(key: string): boolean {
+  return MOUSE_KEY_NAMES.includes(key);
+}
+
+/**
+ * Maps a `MouseEvent.button` to a mouse key name, or null for the buttons that are never bound:
+ * left (0), right (2) and anything past the forward button.
+ */
+export function mouseButtonKey(button: number): string | null {
+  return MOUSE_BUTTON_KEY.get(button) ?? null;
+}
+
+/**
+ * True when one more push-to-talk key may be added to a list of `count` keys. The list holds at
+ * most MAX_PUSH_TO_TALK_KEYS (4).
+ */
+export function canAddPushToTalkKey(count: number): boolean {
+  return count < MAX_PUSH_TO_TALK_KEYS;
 }
 
 /**
@@ -264,8 +304,11 @@ export function keyFromKey(key: string): string | null {
   return VALUE_TO_KEY.get(key) ?? null;
 }
 
+/** The modifier fields of an event. Both a KeyboardEvent and a MouseEvent satisfy this. */
+export type ModifierEvent = Pick<ChordEvent, 'ctrlKey' | 'altKey' | 'shiftKey' | 'metaKey' | 'getModifierState'>;
+
 /** Modifiers held on an event. AltGr sends synthetic Ctrl+Alt, so those are dropped. */
-export function modifiersOf(e: ChordEvent): ChordModifiers {
+export function modifiersOf(e: ModifierEvent): ChordModifiers {
   const altGraph = e.getModifierState?.('AltGraph') ?? false;
   return {
     ctrl: altGraph ? false : e.ctrlKey,
@@ -340,6 +383,9 @@ const KEY_LABELS: ReadonlyMap<string, string> = new Map<string, string>([
   ['BrowserSearch', 'Browser Search'],
   ['BrowserFavorites', 'Browser Favorites'],
   ['BrowserHome', 'Browser Home'],
+  ['Mouse3', 'Middle mouse button'],
+  ['Mouse4', 'Mouse button 4 (back)'],
+  ['Mouse5', 'Mouse button 5 (forward)'],
 ]);
 
 /** Friendly text for one key name, such as "Scroll Lock" for ScrollLock. */
@@ -369,12 +415,13 @@ export function chordChipParts(chord: string): string[] {
 }
 
 /**
- * The session chords (split, start or stop, buffer, mute) that a new clip must not reuse.
- * Unbound (empty) entries are left out. Shared by the Replay and Hotkeys tabs.
+ * The session chords (split, start or stop, buffer, mute, then each push-to-talk key) that a new
+ * clip must not reuse. Unbound (empty) entries are left out. Shared by the Replay and Hotkeys tabs.
  */
 export function sessionChordsOf(session: SessionHotkeysConfig | undefined): string[] {
   if (!session) return [];
-  return [session.split, session.stop_start, session.toggle_buffer, session.mute_mic].filter((c) => c !== '');
+  const ptt = session.push_to_talk ?? [];
+  return [session.split, session.stop_start, session.toggle_buffer, session.mute_mic, ...ptt].filter((c) => c !== '');
 }
 
 /**
@@ -478,7 +525,9 @@ export function isReservedChord(text: string): string | null {
 
 /**
  * A problem that stops a chord from being bound, or null. `needs_modifier` is the text-key rule
- * (see `isBareAllowed`). `reserved` is a chord Windows or ClipCheck owns.
+ * (see `isBareAllowed`); mouse buttons Mouse3-5 are allowed alone, so they never hit it. `reserved`
+ * is a chord Windows or ClipCheck owns. Left and right mouse buttons do not parse, so they are
+ * `invalid`.
  */
 export function chordProblem(text: string): 'needs_modifier' | 'reserved' | 'invalid' | null {
   const parsed = parseChord(text);

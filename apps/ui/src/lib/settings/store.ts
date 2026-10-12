@@ -106,6 +106,10 @@ export interface MicAudioConfig {
   gain_db: number;
   gate_enabled: boolean;
   gate_db: number;
+  /** Records push to talk as its own track (needs separate tracks and PTT mode). */
+  ptt_separate_track: boolean;
+  /** Keeps the mic open this many ms after the key is released, 0..=2000. */
+  ptt_release_ms: number;
 }
 
 /** `[audio.other_apps]`: everything that is not the game or a listed app. */
@@ -157,13 +161,18 @@ export interface ClipHotkeyConfig {
   press: ClipPress;
 }
 
-/** `[hotkeys.session]`. An empty string means unbound. */
+/**
+ * `[hotkeys.session]`. An empty string means unbound. `push_to_talk` holds up to 4 chords (keys or
+ * mouse buttons Mouse3-5); the mic records while any one is held. `mute_mic_mode` is legacy: when
+ * it is 'push_to_talk', `mute_mic` acts as one more hold-to-talk key.
+ */
 export interface SessionHotkeysConfig {
   split: string;
   stop_start: string;
   toggle_buffer: string;
   mute_mic: string;
   mute_mic_mode: MuteMode;
+  push_to_talk: string[];
 }
 
 /** `[hotkeys]` */

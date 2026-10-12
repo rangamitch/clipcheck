@@ -49,6 +49,9 @@ pub enum HotkeyAction {
     ToggleBuffer,
     /// Toggle microphone mute.
     MuteMic,
+    /// Push to talk: the mic is open while the chord is held. Delivers a press event on key
+    /// down and a release event when the key (or a required modifier) goes up.
+    PushToTalk,
 }
 
 impl HotkeyAction {
@@ -62,6 +65,7 @@ impl HotkeyAction {
             HotkeyAction::SessionStopStart => Cow::Borrowed("session start/stop"),
             HotkeyAction::ToggleBuffer => Cow::Borrowed("toggle buffer"),
             HotkeyAction::MuteMic => Cow::Borrowed("mute microphone"),
+            HotkeyAction::PushToTalk => Cow::Borrowed("push to talk"),
         }
     }
 }

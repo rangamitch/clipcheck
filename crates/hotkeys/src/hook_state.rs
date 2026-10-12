@@ -92,6 +92,16 @@ pub(crate) struct Fired {
     pub(crate) press: PressKind,
 }
 
+/// A push-to-talk hold chord went down (`pressed` true) or was released
+/// (`pressed` false).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HoldEvent {
+    /// The chord id the state machine was built with.
+    pub(crate) id: ChordId,
+    /// `true` on press, `false` on release.
+    pub(crate) pressed: bool,
+}
+
 /// Chord matching and tap/long gestures for the keyboard hook.
 #[derive(Debug, Clone)]
 pub(crate) struct HookState {
@@ -107,6 +117,12 @@ pub(crate) struct HookState {
     down: BTreeSet<u32>,
     /// Start time of an active UI suspension, if any.
     suspended_since: Option<u64>,
+    /// Chord ids bound to push-to-talk. They bypass the gesture tracker.
+    holds: BTreeSet<ChordId>,
+    /// Hold chords that reported a press and still owe a release.
+    active_holds: BTreeSet<ChordId>,
+    /// Hold press/release events not yet drained by [`HookState::take_hold_events`].
+    hold_events: Vec<HoldEvent>,
 }
 
 impl HookState {
@@ -128,7 +144,102 @@ impl HookState {
             mods: 0,
             down: BTreeSet::new(),
             suspended_since: None,
+            holds: BTreeSet::new(),
+            active_holds: BTreeSet::new(),
+            hold_events: Vec::new(),
         }
+    }
+
+    /// Marks which of the chord ids given to [`HookState::new`] are hold chords
+    /// (push to talk). A hold chord reports a press when its key goes down and a
+    /// release when it is let go, and it never reaches the tap/long gesture
+    /// tracker. Call before any key event.
+    pub(crate) fn set_holds(&mut self, holds: &[ChordId]) {
+        self.holds = holds.iter().copied().collect();
+    }
+
+    /// Drains the hold press/release events queued since the last call.
+    pub(crate) fn take_hold_events(&mut self) -> Vec<HoldEvent> {
+        std::mem::take(&mut self.hold_events)
+    }
+
+    /// True while at least one hold chord is down and owes a release.
+    pub(crate) fn has_active_holds(&self) -> bool {
+        !self.active_holds.is_empty()
+    }
+
+    /// Releases every active hold, for example when the bindings are replaced.
+    pub(crate) fn release_all_holds(&mut self) {
+        for id in std::mem::take(&mut self.active_holds) {
+            self.hold_events.push(HoldEvent { id, pressed: false });
+        }
+    }
+
+    /// Releases any active hold whose main key is no longer physically down, so
+    /// a missed key-up cannot leave push to talk stuck on. The key is also dropped
+    /// from the held-key set so its next press is not read as auto-repeat.
+    pub(crate) fn check_holds(&mut self, is_physically_down: impl Fn(u32) -> bool) {
+        let stale: Vec<(ChordId, u32)> = self
+            .active_holds
+            .iter()
+            .copied()
+            .filter_map(|id| self.chord_of(id).map(|c| (id, c.vk_code())))
+            .filter(|&(_, vk)| !is_physically_down(vk))
+            .collect();
+        for (id, vk) in stale {
+            self.down.remove(&vk);
+            self.release_hold(id);
+        }
+    }
+
+    /// Releases one hold if it is active.
+    fn release_hold(&mut self, id: ChordId) {
+        if self.active_holds.remove(&id) {
+            self.hold_events.push(HoldEvent { id, pressed: false });
+        }
+    }
+
+    /// Releases every active hold whose main key is `vk`.
+    fn release_holds_for_key(&mut self, vk: u32) {
+        let ids: Vec<ChordId> = self
+            .active_holds
+            .iter()
+            .copied()
+            .filter(|&id| self.chord_of(id).is_some_and(|c| c.vk_code() == vk))
+            .collect();
+        for id in ids {
+            self.release_hold(id);
+        }
+    }
+
+    /// Releases every active hold that requires a modifier which is no longer held.
+    /// Extra modifiers do not release a hold.
+    fn release_holds_missing_mods(&mut self) {
+        let mods = self.current_mods();
+        let ids: Vec<ChordId> = self
+            .active_holds
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.chord_of(id).is_some_and(|c| {
+                    (c.ctrl && !mods.ctrl)
+                        || (c.shift && !mods.shift)
+                        || (c.alt && !mods.alt)
+                        || (c.win && !mods.win)
+                })
+            })
+            .collect();
+        for id in ids {
+            self.release_hold(id);
+        }
+    }
+
+    /// The chord registered under `id`, if any.
+    fn chord_of(&self, id: ChordId) -> Option<Chord> {
+        self.chords
+            .iter()
+            .find(|(cid, _)| *cid == id)
+            .map(|(_, chord)| *chord)
     }
 
     /// Sets the suspension start (`Some(ms)`) or clears it (`None`). While a
@@ -152,12 +263,30 @@ impl HookState {
     /// auto-repeat), false for key-up. `flags` is the raw `KBDLLHOOKSTRUCT.flags`.
     /// Returns the chords that fired on this event.
     pub(crate) fn on_key(&mut self, vk: u32, down: bool, flags: u32, now_ms: u64) -> Vec<Fired> {
+        self.on_event(vk, down, Some(flags), now_ms)
+    }
+
+    /// A mouse-button event (`Mouse3`/`Mouse4`/`Mouse5`). Mouse events carry no
+    /// `LLKHF_*` flags, so Alt is not re-synchronised from them: a held Alt
+    /// stays held across a mouse chord.
+    pub(crate) fn on_mouse(&mut self, vk: u32, down: bool, now_ms: u64) -> Vec<Fired> {
+        self.on_event(vk, down, None, now_ms)
+    }
+
+    /// Shared body of [`on_key`](Self::on_key) and [`on_mouse`](Self::on_mouse).
+    /// `flags` is `None` for mouse events, which skips the Alt correction.
+    fn on_event(&mut self, vk: u32, down: bool, flags: Option<u32>, now_ms: u64) -> Vec<Fired> {
+        if self.is_suspended(now_ms) {
+            self.release_all_holds();
+        }
+
         if let Some(bits) = modifier_bits(vk) {
             if down {
                 self.mods |= bits;
             } else {
                 self.mods &= !bits;
             }
+            self.release_holds_missing_mods();
             return Vec::new();
         }
 
@@ -167,6 +296,7 @@ impl HookState {
                 return Vec::new();
             }
             self.sync_alt(flags);
+            self.release_holds_missing_mods();
             if self.is_suspended(now_ms) {
                 self.clear_holds();
                 return Vec::new();
@@ -175,6 +305,12 @@ impl HookState {
             let Some(id) = self.find(vk, mods) else {
                 return Vec::new();
             };
+            if self.holds.contains(&id) {
+                if self.active_holds.insert(id) {
+                    self.hold_events.push(HoldEvent { id, pressed: true });
+                }
+                return Vec::new();
+            }
             return self
                 .gestures
                 .on_press(id, now_ms)
@@ -189,6 +325,8 @@ impl HookState {
             return Vec::new();
         }
         self.sync_alt(flags);
+        self.release_holds_for_key(vk);
+        self.release_holds_missing_mods();
         self.poll(now_ms)
     }
 
@@ -229,8 +367,12 @@ impl HookState {
         self.gestures = GestureTracker::new(self.long_press_ms, &self.triples);
     }
 
-    /// Corrects Alt from `LLKHF_ALTDOWN` on a non-modifier event.
-    fn sync_alt(&mut self, flags: u32) {
+    /// Corrects Alt from `LLKHF_ALTDOWN` on a non-modifier keyboard event.
+    /// `None` (a mouse event) leaves Alt unchanged.
+    fn sync_alt(&mut self, flags: Option<u32>) {
+        let Some(flags) = flags else {
+            return;
+        };
         if flags & LLKHF_ALTDOWN != 0 {
             if self.mods & ALT_BITS == 0 {
                 self.mods |= L_ALT;
@@ -589,5 +731,237 @@ mod tests {
         assert!(s.on_key(F9, true, NO_FLAGS, 0).is_empty());
         assert!(!s.is_pending());
         assert!(s.on_key(A, true, NO_FLAGS, 5).is_empty());
+    }
+
+    /// One hold chord with id 1 and no tap or long binding.
+    fn hold(c: Chord) -> HookState {
+        let mut s = HookState::new(MS, &[(1, c, false, false)]);
+        s.set_holds(&[1]);
+        s
+    }
+
+    /// Drains the hold events as `(id, pressed)` pairs.
+    fn holds(s: &mut HookState) -> Vec<(ChordId, bool)> {
+        s.take_hold_events()
+            .into_iter()
+            .map(|e| (e.id, e.pressed))
+            .collect()
+    }
+
+    #[test]
+    fn hold_bare_key_reports_press_then_release() {
+        let mut s = hold(bare(Key::F9));
+        assert!(s.on_key(F9, true, NO_FLAGS, 0).is_empty());
+        assert_eq!(holds(&mut s), vec![(1, true)]);
+        assert!(s.has_active_holds());
+        assert!(s.on_key(F9, false, NO_FLAGS, 500).is_empty());
+        assert_eq!(holds(&mut s), vec![(1, false)]);
+        assert!(!s.has_active_holds());
+        assert!(!s.is_pending());
+    }
+
+    #[test]
+    fn hold_never_goes_through_the_gesture_tracker() {
+        let mut s = hold(bare(Key::F9));
+        s.on_key(F9, true, NO_FLAGS, 0);
+        assert!(!s.is_pending());
+        assert!(s.tick(1_000).is_empty());
+    }
+
+    #[test]
+    fn hold_auto_repeat_does_not_refire() {
+        let mut s = hold(bare(Key::F9));
+        s.on_key(F9, true, NO_FLAGS, 0);
+        s.on_key(F9, true, NO_FLAGS, 30);
+        s.on_key(F9, true, NO_FLAGS, 60);
+        assert_eq!(holds(&mut s), vec![(1, true)]);
+        s.on_key(F9, false, NO_FLAGS, 90);
+        assert_eq!(holds(&mut s), vec![(1, false)]);
+    }
+
+    #[test]
+    fn hold_rapid_tap_gives_press_then_release_in_order() {
+        let mut s = hold(bare(Key::F9));
+        s.on_key(F9, true, NO_FLAGS, 0);
+        s.on_key(F9, false, NO_FLAGS, 1);
+        assert_eq!(holds(&mut s), vec![(1, true), (1, false)]);
+    }
+
+    #[test]
+    fn hold_ctrl_chord_released_when_ctrl_released_first() {
+        let mut s = hold(chord("Ctrl+F9"));
+        s.on_key(VK_LCONTROL, true, NO_FLAGS, 0);
+        s.on_key(F9, true, NO_FLAGS, 10);
+        assert_eq!(holds(&mut s), vec![(1, true)]);
+        s.on_key(VK_LCONTROL, false, NO_FLAGS, 20);
+        assert_eq!(holds(&mut s), vec![(1, false)]);
+        assert!(!s.has_active_holds());
+        // F9 is still physically down: its auto-repeat must not re-press.
+        assert!(s.on_key(F9, true, NO_FLAGS, 30).is_empty());
+        assert!(holds(&mut s).is_empty());
+        s.on_key(F9, false, NO_FLAGS, 40);
+        assert!(holds(&mut s).is_empty());
+    }
+
+    #[test]
+    fn hold_extra_modifier_does_not_release() {
+        let mut s = hold(chord("Ctrl+F9"));
+        s.on_key(VK_LCONTROL, true, NO_FLAGS, 0);
+        s.on_key(F9, true, NO_FLAGS, 10);
+        holds(&mut s);
+        s.on_key(VK_LSHIFT, true, NO_FLAGS, 20);
+        s.on_key(VK_LSHIFT, false, NO_FLAGS, 30);
+        assert!(holds(&mut s).is_empty());
+        assert!(s.has_active_holds());
+    }
+
+    #[test]
+    fn hold_is_not_pressed_when_a_required_modifier_is_missing() {
+        let mut s = hold(chord("Ctrl+F9"));
+        s.on_key(F9, true, NO_FLAGS, 0);
+        assert!(holds(&mut s).is_empty());
+        assert!(!s.has_active_holds());
+    }
+
+    #[test]
+    fn hold_suspension_releases_active_hold() {
+        let mut s = hold(bare(Key::F9));
+        s.on_key(F9, true, NO_FLAGS, 0);
+        holds(&mut s);
+        s.set_suspension(Some(100));
+        // Any key event while suspended releases the hold.
+        s.on_key(A, true, NO_FLAGS, 200);
+        assert_eq!(holds(&mut s), vec![(1, false)]);
+        assert!(!s.has_active_holds());
+    }
+
+    #[test]
+    fn hold_key_up_during_suspension_does_not_double_release() {
+        let mut s = hold(bare(Key::F9));
+        s.on_key(F9, true, NO_FLAGS, 0);
+        holds(&mut s);
+        s.set_suspension(Some(100));
+        s.on_key(F9, false, NO_FLAGS, 200);
+        assert_eq!(holds(&mut s), vec![(1, false)]);
+    }
+
+    #[test]
+    fn hold_check_holds_releases_when_key_not_physically_down() {
+        let mut s = hold(bare(Key::F9));
+        s.on_key(F9, true, NO_FLAGS, 0);
+        holds(&mut s);
+        s.check_holds(|_| true);
+        assert!(holds(&mut s).is_empty());
+        assert!(s.has_active_holds());
+        s.check_holds(|_| false);
+        assert_eq!(holds(&mut s), vec![(1, false)]);
+        assert!(!s.has_active_holds());
+        // The stale key is forgotten, so a fresh press fires again.
+        assert_eq!(holds(&mut s), Vec::<(ChordId, bool)>::new());
+        s.on_key(F9, true, NO_FLAGS, 100);
+        assert_eq!(holds(&mut s), vec![(1, true)]);
+    }
+
+    #[test]
+    fn hold_release_all_releases_every_active_hold() {
+        let mut s = HookState::new(
+            MS,
+            &[
+                (1, bare(Key::F9), false, false),
+                (2, bare(Key::F10), false, false),
+            ],
+        );
+        s.set_holds(&[1, 2]);
+        s.on_key(F9, true, NO_FLAGS, 0);
+        s.on_key(0x79, true, NO_FLAGS, 5); // F10
+        holds(&mut s);
+        s.release_all_holds();
+        let mut released = holds(&mut s);
+        released.sort();
+        assert_eq!(released, vec![(1, false), (2, false)]);
+        assert!(!s.has_active_holds());
+        // Releasing again is a no-op.
+        s.release_all_holds();
+        assert!(holds(&mut s).is_empty());
+    }
+
+    #[test]
+    fn hold_and_tap_chords_are_independent() {
+        let mut s = HookState::new(
+            MS,
+            &[
+                (1, bare(Key::F9), false, false),
+                (2, bare(Key::F10), true, false),
+            ],
+        );
+        s.set_holds(&[1]);
+        assert_eq!(
+            ids(&s.on_key(0x79, true, NO_FLAGS, 0)),
+            vec![(2, PressKind::Tap)]
+        );
+        assert!(s.on_key(F9, true, NO_FLAGS, 10).is_empty());
+        assert_eq!(holds(&mut s), vec![(1, true)]);
+        assert!(s.on_key(0x79, false, NO_FLAGS, 20).is_empty());
+        assert_eq!(holds(&mut s), Vec::<(ChordId, bool)>::new());
+        s.on_key(F9, false, NO_FLAGS, 30);
+        assert_eq!(holds(&mut s), vec![(1, false)]);
+    }
+
+    const VK_MOUSE4: u32 = 0x05;
+    const VK_MOUSE5: u32 = 0x06;
+
+    #[test]
+    fn mouse_button_chord_fires_like_a_key() {
+        let mut s = tap(bare(Key::Mouse4));
+        assert_eq!(
+            ids(&s.on_mouse(VK_MOUSE4, true, 0)),
+            vec![(1, PressKind::Tap)]
+        );
+        assert!(s.on_mouse(VK_MOUSE4, false, 10).is_empty());
+    }
+
+    #[test]
+    fn mouse_button_long_press_fires_at_threshold() {
+        let mut s = long(bare(Key::Mouse5));
+        assert!(s.on_mouse(VK_MOUSE5, true, 0).is_empty());
+        assert!(s.is_pending());
+        assert_eq!(ids(&s.tick(400)), vec![(1, PressKind::Long)]);
+        assert!(s.on_mouse(VK_MOUSE5, false, 600).is_empty());
+        assert!(!s.is_pending());
+    }
+
+    #[test]
+    fn push_to_talk_hold_on_a_mouse_button_reports_press_and_release() {
+        let mut s = HookState::new(MS, &[(1, bare(Key::Mouse4), false, false)]);
+        s.set_holds(&[1]);
+        s.on_mouse(VK_MOUSE4, true, 0);
+        assert_eq!(holds(&mut s), vec![(1, true)]);
+        s.on_mouse(VK_MOUSE4, true, 5);
+        assert_eq!(holds(&mut s), Vec::<(ChordId, bool)>::new());
+        s.on_mouse(VK_MOUSE4, false, 10);
+        assert_eq!(holds(&mut s), vec![(1, false)]);
+    }
+
+    #[test]
+    fn alt_stays_held_across_a_mouse_chord() {
+        let mut s = tap(chord("Alt+Mouse4"));
+        s.on_key(VK_LMENU, true, ALT_FLAG, 0);
+        assert_eq!(
+            ids(&s.on_mouse(VK_MOUSE4, true, 5)),
+            vec![(1, PressKind::Tap)]
+        );
+    }
+
+    #[test]
+    fn mouse_event_does_not_clear_a_held_alt_from_flags() {
+        // A mouse event must not run the keyboard Alt correction: with Alt
+        // held, a mouse event sent without LLKHF_ALTDOWN keeps Alt set.
+        let mut s = tap(chord("Alt+Mouse5"));
+        s.on_key(VK_LMENU, true, ALT_FLAG, 0);
+        s.on_mouse(VK_MOUSE4, true, 1);
+        assert_eq!(
+            ids(&s.on_mouse(VK_MOUSE5, true, 5)),
+            vec![(1, PressKind::Tap)]
+        );
     }
 }

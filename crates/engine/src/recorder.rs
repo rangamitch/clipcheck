@@ -574,6 +574,8 @@ pub struct Recorder {
     shared: Arc<Shared>,
     /// The finalizer thread. `None` when it could not be spawned.
     finalizer: Option<Finalizer>,
+    /// Shared push-to-talk / mute gate for `MicrophoneGated` sources. `None` until set.
+    mic_gate: Option<Arc<crate::audiomix::MicGate>>,
 }
 
 impl Recorder {
@@ -597,7 +599,14 @@ impl Recorder {
             ctx,
             shared,
             finalizer,
+            mic_gate: None,
         }
+    }
+
+    /// Shares the microphone gate (push to talk / mute) with every audio feeder this recorder
+    /// starts from now on.
+    pub fn set_mic_gate(&mut self, gate: Arc<crate::audiomix::MicGate>) {
+        self.mic_gate = Some(gate);
     }
 
     /// Starts recording the window `hwnd`. `game` is the label for file names
@@ -629,7 +638,8 @@ impl Recorder {
         } else {
             let pid = window_pid(hwnd);
             let (feeder, receivers) =
-                AudioFeeder::start(&self.cfg.audio_tracks, pid).map_err(io_err)?;
+                AudioFeeder::start_with_gate(&self.cfg.audio_tracks, pid, self.mic_gate.clone())
+                    .map_err(io_err)?;
             let lanes: AudioLanes = self
                 .cfg
                 .audio_tracks
