@@ -490,9 +490,20 @@ fn issue_139_frontend_package_version_matches_cargo_version() {
 
 #[test]
 fn issue_139_cargo_manifest_has_no_empty_feature_lists() {
+    // The Tauri CLI rewrites the `tauri` and `tauri-build` dependency lines (with an empty
+    // `features = []`) on every `tauri dev`/`tauri build`, so those two are exempt; any
+    // other empty feature list is still a mistake.
+    let offenders: Vec<&str> = CARGO_TOML
+        .lines()
+        .filter(|l| l.contains("features = []"))
+        .filter(|l| {
+            let name = l.split('=').next().unwrap_or("").trim();
+            name != "tauri" && name != "tauri-build"
+        })
+        .collect();
     assert!(
-        !CARGO_TOML.contains("features = []"),
-        "Cargo.toml still has an empty features list, which does nothing"
+        offenders.is_empty(),
+        "Cargo.toml has an empty features list, which does nothing: {offenders:?}"
     );
 }
 
