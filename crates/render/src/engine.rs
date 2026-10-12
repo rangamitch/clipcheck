@@ -7,6 +7,8 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{sync_channel, Receiver, Sender, SyncSender};
+use std::thread::JoinHandle;
 
 use clipcheck_aacenc::AacEncoder;
 use clipcheck_hwenc::{
@@ -28,7 +30,9 @@ use clipcheck_timeline::time::{Rate, Tick};
 use crate::dsp::normalize_gain_db;
 use crate::error::RenderError;
 use crate::frame::Frame;
+use crate::gpuenc::GpuUploader;
 use crate::job::{JobControl, Progress};
+use crate::nv12;
 use crate::pipeline::{self, PipelineConfig, Sink};
 use crate::reference;
 use crate::smart;
@@ -133,8 +137,10 @@ const LOUDNESS_SHARE: f32 = 10.0;
 const TARGET_TOLERANCE: f64 = 1.03;
 /// Frame rate cap for exports.
 const MAX_FPS: u32 = 120;
-/// Quality-vs-speed hint passed to the encoder (0 fastest .. 100 best).
-const QUALITY_VS_SPEED: u32 = 70;
+/// Quality-vs-speed hint for the software encoder (0 fastest .. 100 best); speed-leaning.
+const QUALITY_VS_SPEED_SW: u32 = 50;
+/// Quality-vs-speed hint for hardware encoders.
+const QUALITY_VS_SPEED_HW: u32 = 70;
 
 /// Video export: the smart path when it applies, else decode, composite, encode and mux.
 fn export_video(
@@ -199,7 +205,8 @@ fn export_video(
     let fps_int = (fps.as_f64().round() as u32).clamp(1, MAX_FPS);
 
     let want = codec_for(s.codec)?;
-    let (desc, codec) = choose_encoder(want, &s.encoder, warnings)?;
+    let chosen = choose_encoder(want, &s.encoder, warnings)?;
+    let codec = chosen.codec;
 
     let audio_tracks = match s.audio.layout {
         AudioLayout::Mix => 1,
@@ -268,18 +275,16 @@ fn export_video(
     } else {
         (0.0, 100.0)
     };
-    let attempts: u32 = if target_bytes.is_some() {
-        MAX_RETRIES + 1
-    } else {
-        1
-    };
+    // Two passes for a target size; a third only when the first missed by more than 10 %.
+    let mut attempts: u32 = if target_bytes.is_some() { 2 } else { 1 };
 
     let job = Job {
         project,
         plan,
         cfg,
         ctl: req.ctl,
-        desc,
+        desc: chosen.desc,
+        fallback: chosen.fallback,
         codec,
         width,
         height,
@@ -292,24 +297,50 @@ fn export_video(
 
     let part = part_path(req.out_path);
     let mut attempt: u32 = 0;
+    let mut allow_hw = true;
+    let mut first_miss = 1.0_f64;
+    let mut used: String;
+    let mut used_hw: bool;
     let bytes = loop {
         if req.ctl.is_cancelled() {
             return Err(RenderError::Cancelled);
         }
         let rate = rate_control(cbr, kbps);
         let pass_dir = req.work_dir.join(format!("pass-{attempt}"));
+        attempts = attempts.max(attempt + 1);
         let map = ProgressMap {
             offset,
             span,
             attempt,
             attempts,
         };
-        let bytes = encode_pass(&job, rate, &pass_dir, &part, map, on_progress, warnings)?;
+        let pass = encode_pass(
+            &job,
+            rate,
+            &pass_dir,
+            &part,
+            map,
+            &mut allow_hw,
+            on_progress,
+            warnings,
+        )?;
+        let bytes = pass.bytes;
+        used = pass.encoder;
+        used_hw = pass.hardware;
         match target_bytes {
-            Some(target) if (bytes as f64) > target * TARGET_TOLERANCE && attempt < MAX_RETRIES => {
+            Some(target) if (bytes as f64) > target * TARGET_TOLERANCE => {
+                let ratio = bytes as f64 / target;
+                if attempt == 0 {
+                    first_miss = ratio;
+                }
+                // A second retry only when the first pass missed by more than 10 %.
+                let may_retry = attempt == 0 || (attempt == 1 && first_miss > 1.10);
+                if !may_retry || attempt >= MAX_RETRIES {
+                    break bytes;
+                }
                 attempt += 1;
                 // Scale the bitrate by the measured overshoot so one retry can converge.
-                let scaled = f64::from(kbps) * (target / bytes as f64) * RETRY_SAFETY;
+                let scaled = f64::from(kbps) * (1.0 / ratio) * RETRY_SAFETY;
                 kbps = scaled.max(MIN_RETRY_KBPS) as u32;
             }
             _ => break bytes,
@@ -318,13 +349,17 @@ fn export_video(
     if let Some(target) = target_bytes {
         if (bytes as f64) > target * TARGET_TOLERANCE {
             warnings.push(format!(
-                "The file is {:.1} MB, over the {:.1} MB target after {} retries",
+                "The file is {:.1} MB, over the {:.1} MB target after {} passes",
                 bytes as f64 / 1_000_000.0,
                 target / 1_000_000.0,
-                MAX_RETRIES
+                attempt + 1
             ));
         }
     }
+    warnings.push(format!(
+        "Encoder: {used} ({})",
+        if used_hw { "hardware" } else { "software" }
+    ));
 
     fs::rename(&part, req.out_path).map_err(|e| {
         let _ = fs::remove_file(&part);
@@ -335,7 +370,7 @@ fn export_video(
         out_path: req.out_path.to_path_buf(),
         bytes,
         duration_secs,
-        encoder: job.desc.name.clone(),
+        encoder: used,
         smart: false,
         warnings: Vec::new(),
     })
@@ -431,47 +466,61 @@ fn software_encoder(
     ))
 }
 
-/// Chooses the encoder for `requested` ("software", "auto" or an encoder name). Hardware
-/// encoders need a D3D11 device and NV12 textures, which the export engine does not create yet,
-/// so hardware choices fall back to the software encoder with a warning.
+/// The encoder to try first and the software encoder to fall back to if the first one fails.
+struct Chosen {
+    desc: EncoderDescriptor,
+    codec: Codec,
+    /// Software encoder for the same codec, used when a hardware encoder cannot be opened or
+    /// fails on its first frame. None for software choices.
+    fallback: Option<EncoderDescriptor>,
+}
+
+/// Chooses the encoder for `requested` ("software", "auto" or an encoder name). Hardware encoders
+/// are fed D3D11 NV12 textures (see `gpuenc`); `fallback` carries the software encoder to use if
+/// the hardware path fails at run time.
 fn choose_encoder(
     codec: Codec,
     requested: &str,
     warnings: &mut Vec<String>,
-) -> Result<(EncoderDescriptor, Codec), RenderError> {
+) -> Result<Chosen, RenderError> {
     clipcheck_hwenc::mf_startup().map_err(enc_err)?;
+    let software_only = |warnings: &mut Vec<String>| {
+        software_encoder(codec, warnings).map(|(desc, codec)| Chosen {
+            desc,
+            codec,
+            fallback: None,
+        })
+    };
+    let hardware = |hw: EncoderDescriptor, list: &[EncoderDescriptor]| Chosen {
+        fallback: list.iter().find(|d| !d.hardware).cloned(),
+        desc: hw,
+        codec,
+    };
     match requested {
-        "software" => software_encoder(codec, warnings),
+        "software" => software_only(warnings),
         "auto" => {
             let list = clipcheck_hwenc::enumerate(codec).map_err(enc_err)?;
-            let software = software_encoder(codec, warnings)?;
-            if let Some(hw) = list.iter().find(|d| d.hardware) {
-                warnings.push(format!(
-                    "Hardware encoder {} is not wired into the export engine yet; exporting with {}",
-                    hw.name, software.0.name
-                ));
+            match list.iter().find(|d| d.hardware).cloned() {
+                Some(hw) => Ok(hardware(hw, &list)),
+                None => software_only(warnings),
             }
-            Ok(software)
         }
         name => {
             let list = clipcheck_hwenc::enumerate(codec).map_err(enc_err)?;
-            match list.into_iter().find(|d| d.name == name) {
-                Some(d) if !d.hardware => Ok((d, codec)),
-                Some(d) => {
-                    let software = software_encoder(codec, warnings)?;
-                    warnings.push(format!(
-                        "Hardware encoder {} is not wired into the export engine yet; exporting with {}",
-                        d.name, software.0.name
-                    ));
-                    Ok(software)
-                }
+            match list.iter().find(|d| d.name == name).cloned() {
+                Some(d) if !d.hardware => Ok(Chosen {
+                    desc: d,
+                    codec,
+                    fallback: None,
+                }),
+                Some(d) => Ok(hardware(d, &list)),
                 None => {
-                    let software = software_encoder(codec, warnings)?;
+                    let chosen = software_only(warnings)?;
                     warnings.push(format!(
                         "Encoder {name} was not found; exporting with {}",
-                        software.0.name
+                        chosen.desc.name
                     ));
-                    Ok(software)
+                    Ok(chosen)
                 }
             }
         }
@@ -497,6 +546,8 @@ struct Job<'a> {
     cfg: PipelineConfig,
     ctl: &'a JobControl,
     desc: EncoderDescriptor,
+    /// Software encoder for the same codec, tried if `desc` is hardware and fails.
+    fallback: Option<EncoderDescriptor>,
     codec: Codec,
     width: u32,
     height: u32,
@@ -507,31 +558,45 @@ struct Job<'a> {
     audio_kbps: u32,
 }
 
-/// Runs one full encode into `part` (a flat faststart MP4) and returns its size.
+/// Result of one encode pass.
+struct PassResult {
+    bytes: u64,
+    /// Name of the encoder that produced the video.
+    encoder: String,
+    hardware: bool,
+}
+
+/// Runs one full encode into `part` (a flat faststart MP4). `allow_hw` is cleared when the
+/// hardware encoder failed so later passes go straight to the software encoder.
+#[allow(clippy::too_many_arguments)]
 fn encode_pass(
     job: &Job<'_>,
     rate: RateControl,
     pass_dir: &Path,
     part: &Path,
     map: ProgressMap,
+    allow_hw: &mut bool,
     on_progress: &mut dyn FnMut(Progress),
     warnings: &mut Vec<String>,
-) -> Result<u64, RenderError> {
+) -> Result<PassResult, RenderError> {
     let _ = fs::remove_dir_all(pass_dir);
     fs::create_dir_all(pass_dir).map_err(|e| io_out("create pass dir", e))?;
     let _ = fs::remove_file(part);
 
-    let enc_cfg = VideoEncoderConfig {
+    let base_cfg = VideoEncoderConfig {
         codec: job.codec,
         width: job.width,
         height: job.height,
         fps: job.fps_int,
         rate,
         gop_frames: job.fps_int.saturating_mul(2).max(1),
-        quality_vs_speed: QUALITY_VS_SPEED,
+        quality_vs_speed: QUALITY_VS_SPEED_SW,
         low_latency: false,
     };
-    let enc = clipcheck_hwenc::open(&job.desc, None, &enc_cfg).map_err(enc_err)?;
+    let (primary, fallback) = match (&job.fallback, *allow_hw) {
+        (Some(sw), false) => (sw.clone(), None),
+        (fb, _) => (job.desc.clone(), fb.clone()),
+    };
 
     let mut aacs = Vec::with_capacity(job.audio_tracks);
     let mut specs = Vec::with_capacity(job.audio_tracks);
@@ -562,19 +627,20 @@ fn encode_pass(
     })
     .map_err(mp4_err)?;
 
-    let tracks = job.audio_tracks;
-    let mut sink = EncodeSink {
-        enc,
-        muxer,
+    let mut sink = EncodeSink::start(
+        ThreadSetup {
+            primary,
+            fallback,
+            base_cfg,
+            muxer,
+            tracks: job.audio_tracks,
+            fps: job.fps,
+            width: job.width,
+            height: job.height,
+        },
         aacs,
-        queues: (0..tracks).map(|_| VecDeque::new()).collect(),
-        audio_frames: vec![0; tracks],
-        fps: job.fps,
-        sample_rate: job.sample_rate,
-        width: job.width,
-        height: job.height,
-        nv12: Vec::new(),
-    };
+        job.sample_rate,
+    )?;
     let mut video = MfVideoProvider::new(job.project);
     let mut audio = MfAudioProvider::new(job.project);
     let mut titles = GdiTitleProvider;
@@ -596,8 +662,12 @@ fn encode_pass(
     )?;
     warnings.extend(report.warnings);
 
-    let segments = sink.finish()?;
-    if segments.is_empty() {
+    let done = sink.finish()?;
+    warnings.extend(done.warnings);
+    if done.fell_back {
+        *allow_hw = false;
+    }
+    if done.segments.is_empty() {
         return Err(RenderError::Encode(
             "the encoder produced no video".to_string(),
         ));
@@ -605,12 +675,16 @@ fn encode_pass(
     if job.ctl.is_cancelled() {
         return Err(RenderError::Cancelled);
     }
-    concat_remux(&segments, part, &RemuxOptions::default()).map_err(mp4_err)?;
+    concat_remux(&done.segments, part, &RemuxOptions::default()).map_err(mp4_err)?;
     let _ = fs::remove_dir_all(pass_dir);
     let bytes = fs::metadata(part)
         .map_err(|e| io_out("stat output", e))?
         .len();
-    Ok(bytes)
+    Ok(PassResult {
+        bytes,
+        encoder: done.encoder,
+        hardware: done.hardware,
+    })
 }
 
 /// Maps one pass's own progress (0..=100) into the overall job percent: the job is
@@ -671,24 +745,162 @@ fn wait_while_paused(
     Ok(())
 }
 
-/// Receives composed frames and mixed audio; encodes, muxes and flushes at the end.
-struct EncodeSink {
-    enc: Box<dyn VideoEncoder>,
-    muxer: SegmentMuxer,
-    aacs: Vec<AacEncoder>,
-    /// Encoded audio waiting to be interleaved, per track.
-    queues: Vec<VecDeque<AudioPacket>>,
-    /// Samples per channel pushed so far, per track.
-    audio_frames: Vec<u64>,
-    fps: Rate,
-    sample_rate: u32,
-    width: u32,
-    height: u32,
-    /// Reused NV12 buffer.
-    nv12: Vec<u8>,
+/// Messages from the pipeline thread to the encoder thread.
+enum Msg {
+    /// A composed frame.
+    Video { index: u64, frame: Frame },
+    /// Encoded audio packets of one track.
+    Audio {
+        track: usize,
+        packets: Vec<AudioPacket>,
+    },
+    /// No more input: flush and finish.
+    End,
 }
 
-impl EncodeSink {
+/// Messages in flight between the pipeline and the encoder thread.
+const CHANNEL_DEPTH: usize = 6;
+
+/// What the encoder thread reports when it finishes.
+struct ThreadDone {
+    segments: Vec<PathBuf>,
+    /// Name of the encoder that produced the video.
+    encoder: String,
+    hardware: bool,
+    /// True when the hardware encoder failed and the software fallback took over.
+    fell_back: bool,
+    warnings: Vec<String>,
+}
+
+/// Everything the encoder thread needs.
+struct ThreadSetup {
+    primary: EncoderDescriptor,
+    fallback: Option<EncoderDescriptor>,
+    base_cfg: VideoEncoderConfig,
+    muxer: SegmentMuxer,
+    tracks: usize,
+    fps: Rate,
+    width: u32,
+    height: u32,
+}
+
+/// Video encoder plus its input path.
+struct VideoPath {
+    enc: Box<dyn VideoEncoder>,
+    gpu: Option<GpuUploader>,
+    desc: EncoderDescriptor,
+}
+
+/// Opens `desc` for `base_cfg` with the quality/speed hint suited to its kind.
+fn open_video(
+    desc: &EncoderDescriptor,
+    base_cfg: &VideoEncoderConfig,
+) -> Result<VideoPath, RenderError> {
+    let cfg = VideoEncoderConfig {
+        quality_vs_speed: if desc.hardware {
+            QUALITY_VS_SPEED_HW
+        } else {
+            QUALITY_VS_SPEED_SW
+        },
+        ..*base_cfg
+    };
+    if desc.hardware {
+        let gpu = GpuUploader::new(desc.vendor, cfg.width, cfg.height)?;
+        let enc = clipcheck_hwenc::open(desc, Some(gpu.device()), &cfg).map_err(enc_err)?;
+        Ok(VideoPath {
+            enc,
+            gpu: Some(gpu),
+            desc: desc.clone(),
+        })
+    } else {
+        let enc = clipcheck_hwenc::open(desc, None, &cfg).map_err(enc_err)?;
+        Ok(VideoPath {
+            enc,
+            gpu: None,
+            desc: desc.clone(),
+        })
+    }
+}
+
+/// Runs on the encoder thread: encodes frames, interleaves audio and muxes.
+struct Worker {
+    path: VideoPath,
+    fallback: Option<EncoderDescriptor>,
+    base_cfg: VideoEncoderConfig,
+    muxer: SegmentMuxer,
+    /// Encoded audio waiting to be interleaved, per track.
+    queues: Vec<VecDeque<AudioPacket>>,
+    fps: Rate,
+    nv12: Vec<u8>,
+    frames: u64,
+    fell_back: bool,
+    warnings: Vec<String>,
+}
+
+impl Worker {
+    /// Switches to the software fallback after a hardware failure, or returns `err` when there is
+    /// none (or the software encoder is already in use).
+    fn switch_to_fallback(&mut self, err: RenderError) -> Result<(), RenderError> {
+        let Some(sw) = self.fallback.take() else {
+            return Err(err);
+        };
+        if !self.path.desc.hardware {
+            return Err(err);
+        }
+        self.warnings.push(format!(
+            "Hardware encoder {} failed ({err}); exporting with {}",
+            self.path.desc.name, sw.name
+        ));
+        self.path = open_video(&sw, &self.base_cfg)?;
+        self.fell_back = true;
+        Ok(())
+    }
+
+    /// Encodes one frame with the current encoder.
+    fn encode_one(&mut self, frame: &Frame, index: u64) -> Result<Vec<EncodedPacket>, RenderError> {
+        let pts = frame_pts(index, self.fps);
+        let force = index == 0;
+        match &mut self.path.gpu {
+            Some(gpu) => {
+                let tex = gpu.upload(&frame.bgra)?;
+                self.path
+                    .enc
+                    .encode(InputFrame::Texture(tex), pts, force)
+                    .map_err(enc_err)
+            }
+            None => {
+                nv12::bgra_to_nv12(frame, &mut self.nv12);
+                self.path
+                    .enc
+                    .encode(
+                        InputFrame::Nv12 {
+                            data: &self.nv12,
+                            width: frame.width,
+                            height: frame.height,
+                        },
+                        pts,
+                        force,
+                    )
+                    .map_err(enc_err)
+            }
+        }
+    }
+
+    fn video(&mut self, frame: &Frame, index: u64) -> Result<(), RenderError> {
+        let result = self.encode_one(frame, index);
+        let packets = match result {
+            Ok(p) => p,
+            // Only the first frame may fall back: nothing has been written yet.
+            Err(e) if self.frames == 0 => {
+                self.switch_to_fallback(e)?;
+                self.encode_one(frame, index)?
+            }
+            Err(e) => return Err(e),
+        };
+        self.frames += 1;
+        self.mux_video(packets)
+    }
+
     /// Muxes encoder packets, writing audio that is due before each video packet first.
     fn mux_video(&mut self, packets: Vec<EncodedPacket>) -> Result<(), RenderError> {
         for p in packets {
@@ -720,18 +932,181 @@ impl EncodeSink {
         Ok(())
     }
 
-    /// Flushes encoders, writes the remaining audio and finishes the segments.
-    fn finish(mut self) -> Result<Vec<PathBuf>, RenderError> {
-        let rest = self.enc.flush().map_err(enc_err)?;
+    fn finish(mut self) -> Result<ThreadDone, RenderError> {
+        let rest = self.path.enc.flush().map_err(enc_err)?;
         self.mux_video(rest)?;
-        for (k, aac) in self.aacs.iter_mut().enumerate() {
-            let packets = aac.flush().map_err(aac_err)?;
-            if let Some(q) = self.queues.get_mut(k) {
-                q.extend(packets.into_iter().map(to_audio_packet));
+        self.drain_audio(i64::MAX)?;
+        let segments = self.muxer.finish().map_err(mp4_err)?;
+        Ok(ThreadDone {
+            segments,
+            encoder: self.path.desc.name.clone(),
+            hardware: self.path.desc.hardware,
+            fell_back: self.fell_back,
+            warnings: self.warnings,
+        })
+    }
+}
+
+/// The encoder thread body. Returns Err(Cancelled) when the sender went away without `End`.
+fn encoder_thread(
+    setup: ThreadSetup,
+    rx: Receiver<Msg>,
+    free_tx: Sender<Vec<u8>>,
+) -> Result<ThreadDone, RenderError> {
+    let _com = crate::sources::ComGuard::enter();
+    let ThreadSetup {
+        primary,
+        fallback,
+        base_cfg,
+        muxer,
+        tracks,
+        fps,
+        width,
+        height,
+    } = setup;
+    let _ = (width, height);
+    let mut warnings = Vec::new();
+    let mut fell_back = false;
+    let mut fallback = fallback;
+    let path = match open_video(&primary, &base_cfg) {
+        Ok(p) => p,
+        Err(e) => match fallback.take() {
+            Some(sw) if primary.hardware => {
+                warnings.push(format!(
+                    "Hardware encoder {} could not be opened ({e}); exporting with {}",
+                    primary.name, sw.name
+                ));
+                fell_back = true;
+                open_video(&sw, &base_cfg)?
+            }
+            _ => return Err(e),
+        },
+    };
+    let mut worker = Worker {
+        path,
+        fallback,
+        base_cfg,
+        muxer,
+        queues: (0..tracks).map(|_| VecDeque::new()).collect(),
+        fps,
+        nv12: Vec::new(),
+        frames: 0,
+        fell_back,
+        warnings,
+    };
+    loop {
+        match rx.recv() {
+            Ok(Msg::Video { index, frame }) => {
+                worker.video(&frame, index)?;
+                let _ = free_tx.send(frame.bgra);
+            }
+            Ok(Msg::Audio { track, packets }) => {
+                if let Some(q) = worker.queues.get_mut(track) {
+                    q.extend(packets);
+                }
+            }
+            Ok(Msg::End) => return worker.finish(),
+            Err(_) => return Err(RenderError::Cancelled),
+        }
+    }
+}
+
+/// Receives composed frames and mixed audio on the pipeline thread. Video is handed to a
+/// dedicated encoder thread (which also muxes) so compose and encode overlap; AAC runs here.
+struct EncodeSink {
+    tx: Option<SyncSender<Msg>>,
+    handle: Option<JoinHandle<Result<ThreadDone, RenderError>>>,
+    free_rx: Receiver<Vec<u8>>,
+    aacs: Vec<AacEncoder>,
+    /// Samples per channel pushed so far, per track.
+    audio_frames: Vec<u64>,
+    sample_rate: u32,
+    width: u32,
+    height: u32,
+}
+
+impl EncodeSink {
+    /// Spawns the encoder thread.
+    fn start(
+        setup: ThreadSetup,
+        aacs: Vec<AacEncoder>,
+        sample_rate: u32,
+    ) -> Result<Self, RenderError> {
+        let (tx, rx) = sync_channel(CHANNEL_DEPTH);
+        let (free_tx, free_rx) = std::sync::mpsc::channel();
+        let (width, height) = (setup.width, setup.height);
+        let tracks = aacs.len();
+        let handle = std::thread::Builder::new()
+            .name("export-encoder".to_string())
+            .spawn(move || encoder_thread(setup, rx, free_tx))
+            .map_err(|e| io_out("spawn encoder thread", e))?;
+        Ok(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+            free_rx,
+            aacs,
+            audio_frames: vec![0; tracks],
+            sample_rate,
+            width,
+            height,
+        })
+    }
+
+    /// Sends a message; when the encoder thread is gone, returns the error it ended with.
+    fn send(&mut self, msg: Msg) -> Result<(), RenderError> {
+        let sent = self.tx.as_ref().is_some_and(|tx| tx.send(msg).is_ok());
+        if sent {
+            Ok(())
+        } else {
+            Err(self.thread_error())
+        }
+    }
+
+    /// Joins the encoder thread and returns why it stopped.
+    fn thread_error(&mut self) -> RenderError {
+        self.tx = None;
+        match self.handle.take() {
+            Some(h) => match h.join() {
+                Ok(Err(e)) => e,
+                Ok(Ok(_)) => RenderError::Encode("the encoder thread ended early".to_string()),
+                Err(_) => RenderError::Encode("the encoder thread panicked".to_string()),
+            },
+            None => RenderError::Encode("the encoder thread is gone".to_string()),
+        }
+    }
+
+    /// Flushes AAC, tells the encoder thread to finish and returns its result.
+    fn finish(mut self) -> Result<ThreadDone, RenderError> {
+        for k in 0..self.aacs.len() {
+            let packets = match self.aacs.get_mut(k) {
+                Some(aac) => aac.flush().map_err(aac_err)?,
+                None => continue,
+            };
+            if !packets.is_empty() {
+                let packets = packets.into_iter().map(to_audio_packet).collect();
+                self.send(Msg::Audio { track: k, packets })?;
             }
         }
-        self.drain_audio(i64::MAX)?;
-        self.muxer.finish().map_err(mp4_err)
+        self.send(Msg::End)?;
+        self.tx = None;
+        match self.handle.take() {
+            Some(h) => h
+                .join()
+                .map_err(|_| RenderError::Encode("the encoder thread panicked".to_string()))?,
+            None => Err(RenderError::Encode(
+                "the encoder thread is gone".to_string(),
+            )),
+        }
+    }
+}
+
+impl Drop for EncodeSink {
+    fn drop(&mut self) {
+        // Closing the channel ends the thread; wait for it so its files are released.
+        self.tx = None;
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -743,21 +1118,17 @@ impl Sink for EncodeSink {
                 frame.width, frame.height, self.width, self.height
             )));
         }
-        bgra_to_nv12(frame, &mut self.nv12);
-        let pts = frame_pts(index, self.fps);
-        let packets = self
-            .enc
-            .encode(
-                InputFrame::Nv12 {
-                    data: &self.nv12,
-                    width: self.width,
-                    height: self.height,
-                },
-                pts,
-                index == 0,
-            )
-            .map_err(enc_err)?;
-        self.mux_video(packets)
+        let mut bgra = self.free_rx.try_recv().unwrap_or_default();
+        bgra.clear();
+        bgra.extend_from_slice(&frame.bgra);
+        self.send(Msg::Video {
+            index,
+            frame: Frame {
+                width: frame.width,
+                height: frame.height,
+                bgra,
+            },
+        })
     }
 
     fn audio(&mut self, track: usize, samples: &[f32]) -> Result<(), RenderError> {
@@ -772,10 +1143,11 @@ impl Sink for EncodeSink {
         if let Some(n) = self.audio_frames.get_mut(track) {
             *n = n.saturating_add((samples.len() / 2) as u64);
         }
-        if let Some(q) = self.queues.get_mut(track) {
-            q.extend(packets.into_iter().map(to_audio_packet));
+        if packets.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let packets = packets.into_iter().map(to_audio_packet).collect();
+        self.send(Msg::Audio { track, packets })
     }
 }
 
@@ -798,48 +1170,6 @@ fn to_audio_packet(p: clipcheck_aacenc::AacPacket) -> AudioPacket {
         data: p.data,
         pts: p.pts,
         samples: p.samples,
-    }
-}
-
-/// Converts a BGRA frame to NV12 (BT.601, limited range) in `out`. Width and height are even.
-fn bgra_to_nv12(frame: &Frame, out: &mut Vec<u8>) {
-    let w = frame.width as usize;
-    let h = frame.height as usize;
-    out.clear();
-    out.resize(w * h + w * h / 2, 0);
-    let (luma, chroma) = out.split_at_mut(w * h);
-    for by in 0..h / 2 {
-        for bx in 0..w / 2 {
-            let mut sum_r = 0i32;
-            let mut sum_g = 0i32;
-            let mut sum_b = 0i32;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    let x = bx * 2 + dx;
-                    let y = by * 2 + dy;
-                    let Some([b, g, r, _]) = frame.pixel(x as u32, y as u32) else {
-                        continue;
-                    };
-                    let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
-                    sum_r += r;
-                    sum_g += g;
-                    sum_b += b;
-                    if let Some(dst) = luma.get_mut(y * w + x) {
-                        *dst = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(0, 255) as u8;
-                    }
-                }
-            }
-            let (r, g, b) = (sum_r / 4, sum_g / 4, sum_b / 4);
-            let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-            let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(0, 255) as u8;
-            let at = by * w + bx * 2;
-            if let Some(dst) = chroma.get_mut(at) {
-                *dst = u;
-            }
-            if let Some(dst) = chroma.get_mut(at + 1) {
-                *dst = v;
-            }
-        }
     }
 }
 

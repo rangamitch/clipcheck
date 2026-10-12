@@ -17,8 +17,13 @@ clipcheck-hwenc = { path = "../hwenc" }
 clipcheck-aacenc = { path = "../aacenc" }
 clipcheck-mp4 = { path = "../mp4" }
 clipcheck-util = { path = "../util" }
+clipcheck-gpuconv = { path = "../gpuconv" }
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
     "Win32_System_Com",

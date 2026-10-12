@@ -21,11 +21,14 @@ pub mod dsp;
 pub mod error;
 pub mod frame;
 pub mod job;
+pub mod nv12;
 pub mod pipeline;
 pub mod reference;
 
 #[cfg(windows)]
 pub mod engine;
+#[cfg(windows)]
+pub mod gpuenc;
 #[cfg(windows)]
 pub mod smart;
 #[cfg(windows)]
