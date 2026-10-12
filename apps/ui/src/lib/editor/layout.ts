@@ -10,7 +10,7 @@ export const RULER_HEIGHT = 28;
 /** Vertical gap between consecutive track rows, px. */
 export const TRACK_GAP = 2;
 /** Pointer distance from a clip edge that still counts as an edge hit, px. */
-export const EDGE_HIT_PX = 6;
+export const EDGE_HIT_PX = 10;
 
 /** Lowest gain shown on an audio clip's envelope, dB (same mapping as drawClips.ts). */
 export const ENVELOPE_DB_MIN = -60;
@@ -69,6 +69,10 @@ export interface HitResult {
   clipId?: string;
   trackId?: string;
   tick?: Tick;
+  /** For `gap`: start of the empty span (end of the previous clip, or 0). */
+  gapStart?: Tick;
+  /** For `gap`: end of the empty span (start of the next clip). Always greater than `gapStart`. */
+  gapEnd?: Tick;
 }
 
 /** Envelope point or gain line under the pointer (see `hitEnvelopePoint`). */
@@ -221,8 +225,12 @@ function betterEdge(c: EdgeCandidate, b: EdgeCandidate, x: number): boolean {
 
 /**
  * Hit test in timeline-area coordinates. See `HitKind` for the result kinds. Edge zones are
- * checked before the clip body. Each zone is at most a quarter of the clip width, so narrow
- * clips stay grabbable on both sides.
+ * checked before the clip body. Each zone is at most a third of the clip width (EDGE_HIT_PX at
+ * most), so the body keeps at least a third of a narrow clip.
+ *
+ * A `gap` is empty track space with a clip starting after it on the same row: from the end of the
+ * previous clip (or tick 0 before the first clip) to the start of the next clip. Empty space with
+ * no clip after it (trailing space) and zero-length spans are `track`.
  */
 export function hitTest(
   project: Project,
@@ -246,7 +254,7 @@ export function hitTest(
   for (const clip of onTrack) {
     const x0 = tickToX(clip.start, view);
     const x1 = tickToX(clip.start + clip.dur, view);
-    const edgePx = Math.min(EDGE_HIT_PX, Math.max(0, x1 - x0) / 4);
+    const edgePx = Math.min(EDGE_HIT_PX, Math.max(0, x1 - x0) / 3);
     const candidates: EdgeCandidate[] = [
       { kind: 'edge-start', clipId: clip.id, dist: Math.abs(x - x0), edgeX: x0 },
       { kind: 'edge-end', clipId: clip.id, dist: Math.abs(x - x1), edgeX: x1 },
@@ -268,12 +276,24 @@ export function hitTest(
     }
   }
 
-  const hasBefore = onTrack.some((c) => c.start + c.dur <= tick);
-  const hasAfter = onTrack.some((c) => c.start >= tick);
-  if (hasBefore && hasAfter) {
-    return { kind: 'gap', trackId: row.trackId, tick };
+  return gapAt(onTrack, row.trackId, tick) ?? { kind: 'track', trackId: row.trackId, tick };
+}
+
+/**
+ * Gap on one track row around `tick`, or null. Null when a clip covers the tick, when no clip
+ * starts after it (nothing to close), or when the span is empty.
+ */
+function gapAt(onTrack: readonly Clip[], trackId: string, tick: Tick): HitResult | null {
+  let gapStart: Tick = 0;
+  let nextStart: Tick | null = null;
+  for (const c of onTrack) {
+    const end = c.start + c.dur;
+    if (c.start <= tick && tick < end) return null;
+    if (end <= tick) gapStart = Math.max(gapStart, end);
+    if (c.start > tick) nextStart = nextStart === null ? c.start : Math.min(nextStart, c.start);
   }
-  return { kind: 'track', trackId: row.trackId, tick };
+  if (nextStart === null || nextStart <= gapStart) return null;
+  return { kind: 'gap', trackId, tick, gapStart, gapEnd: nextStart };
 }
 
 /** Y of a gain in dB inside a clip rectangle (0 dB near the top, -60 dB at the bottom). */

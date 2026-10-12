@@ -119,6 +119,10 @@
   let dropPreview = $state.raw<{ tick: Tick; row: TrackRow | null } | null>(null);
   /** Open context menu, or null. */
   let menu = $state.raw<{ x: number; y: number; items: MenuItem[] } | null>(null);
+  /** Gap picked by a click or right-click (cleared by any other press, a selection, or Escape). */
+  let selectedGap = $state.raw<{ trackId: string; start: Tick; end: Tick } | null>(null);
+  /** Hit under the idle pointer, kept only for edges and gaps (the things a press would act on). */
+  let hover = $state.raw<HitResult | null>(null);
 
   // Plain (non-reactive) pointer bookkeeping for the active press.
   let pointerId = -1;
@@ -209,12 +213,35 @@
     scrollX.set(clampX(get(scrollX) + dir * vpWidth * 0.9));
   }
 
+  /** Edge under the pointer (idle, select tool) or being trimmed, for the cursor and the edge handle. */
+  const hoverEdge = $derived.by((): { clipId: string; edge: 'start' | 'end' } | null => {
+    if (drag !== null) {
+      if (drag.kind === 'trim-start') return { clipId: drag.clipId, edge: 'start' };
+      if (drag.kind === 'trim-end') return { clipId: drag.clipId, edge: 'end' };
+      return null;
+    }
+    if ($tool !== 'select' || hover === null || hover.clipId === undefined) return null;
+    if (hover.kind === 'edge-start') return { clipId: hover.clipId, edge: 'start' };
+    if (hover.kind === 'edge-end') return { clipId: hover.clipId, edge: 'end' };
+    return null;
+  });
+
   const cursorClass = $derived.by(() => {
     if (drag?.kind === 'pan' || $tool === 'hand') return 'pan';
     if (drag?.kind === 'move') return 'moving';
+    if (drag?.kind === 'trim-start' || drag?.kind === 'trim-end') return 'trim';
+    if (drag?.kind === 'roll') return 'roll';
+    if (drag !== null) return '';
     if ($tool === 'razor') return 'razor';
     if ($tool === 'zoom') return 'zoom';
+    if (hoverEdge !== null) return 'trim';
+    if ($tool === 'select' && hover?.kind === 'gap') return 'gap';
     return '';
+  });
+
+  // Any selection change ends the gap selection (a gap is only selected while no clip is).
+  $effect(() => {
+    if ($selection.length > 0) selectedGap = null;
   });
 
   const playX = $derived(tickToX($playhead, view));
@@ -343,6 +370,8 @@
     void $selection;
     void view;
     void frame;
+    void hoverEdge;
+    void selectedGap;
     void assetVersion;
     void dprVersion;
     scheduleDraw();
@@ -421,6 +450,8 @@
       dragGhosts: frame.ghosts,
       marquee: frame.marquee,
       ...(frame.fadePreview ? { fadePreview: frame.fadePreview } : {}),
+      selectedGap,
+      hoverEdge,
       devicePixelRatio: dpr,
       thumbs: getThumbStrip,
       peaks: getPeaks,
@@ -470,6 +501,7 @@
       return;
     }
     const update = updateDrag(state, p, contextFor(current, state));
+    if (state.kind === 'marquee') selectedGap = null;
     drag = update.state;
     frame = {
       ghosts: update.ghosts,
@@ -674,6 +706,8 @@
   }
 
   function onPointerDown(e: PointerEvent): void {
+    // Any press replaces the gap selection; a press on a gap selects that gap again below.
+    selectedGap = null;
     if (isRulerTarget(e)) return;
     const current = proj;
     if (!current || isBusy()) return;
@@ -723,14 +757,78 @@
       if (!pressClipSelection(hit.clipId, e)) return;
     } else if ((hit.kind === 'edge-start' || hit.kind === 'edge-end') && hit.clipId) {
       if (!get(selection).includes(hit.clipId)) selectClips([hit.clipId], 'replace');
+    } else if (hit.kind === 'gap') {
+      selectGap(hit, e);
     }
     const state = beginDrag(hit, p, current, get(selection));
     beginState(state, e, p, state?.kind === 'playhead');
   }
 
+  /** Makes a gap hit the selection: clears the clips unless a modifier adds to them. */
+  function selectGap(hit: HitResult, e: MouseEvent): void {
+    const gap = gapOf(hit);
+    if (gap === null) return;
+    if (!e.shiftKey && !e.ctrlKey && !e.metaKey) selection.set([]);
+    selectedGap = gap;
+  }
+
+  /** Gap span of a `gap` hit, or null when the hit lacks one. */
+  function gapOf(hit: HitResult): { trackId: string; start: Tick; end: Tick } | null {
+    if (hit.kind !== 'gap' || !hit.trackId || hit.gapStart === undefined || hit.gapEnd === undefined) {
+      return null;
+    }
+    return { trackId: hit.trackId, start: hit.gapStart, end: hit.gapEnd };
+  }
+
+  /**
+   * Closes a gap: the clips after it on its track move left. `at` is the gap start, which the
+   * backend accepts as a time inside the gap. Clears the gap selection.
+   */
+  function deleteGap(gap: { trackId: string; start: Tick }): void {
+    selectedGap = null;
+    void dispatch({ type: 'close_gap', track_id: gap.trackId, at: gap.start });
+  }
+
+  /** Delete and Backspace act on a selected gap here, so the global shortcut does not run. */
+  function onViewportKey(e: KeyboardEvent): void {
+    if (selectedGap === null) return;
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      e.preventDefault();
+      e.stopPropagation();
+      deleteGap(selectedGap);
+      return;
+    }
+    if (e.key === 'Escape') selectedGap = null;
+  }
+
+  /**
+   * Idle hover: remembers the edge or gap under the pointer (select tool only) so the cursor and
+   * the edge handle can show what a press will do. Assigns only when the hit changes, so a still
+   * pointer does not redraw.
+   */
+  function updateHover(p: PointerLike): void {
+    const current = proj;
+    let next: HitResult | null = null;
+    if (current && $tool === 'select') {
+      const hit = hitTest(current, rows, view, p.x, p.y);
+      if (hit.kind === 'edge-start' || hit.kind === 'edge-end' || hit.kind === 'gap') next = hit;
+    }
+    if (hoverKey(next) !== hoverKey(hover)) hover = next;
+  }
+
+  function hoverKey(h: HitResult | null): string {
+    if (h === null) return '';
+    return [h.kind, h.clipId ?? '', h.trackId ?? '', h.gapStart ?? '', h.gapEnd ?? ''].join('|');
+  }
+
   function onPointerMove(e: PointerEvent): void {
     const state = drag;
-    if (state === null || e.pointerId !== pointerId) return;
+    if (state === null) {
+      updateHover(pointerLike(e));
+      return;
+    }
+    if (e.pointerId !== pointerId) return;
     const p = pointerLike(e);
     if (!armed) {
       if (Math.hypot(p.x - pressX, p.y - pressY) < DRAG_THRESHOLD_PX) return;
@@ -788,6 +886,9 @@
     const hit = hitTest(current, rows, view, p.x, p.y);
     // Enter the group: select only this clip, without expanding its group.
     if (hit.kind === 'clip' && hit.clipId) selection.set([hit.clipId]);
+    // Double-clicking a gap closes it.
+    const gap = gapOf(hit);
+    if (gap !== null) deleteGap(gap);
   }
 
   /** Clamps `v` into `lo..hi`. */
@@ -992,32 +1093,15 @@
     ];
   }
 
-  function gapMenu(hit: HitResult, trackId: string): MenuItem[] {
-    const at = hit.tick ?? 0;
+  /** Menu for a right-clicked gap: one item, which closes that gap. */
+  function gapMenu(gap: { trackId: string; start: Tick }): MenuItem[] {
     return [
       {
-        label: 'Close gap',
+        label: 'Delete gap',
+        shortcut: 'Delete',
         action: () => {
-          void dispatch({ type: 'close_gap', track_id: trackId, at });
+          deleteGap(gap);
         },
-      },
-      {
-        label: 'Close all gaps on track',
-        action: () => {
-          void dispatch({ type: 'close_all_gaps', track_id: trackId });
-        },
-      },
-      SEPARATOR,
-      {
-        label: 'Paste at playhead',
-        action: () => {
-          void pasteAtPlayhead();
-        },
-      },
-      {
-        label: 'Select all',
-        shortcut: 'Ctrl+A',
-        action: selectAllClips,
       },
     ];
   }
@@ -1101,13 +1185,16 @@
     if (!current) return;
     const p = pointerLike(e);
     const hit = hitTest(current, rows, view, p.x, p.y);
+    const gap = gapOf(hit);
 
     // Within a few px of a clip edge still counts as the clip.
     if ((hit.kind === 'clip' || hit.kind === 'edge-start' || hit.kind === 'edge-end') && hit.clipId) {
       if (!get(selection).includes(hit.clipId)) selectClips([hit.clipId], 'replace');
       openMenu(e, clipMenu(current, hit.clipId));
-    } else if (hit.kind === 'gap' && hit.trackId) {
-      openMenu(e, gapMenu(hit, hit.trackId));
+    } else if (gap !== null) {
+      selection.set([]);
+      selectedGap = gap;
+      openMenu(e, gapMenu(gap));
     } else if (hit.kind === 'ruler') {
       openMenu(e, rulerMenu(hit, current));
     } else if (hit.kind === 'track' && hit.trackId) {
@@ -1274,6 +1361,14 @@
     onpointerup={onPointerUp}
     onpointercancel={onPointerCancel}
     onlostpointercapture={onLostCapture}
+    onpointerleave={() => {
+      if (drag === null) hover = null;
+    }}
+    onkeydown={onViewportKey}
+    onblur={() => {
+      // Keys go elsewhere once focus leaves the viewport, so the gap is no longer selected.
+      selectedGap = null;
+    }}
     oncontextmenu={onContextMenu}
     ondblclick={onDoubleClick}
     ondragover={onDragOver}
@@ -1482,6 +1577,18 @@
 
   .viewport.zoom {
     cursor: zoom-in;
+  }
+
+  .viewport.trim {
+    cursor: ew-resize;
+  }
+
+  .viewport.roll {
+    cursor: col-resize;
+  }
+
+  .viewport.gap {
+    cursor: pointer;
   }
 
   canvas {

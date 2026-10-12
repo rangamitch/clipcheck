@@ -141,6 +141,10 @@ export interface DrawArgs {
   marquee: { x0: number; y0: number; x1: number; y1: number } | null;
   /** Live fade lengths (ticks) of one audio clip while its fade handle is dragged. */
   fadePreview?: { clipId: string; fadeIn: Tick; fadeOut: Tick };
+  /** Gap selected by a click, drawn as a highlighted span on its track row. */
+  selectedGap?: { trackId: string; start: Tick; end: Tick } | null;
+  /** Clip edge under the pointer while idle (trim affordance), drawn as a light bar. */
+  hoverEdge?: { clipId: string; edge: 'start' | 'end' } | null;
   devicePixelRatio: number;
   thumbs: (mediaId: string) => unknown;
   peaks: (mediaId: string, stream: number) => Float32Array | null;
@@ -690,6 +694,39 @@ function drawGhosts(ctx: CanvasRenderingContext2D, ghosts: DrawArgs['dragGhosts'
   }
 }
 
+/** Width of the hovered-edge handle bar, px. */
+const EDGE_HANDLE_PX = 3;
+
+/** Light bar at the hovered clip edge, so the trim affordance is visible before pressing. */
+function drawEdgeHandle(ctx: CanvasRenderingContext2D, hover: NonNullable<DrawArgs['hoverEdge']>, args: DrawArgs): void {
+  const clip = args.project.clips.find((c) => c.id === hover.clipId);
+  if (!clip) return;
+  const rect = clipRect(clip, args.rows, args.view);
+  if (!rect) return;
+  const x = hover.edge === 'start' ? rect.x : rect.x + rect.w - EDGE_HANDLE_PX;
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.fillRect(x, rect.y + 1, EDGE_HANDLE_PX, Math.max(0, rect.h - 2));
+}
+
+/**
+ * Selected gap: a translucent accent fill across the track row between its two clip edges, with a
+ * dashed outline. Spans on rows that are not drawn (scrolled out) fall outside the clip area.
+ */
+function drawSelectedGap(ctx: CanvasRenderingContext2D, gap: NonNullable<DrawArgs['selectedGap']>, args: DrawArgs): void {
+  const row = args.rows.find((r) => r.trackId === gap.trackId);
+  if (!row) return;
+  const x0 = tickToX(gap.start, args.view);
+  const x1 = tickToX(gap.end, args.view);
+  const w = Math.max(0, x1 - x0);
+  ctx.fillStyle = 'rgba(237, 28, 36, 0.18)';
+  ctx.fillRect(x0, row.top, w, row.height);
+  ctx.strokeStyle = ACCENT;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 3]);
+  ctx.strokeRect(x0 + 0.5, row.top + 0.5, Math.max(0, w - 1), Math.max(0, row.height - 1));
+  ctx.setLineDash([]);
+}
+
 /** Rubber-band selection rectangle, normalised so any drag direction works. */
 function drawMarquee(ctx: CanvasRenderingContext2D, m: NonNullable<DrawArgs['marquee']>): void {
   const x = Math.min(m.x0, m.x1);
@@ -750,6 +787,12 @@ export function drawTimeline(ctx: CanvasRenderingContext2D, args: DrawArgs): voi
   }
 
   drawGroupBrackets(ctx, project, rows, view);
+  if (args.selectedGap) {
+    drawSelectedGap(ctx, args.selectedGap, args);
+  }
+  if (args.hoverEdge) {
+    drawEdgeHandle(ctx, args.hoverEdge, args);
+  }
   drawMarkers(ctx, project, view, height);
   if (args.snapTick !== null) {
     drawSnap(ctx, args.snapTick, view, height);
