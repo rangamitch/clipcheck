@@ -185,13 +185,22 @@ export function trackLayout(project: Project, scrollY: number): TrackRow[] {
   return rows;
 }
 
+/**
+ * Horizontal span of a clip in the track area: the drawn span, so the 2 px minimum width of
+ * `clipRect` applies here too (a zoomed-out clip is as wide to the pointer as it is on screen).
+ */
+function clipSpanX(clip: Clip, view: View): { x0: number; x1: number } {
+  const x0 = tickToX(clip.start, view);
+  const w = Math.max(MIN_CLIP_WIDTH_PX, (clip.dur / TICKS_PER_SECOND) * safePxPerSec(view));
+  return { x0, x1: x0 + w };
+}
+
 /** Rectangle of a clip on its track row, or null when the track has no row. */
 export function clipRect(clip: Clip, rows: readonly TrackRow[], view: View): ClipRect | null {
   const row = rows.find((r) => r.trackId === clip.track_id);
   if (!row) return null;
-  const x = tickToX(clip.start, view);
-  const w = Math.max(MIN_CLIP_WIDTH_PX, (clip.dur / TICKS_PER_SECOND) * safePxPerSec(view));
-  return { x, y: row.top, w, h: row.height };
+  const { x0, x1 } = clipSpanX(clip, view);
+  return { x: x0, y: row.top, w: x1 - x0, h: row.height };
 }
 
 /** Row whose area (including the gap below it) contains y, or undefined. */
@@ -252,8 +261,7 @@ export function hitTest(
 
   let best: EdgeCandidate | null = null;
   for (const clip of onTrack) {
-    const x0 = tickToX(clip.start, view);
-    const x1 = tickToX(clip.start + clip.dur, view);
+    const { x0, x1 } = clipSpanX(clip, view);
     const edgePx = Math.min(EDGE_HIT_PX, Math.max(0, x1 - x0) / 3);
     const candidates: EdgeCandidate[] = [
       { kind: 'edge-start', clipId: clip.id, dist: Math.abs(x - x0), edgeX: x0 },
@@ -269,8 +277,7 @@ export function hitTest(
   }
 
   for (const clip of onTrack) {
-    const x0 = tickToX(clip.start, view);
-    const x1 = tickToX(clip.start + clip.dur, view);
+    const { x0, x1 } = clipSpanX(clip, view);
     if (x >= x0 && x <= x1) {
       return { kind: 'clip', clipId: clip.id, trackId: row.trackId, tick };
     }
@@ -332,7 +339,9 @@ export function hitEnvelopePoint(
   view: View,
   x: number,
   y: number,
+  selectedIds?: readonly string[],
 ): EnvelopeHit | null {
+  const selected = selectedIds === undefined ? null : new Set(selectedIds);
   for (const clip of project.clips) {
     if (clip.kind !== 'audio' || clip.dur <= 0) continue;
     const track = project.tracks.find((t) => t.id === clip.track_id);
@@ -380,7 +389,9 @@ export function hitEnvelopePoint(
       if (!a || !b) continue;
       lineDist = Math.min(lineDist, distToSegment(x, y, a.x, a.y, b.x, b.y));
     }
-    if (lineDist <= ENVELOPE_HIT_PX) {
+    // A gain-line hit (no point) counts only on selected clips when a selection is given, so a
+    // press near the line of an unselected clip still selects and moves that clip.
+    if (lineDist <= ENVELOPE_HIT_PX && (selected === null || selected.has(clip.id))) {
       const frac = clampNum((x - rect.x) / rect.w, 0, 1);
       return {
         clipId: clip.id,
@@ -435,7 +446,8 @@ export function dragMoveTarget(
 ): DragMoveTarget {
   const pps = safePxPerSec(view);
   const grab = project.clips.find((c) => c.id === grabClipId);
-  const moved = project.clips.filter((c) => clipIds.includes(c.id));
+  const movedIds = new Set(clipIds);
+  const moved = project.clips.filter((c) => movedIds.has(c.id));
 
   let delta = Math.round((dx / pps) * TICKS_PER_SECOND);
   if (moved.length > 0) {
@@ -527,8 +539,9 @@ export function snapTargets(
     { time: 0, kind: 'start' },
     { time: playhead, kind: 'playhead' },
   ];
+  const excluded = new Set(excludeIds);
   for (const clip of project.clips) {
-    if (!clip.enabled || excludeIds.includes(clip.id)) continue;
+    if (!clip.enabled || excluded.has(clip.id)) continue;
     targets.push({ time: clip.start, kind: 'clip-start' });
     targets.push({ time: clip.start + clip.dur, kind: 'clip-end' });
   }

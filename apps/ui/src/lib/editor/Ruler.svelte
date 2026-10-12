@@ -11,7 +11,7 @@
     xToTick,
     type View,
   } from './layout';
-  import { ACCENT, readPalette } from './drawClips';
+  import { readPalette } from './drawClips';
   import { TICKS_PER_SECOND, clampTick, clipEnd, frameDurationTicks } from './ticks';
   import type { Marker, Project, Tick, WorkArea } from './types';
 
@@ -88,20 +88,22 @@
     return { start: frameFloor(Math.min(a, b)), end: frameCeil(Math.max(a, b)) };
   }
 
+  /**
+   * Playhead x in CSS px, from the store. Only the DOM handle below reads it, so playback repaints
+   * the handle and not the canvas.
+   */
+  const headX = $derived(Math.round(tickToX($playhead, view)));
+
+  // Ticks, labels, work area and markers redraw on zoom, scroll, resize, project or work area
+  // changes. The canvas effect must not read `$playhead`, or every playback frame repaints it.
   $effect(() => {
     const c = canvas;
     if (!c) return;
-    draw(c, view, project, areaPreview, $playhead);
+    draw(c, view, project, areaPreview);
   });
 
-  /** Draws the whole ruler into `c` for the given view and state. */
-  function draw(
-    c: HTMLCanvasElement,
-    v: View,
-    p: Project,
-    preview: WorkArea | null,
-    head: Tick,
-  ): void {
+  /** Draws the ruler (not the playhead handle) into `c` for the given view and state. */
+  function draw(c: HTMLCanvasElement, v: View, p: Project, preview: WorkArea | null): void {
     const width = Math.max(0, v.width);
     const dpr = typeof window !== 'undefined' && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
     // Assigning width or height resets the bitmap, so only do it when the size changed.
@@ -123,7 +125,6 @@
     drawWorkArea(ctx, preview ?? p.work_area, v, width);
     drawTicks(ctx, v, width, palette.textDim);
     drawMarkers(ctx, p.markers, v, width);
-    drawPlayheadHandle(ctx, head, v, width);
   }
 
   /** Work area band with bright end bars. */
@@ -197,30 +198,6 @@
       ctx.closePath();
       ctx.fill();
     }
-  }
-
-  /** Playhead: accent triangle on top and a line down the ruler. */
-  function drawPlayheadHandle(
-    ctx: CanvasRenderingContext2D,
-    head: Tick,
-    v: View,
-    width: number,
-  ): void {
-    const x = Math.round(tickToX(head, v)) + 0.5;
-    if (x < -6 || x > width + 6) return;
-    ctx.strokeStyle = ACCENT;
-    ctx.fillStyle = ACCENT;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(x - 6, 0);
-    ctx.lineTo(x + 6, 0);
-    ctx.lineTo(x, 8);
-    ctx.closePath();
-    ctx.fill();
-    ctx.beginPath();
-    ctx.moveTo(x, 8);
-    ctx.lineTo(x, RULER_HEIGHT);
-    ctx.stroke();
   }
 
   /** Pointer position relative to the canvas, in CSS px. */
@@ -377,24 +354,61 @@
   }
 </script>
 
-<canvas
-  bind:this={canvas}
-  class="ruler"
-  aria-label="Timeline ruler. Click or drag to move the playhead. Drag the ends of the highlighted band to set the work area, or Alt-drag (Shift-drag) on empty ruler to create one. Double click a marker flag to remove it."
-  onpointerdown={onPointerDown}
-  onpointermove={onPointerMove}
-  onpointerup={onPointerUp}
-  onpointercancel={onPointerUp}
-  onlostpointercapture={onLostCapture}
-  ondblclick={onDoubleClick}
-></canvas>
+<div class="ruler-wrap" style="width: {Math.max(0, view.width)}px; height: {RULER_HEIGHT}px">
+  <canvas
+    bind:this={canvas}
+    class="ruler"
+    aria-label="Timeline ruler. Click or drag to move the playhead. Drag the ends of the highlighted band to set the work area, or Alt-drag (Shift-drag) on empty ruler to create one. Double click a marker flag to remove it."
+    onpointerdown={onPointerDown}
+    onpointermove={onPointerMove}
+    onpointerup={onPointerUp}
+    onpointercancel={onPointerUp}
+    onlostpointercapture={onLostCapture}
+    ondblclick={onDoubleClick}
+  ></canvas>
+  <!-- Playhead handle: a DOM element moved with transform, so playback does not repaint the canvas. -->
+  <div class="playhead-handle" style="transform: translateX({headX - 6}px)" aria-hidden="true"></div>
+</div>
 
 <style>
+  .ruler-wrap {
+    position: relative;
+    overflow: hidden;
+  }
   .ruler {
     display: block;
     box-sizing: border-box;
     touch-action: none;
     cursor: default;
     border-bottom: 1px solid var(--border);
+  }
+  /* Accent colour as in drawClips.ts (ACCENT). The handle is 12 px wide, its apex at its centre. */
+  .playhead-handle {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 12px;
+    height: 100%;
+    pointer-events: none;
+    will-change: transform;
+  }
+  .playhead-handle::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 12px;
+    height: 8px;
+    background: #ed1c24;
+    clip-path: polygon(0 0, 100% 0, 50% 100%);
+  }
+  .playhead-handle::after {
+    content: '';
+    position: absolute;
+    left: 5.25px;
+    top: 8px;
+    bottom: 0;
+    width: 1.5px;
+    background: #ed1c24;
   }
 </style>

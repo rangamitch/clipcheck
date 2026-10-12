@@ -14,7 +14,14 @@ const api = vi.hoisted(() => ({
 
 vi.mock('./api', () => ({ editorApi: api }));
 
-import { cancelDragRequest, loopInOut, runAction, shuttleRate, sourceRequest, type ActionContext } from './actions';
+import {
+  loopInOut,
+  runAction,
+  setDragCanceller,
+  shuttleRate,
+  sourceRequest,
+  type ActionContext,
+} from './actions';
 import {
   closeEditor,
   dispatch,
@@ -456,10 +463,24 @@ describe('tools and view', () => {
     expect(get(selection)).toEqual([]);
   });
 
-  it('escape bumps the drag-cancel counter so an active drag is cancelled', () => {
-    const before = get(cancelDragRequest);
+  it('escape cancels the active drag and keeps the selection', () => {
+    const cancel = vi.fn(() => true);
+    setDragCanceller(cancel);
+    selection.set(['a', 'b']);
     runAction(ACTIONS.escape, ctxOf());
-    expect(get(cancelDragRequest)).toBe(before + 1);
+    setDragCanceller(null);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(get(selection)).toEqual(['a', 'b']);
+  });
+
+  it('escape with no drag to cancel clears the selection', () => {
+    const cancel = vi.fn(() => false);
+    setDragCanceller(cancel);
+    selection.set(['a', 'b']);
+    runAction(ACTIONS.escape, ctxOf());
+    setDragCanceller(null);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(get(selection)).toEqual([]);
   });
 
   it('show_shortcuts calls the context callback', () => {
@@ -960,25 +981,28 @@ describe('loop in/out store', () => {
 });
 
 describe('cancel drag and escape', () => {
-  it('escape bumps the cancel request counter once per press', () => {
-    const before = get(cancelDragRequest);
+  afterEach(() => setDragCanceller(null));
+
+  it('each escape press calls the canceller once', () => {
+    const cancel = vi.fn(() => false);
+    setDragCanceller(cancel);
     runAction(ACTIONS.escape, ctxOf());
     runAction(ACTIONS.escape, ctxOf());
-    expect(get(cancelDragRequest)).toBe(before + 2);
+    expect(cancel).toHaveBeenCalledTimes(2);
   });
 
-  it('escape clears the selection after bumping the counter', () => {
+  it('escape without a registered canceller clears the selection', () => {
+    setDragCanceller(null);
     selection.set(['a', 'b']);
     runAction(ACTIONS.escape, ctxOf());
     expect(get(selection)).toEqual([]);
   });
 
-  it('escape without a project still bumps the counter and clears the selection', () => {
+  it('escape without a project and without a drag clears the selection', () => {
     closeEditor();
+    setDragCanceller(() => false);
     selection.set(['a']);
-    const before = get(cancelDragRequest);
     runAction(ACTIONS.escape, ctxOf());
-    expect(get(cancelDragRequest)).toBe(before + 1);
     expect(get(selection)).toEqual([]);
   });
 });

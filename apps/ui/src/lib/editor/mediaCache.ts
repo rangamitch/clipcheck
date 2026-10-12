@@ -30,20 +30,44 @@ export function setTrackLevels(levels: Record<string, number>): void {
   trackLevels.set(levels);
 }
 
-/** Most media entries kept in memory at once. */
+/** Most media entries kept in memory at once, unless the open project has more media. */
 const MAX_MEDIA = 64;
-/** Peak buckets requested for a whole media file. */
-const PEAK_BUCKETS = 2000;
+/** Fewest peak buckets requested for a whole media file. */
+const MIN_PEAK_BUCKETS = 2000;
+/** Most peak buckets requested for a whole media file (the backend clamps to the same value). */
+const MAX_PEAK_BUCKETS = 8192;
+/** Duration of one peak bucket aimed for, ms. Longer media get more buckets, up to the cap. */
+const PEAK_BUCKET_MS = 50;
 /** Height of each thumbnail, px. */
 const THUMB_HEIGHT = 48;
 /** Fewest thumbnails per media file. */
 const MIN_THUMBS = 4;
 /** Most thumbnails per media file. */
-const MAX_THUMBS = 40;
+const MAX_THUMBS = 120;
+/** Duration of one thumbnail aimed for, ms. */
+const THUMB_INTERVAL_MS = 3000;
+
+/**
+ * Peak buckets requested for a media file of `durationTicks`: about one per PEAK_BUCKET_MS, within
+ * MIN_PEAK_BUCKETS..MAX_PEAK_BUCKETS. The whole file is covered, so a short clip cut from a long
+ * file still gets few buckets; the backend has no range query for peaks.
+ */
+export function peakBucketsFor(durationTicks: Tick): number {
+  const wanted = Math.round(tickToMs(durationTicks) / PEAK_BUCKET_MS);
+  return Math.min(MAX_PEAK_BUCKETS, Math.max(MIN_PEAK_BUCKETS, wanted));
+}
+
+/** Thumbnails requested for a media file of `durationMs`: one per THUMB_INTERVAL_MS, within MIN..MAX_THUMBS. */
+export function thumbCountFor(durationMs: number): number {
+  const wanted = Math.round(durationMs / THUMB_INTERVAL_MS);
+  return Math.min(MAX_THUMBS, Math.max(MIN_THUMBS, wanted));
+}
 
 /** Cached state of one media file. Replaced when its duration changes (relink). */
 interface MediaEntry {
   durationTicks: Tick;
+  /** Peak buckets requested for each stream of this file. */
+  peakBuckets: number;
   thumbs: ThumbStrip | null;
   thumbsBusy: boolean;
   thumbsFailed: boolean;
@@ -89,15 +113,16 @@ function touch(mediaId: string): MediaEntry | undefined {
 
 /**
  * Entry for a media file, created when missing. An entry made for a different duration is
- * discarded (the file was relinked). Evicts the least recently used entries beyond `MAX_MEDIA`.
+ * discarded (the file was relinked). Evicts least recently used entries beyond the cap.
  */
-function entryFor(mediaId: string, durationTicks: Tick): MediaEntry {
+function entryFor(project: Project, mediaId: string, durationTicks: Tick): MediaEntry {
   const existing = touch(mediaId);
   if (existing && existing.durationTicks === durationTicks) {
     return existing;
   }
   const fresh: MediaEntry = {
     durationTicks,
+    peakBuckets: peakBucketsFor(durationTicks),
     thumbs: null,
     thumbsBusy: false,
     thumbsFailed: false,
@@ -108,12 +133,23 @@ function entryFor(mediaId: string, durationTicks: Tick): MediaEntry {
   };
   entries.delete(mediaId);
   entries.set(mediaId, fresh);
-  while (entries.size > MAX_MEDIA) {
-    const oldest = entries.keys().next();
-    if (oldest.done) break;
-    entries.delete(oldest.value);
-  }
+  evictBeyondCap(project);
   return fresh;
+}
+
+/**
+ * Drops least recently used entries while there are more than the cap. The cap is MAX_MEDIA or
+ * the open project's media count, whichever is larger. Media used by the open project is never
+ * dropped: evicting it would refetch the same previews on every project change.
+ */
+function evictBeyondCap(project: Project): void {
+  const inProject = new Set(project.media.map((m) => m.id));
+  const cap = Math.max(MAX_MEDIA, inProject.size);
+  for (const id of entries.keys()) {
+    if (entries.size <= cap) break;
+    if (inProject.has(id)) continue;
+    entries.delete(id);
+  }
 }
 
 /** Creates an image from a data URL that calls `onload` when it has decoded. */
@@ -160,7 +196,7 @@ function loadPeaks(mediaId: string, stream: number, entry: MediaEntry, onchange:
   entry.peaksBusy.add(stream);
   let notify = true;
   editorApi
-    .waveform(mediaId, stream, PEAK_BUCKETS)
+    .waveform(mediaId, stream, entry.peakBuckets)
     .then((values) => {
       if (values.length > 0) {
         entry.peaks.set(stream, Float32Array.from(values));
@@ -185,14 +221,14 @@ export function getThumbStrip(mediaId: string): ThumbStrip | null {
   return touch(mediaId)?.thumbs ?? null;
 }
 
-/** Peak values (0..=1, `PEAK_BUCKETS` buckets over the whole file) of one audio stream, or null. */
+/** Peak values (0..=1, one per bucket over the whole file) of one audio stream, or null. */
 export function getPeaks(mediaId: string, stream: number): Float32Array | null {
   return touch(mediaId)?.peaks.get(stream) ?? null;
 }
 
 /**
  * Requests the thumbnail strip of a video media file. Evenly spaced frames across the duration,
- * N = clamp(duration_s / 2, 4, 40), each `THUMB_HEIGHT` px tall. Does nothing for missing media,
+ * N = thumbCountFor(duration), each `THUMB_HEIGHT` px tall. Does nothing for missing media,
  * non-video media, or media already loaded, loading or failed.
  */
 export function requestThumbs(project: Project, mediaId: string, onchange: () => void): void {
@@ -201,10 +237,10 @@ export function requestThumbs(project: Project, mediaId: string, onchange: () =>
   const durationMs = tickToMs(media.duration);
   if (durationMs <= 0) return;
 
-  const entry = entryFor(mediaId, media.duration);
+  const entry = entryFor(project, mediaId, media.duration);
   if (entry.thumbs !== null || entry.thumbsBusy || entry.thumbsFailed) return;
 
-  const count = Math.min(MAX_THUMBS, Math.max(MIN_THUMBS, Math.round(durationMs / 2000)));
+  const count = thumbCountFor(durationMs);
   const timesMs: number[] = [];
   for (let i = 0; i < count; i += 1) {
     timesMs.push(Math.round(((i + 0.5) / count) * durationMs));
@@ -231,8 +267,7 @@ export function requestThumbs(project: Project, mediaId: string, onchange: () =>
 }
 
 /**
- * Requests the peaks of one audio stream of a media file (`PEAK_BUCKETS` buckets over the whole
- * file). A later `peaks-ready` event reloads them. Does nothing for missing media or when the
+ * Requests the peaks of one audio stream of a media file (see `peakBucketsFor`). A later `peaks-ready` event reloads them. Does nothing for missing media or when the
  * stream is already loaded, loading, pending or failed.
  */
 export function requestPeaks(
@@ -245,7 +280,7 @@ export function requestPeaks(
   if (!media || media.missing || media.duration <= 0) return;
   ensureListening();
 
-  const entry = entryFor(mediaId, media.duration);
+  const entry = entryFor(project, mediaId, media.duration);
   peakCallbacks.set(peakKey(mediaId, stream), onchange);
   if (
     entry.peaks.has(stream) ||

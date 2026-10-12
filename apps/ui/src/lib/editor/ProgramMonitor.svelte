@@ -531,6 +531,17 @@
         if (t >= timelineEndTick(get(project))) playing.set(false);
       }),
       e.onEnded(() => {
+        // The time listener has already restarted a loop when it is still running.
+        if (e.isPlaying()) return;
+        // Loop In/Out with the work area ending at the plan end: restart at its start instead of stopping.
+        const wa = get(project)?.work_area ?? null;
+        if (get(loopInOut) && wa !== null && wa.end > wa.start) {
+          lastEngineTick = wa.start;
+          playhead.set(wa.start);
+          e.seek(wa.start);
+          e.play(get(shuttleRate));
+          return;
+        }
         playing.set(false);
       }),
       e.onDroppedFrames(reportDropped),

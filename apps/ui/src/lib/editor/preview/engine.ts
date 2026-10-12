@@ -4,8 +4,11 @@
 //
 // Timing model: the clock (clock.ts) is the single source of timeline time. Every frame, each
 // needed element is checked against the source time that the scheduler derives for it. A playing
-// element that drifts by 0.04 s to 0.5 s is nudged by 5 % of its rate; beyond 0.5 s it is re-seeked,
-// with the measured cost of its last seek added as lead. Re-seeks back off up to 2 s apart.
+// audio-stream element whose drift exceeds 0.1 s (back to nominal below 0.04 s) is nudged by 3 % of its
+// rate; video elements free-run. A playing element whose drift exceeds 0.5 s (audio streams 0.25 s) is
+// re-seeked, with the measured cost of its last seek added as lead. A segment change, a seek or a rate
+// change forces one exact re-seek of each element that is off by more than 0.02 s. Free-running
+// re-seeks back off up to 2 s apart.
 // Elements of frozen (speed 0), reversed layers, or reverse shuttle cannot play backwards, so they
 // are paused and re-seeked at about 12 Hz.
 //
@@ -25,7 +28,7 @@
 // - While the window is hidden the picture stops (rAF); the clock keeps running on a 100 ms timer
 //   that updates audio, time and levels without painting.
 
-import type { AudioSource, PlanSegment, Project, RenderPlan, Rgba, Tick, Transform } from '../types';
+import type { PlanSegment, Project, RenderPlan, Rgba, Tick, Transform } from '../types';
 import { secToTick, tickToSec } from '../ticks';
 import { createClock } from './clock';
 import { AudioGraph } from './audioGraph';
@@ -184,6 +187,11 @@ interface PlayEntry {
   gapMs: number;
   /** True while the element runs at a nudged rate (drift hysteresis). */
   nudging: boolean;
+  /**
+   * Set by a segment change, seek or rate change while playing: the next positioning seeks the
+   * element exactly when it is off by more than DRIFT_PAUSED_S, bypassing the re-seek gap.
+   */
+  resync: boolean;
 }
 
 /** One pooled video element. */
@@ -278,7 +286,6 @@ function setPreload(entry: PlayEntry, value: 'metadata' | 'auto'): void {
   if (entry.el.preload !== value) entry.el.preload = value;
 }
 
-/** Detaches every handler of an image and releases its source. */
 /**
  * Container that keeps pooled media elements attached to the document. Detached, display:none or
  * 0x0 video elements are throttled by Chromium (few presented frames), so they live in a 1x1 px,
@@ -309,6 +316,19 @@ function hostElement(el: HTMLMediaElement): void {
   }
 }
 
+/** Detaches every handler of an image and releases its source. */
+/**
+ * Whether a playing element is due for a seek. A resync (segment change, seek or rate change) seeks
+ * any element off by more than DRIFT_PAUSED_S and bypasses the gap. Free-running drift seeks only
+ * past the audio (DRIFT_SEEK_S) or video (DRIFT_SEEK_VIDEO_S) threshold and only when the gap is open.
+ * `drift` is element time minus source time (positive: ahead).
+ */
+export function playingSeekDue(drift: number, audioOnly: boolean, resync: boolean, gapOpen: boolean): boolean {
+  const abs = Math.abs(drift);
+  if (resync) return abs > DRIFT_PAUSED_S;
+  return gapOpen && abs > (audioOnly ? DRIFT_SEEK_S : DRIFT_SEEK_VIDEO_S);
+}
+
 function disposeImage(img: HTMLImageElement): void {
   img.onload = null;
   img.onerror = null;
@@ -329,8 +349,6 @@ class Engine implements PreviewEngine {
   private readonly failed = new Map<string, string>();
   /** Last segment start prefetched per media id. */
   private readonly prefetched = new Map<string, Tick>();
-  /** Media ids the last prefetch scan wants loaded (preload 'auto'). */
-  private prefetchIds = new Set<string>();
   /** Media ids needed by the current segment. Never evicted. */
   private readonly keepIds = new Set<string>();
   /** Pooled audio-stream elements by `streamKey`. */
@@ -350,8 +368,9 @@ class Engine implements PreviewEngine {
   private paintDirty = true;
   private lastPaintSeg: PlanSegment | null = null;
   private lastPaintFrames = -1;
-  private lastPaintMs = 0;
   private lastResumeMs = 0;
+  /** performance.now() until which a paused seek may use fastSeek (seeks arriving in a quick drag). */
+  private fastSeekUntilMs = 0;
   private lastTimeEmitMs = 0;
   private lastFrameChangeMs = 0;
   private lastFrameTotalSeen = -1;
@@ -427,7 +446,7 @@ class Engine implements PreviewEngine {
   attach(canvas: HTMLCanvasElement): void {
     if (this.destroyed) return;
     this.canvas = canvas;
-    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true }) as CanvasRenderingContext2D | null;
+    const ctx = canvas.getContext('2d', { alpha: false }) as CanvasRenderingContext2D | null;
     if (!ctx) {
       this.ctx2d = null;
       this.reportError(new Error('canvas 2D context is unavailable'));
@@ -475,7 +494,11 @@ class Engine implements PreviewEngine {
       return;
     }
     this.paintDirty = true;
-    this.scrubUntilMs = performance.now() + SCRUB_SETTLE_MS;
+    const nowMs = performance.now();
+    // A seek that lands inside the settle window of the previous one is part of a quick drag and
+    // may use keyframe seeks. A single click or frame step seeks exactly.
+    if (nowMs < this.scrubUntilMs) this.fastSeekUntilMs = nowMs + SCRUB_SETTLE_MS;
+    this.scrubUntilMs = nowMs + SCRUB_SETTLE_MS;
     this.armScrubSettle();
     this.schedulePaint();
   }
@@ -541,6 +564,7 @@ class Engine implements PreviewEngine {
   private settleScrub(): void {
     if (this.destroyed) return;
     this.scrubUntilMs = 0;
+    this.fastSeekUntilMs = 0;
     if (this.clock.isRunning()) return;
     this.redrawNow();
     const plan = this.plan;
@@ -691,7 +715,6 @@ class Engine implements PreviewEngine {
     this.failed.clear();
     this.prefetched.clear();
     this.prefetchedStreams.clear();
-    this.prefetchIds = new Set<string>();
     this.overrides.clear();
     this.mediaKeys.clear();
     this.chainKeys.clear();
@@ -760,6 +783,10 @@ class Engine implements PreviewEngine {
   private stopAt(at: Tick, ended: boolean): void {
     this.stopPlayback();
     this.emitLevels(SILENT_LEVELS);
+    this.setClockPosition(at);
+    this.emitTime(at);
+    this.scheduleRedraw();
+    // Ended listeners run last: a listener may restart playback (loop), which must not be undone.
     if (ended) {
       for (const cb of this.endedCbs) {
         try {
@@ -769,9 +796,6 @@ class Engine implements PreviewEngine {
         }
       }
     }
-    this.setClockPosition(at);
-    this.emitTime(at);
-    this.scheduleRedraw();
   }
 
   // ---- frame loop -------------------------------------------------------------------------
@@ -833,7 +857,6 @@ class Engine implements PreviewEngine {
           else this.paintBlank();
           this.lastPaintSeg = seg;
           this.lastPaintFrames = this.frameTotal();
-          this.lastPaintMs = now;
           this.statsPaints++;
           // Keep painting every tick until all sources have a frame.
           if (this.frameMissed) this.paintDirty = true;
@@ -878,9 +901,20 @@ class Engine implements PreviewEngine {
       this.lastFrameChangeMs = now;
     }
     if (total !== this.lastPaintFrames) return true;
-    // No frame callbacks for a while (detached or throttled element): paint every animation frame.
-    if (now - this.lastFrameChangeMs >= FRAME_STALL_MS) return true;
+    // No frame callbacks for a while (detached or throttled element) while a video layer plays:
+    // paint every animation frame. Gaps, stills, titles and audio-only segments never present frames.
+    if (now - this.lastFrameChangeMs >= FRAME_STALL_MS && this.hasPlayingVideo(seg)) return true;
     for (const layer of seg.video) if (layer.transition !== null) return true;
+    return false;
+  }
+
+  /** True when a video-kind layer of the segment has a pooled element that is playing. */
+  private hasPlayingVideo(seg: PlanSegment): boolean {
+    for (const layer of seg.video) {
+      if (layer.kind !== 'video' || layer.media_id === null) continue;
+      const entry = this.elements.get(layer.media_id);
+      if (entry && !entry.el.paused) return true;
+    }
     return false;
   }
 
@@ -1082,6 +1116,7 @@ class Engine implements PreviewEngine {
       lastSeekTarget: Number.NaN,
       gapMs: SEEK_GAP_MS,
       nudging: false,
+      resync: false,
       frameSeq: 0,
     };
     if (this.hasFrameCallback) {
@@ -1365,6 +1400,8 @@ class Engine implements PreviewEngine {
    * While paused they are seeked to the exact frame and never play.
    */
   private syncMedia(seg: PlanSegment, t: Tick, playing: boolean, now: number): void {
+    // A new segment (also after a seek or a rate change, which clear segStart) needs exact positions.
+    if (playing && this.segStart !== seg.start) this.markResync();
     this.collectNeeds(seg, t);
     const needs = this.needs;
     this.keepIds.clear();
@@ -1400,6 +1437,12 @@ class Engine implements PreviewEngine {
     }
   }
 
+  /** Marks every pooled element for one exact re-seek on its next playing positioning. */
+  private markResync(): void {
+    for (const entry of this.elements.values()) entry.resync = true;
+    for (const entry of this.audioEls.values()) entry.resync = true;
+  }
+
   /**
    * Keeps one element on its source time. `audioOnly` elements never step frames: frozen,
    * reversed and reverse-shuttled sources are simply paused (silent).
@@ -1417,6 +1460,7 @@ class Engine implements PreviewEngine {
     if (need.speed <= 0 || need.reverse || (playing && this.rate < 0)) {
       // Frozen, reversed or reverse-shuttled: cannot play backwards, so step the frame.
       if (!el.paused) el.pause();
+      entry.resync = false;
       if (audioOnly) return;
       const stepOk = !playing || now - entry.lastSeekMs >= STEP_MS;
       if (stepOk && !el.seeking && Math.abs(el.currentTime - target) > DRIFT_PAUSED_S) {
@@ -1445,10 +1489,13 @@ class Engine implements PreviewEngine {
     // Positive drift means the element is ahead of its source time.
     const drift = el.currentTime - target;
     const abs = Math.abs(drift);
-    if (abs > (audioOnly ? DRIFT_SEEK_S : DRIFT_SEEK_VIDEO_S) && now - entry.lastSeekMs >= entry.gapMs) {
+    const resync = entry.resync;
+    entry.resync = false;
+    if (playingSeekDue(drift, audioOnly, resync, now - entry.lastSeekMs >= entry.gapMs)) {
       // Lead the target by the cost of the seek, since the element keeps playing while it loads.
       this.seekTo(entry, target + (entry.seekCostMs / 1000) * nominal, now);
-      entry.gapMs = Math.min(SEEK_GAP_MAX_MS, entry.gapMs * 2);
+      // A resync seek is exact and does not back the free-running gap off.
+      if (!resync) entry.gapMs = Math.min(SEEK_GAP_MAX_MS, entry.gapMs * 2);
       entry.nudging = false;
       if (el.playbackRate !== nominal) el.playbackRate = nominal;
     } else if (audioOnly && abs > (entry.nudging ? DRIFT_NUDGE_OFF_S : DRIFT_NUDGE_S)) {
@@ -1478,8 +1525,9 @@ class Engine implements PreviewEngine {
     if (!el.paused) el.pause();
     entry.nudging = false;
     if (el.seeking || Math.abs(el.currentTime - target) <= DRIFT_PAUSED_S) return;
-    const scrubbing = now < this.scrubUntilMs;
-    if (!scrubbing) {
+    // Keyframe seeks only while a drag runs (setScrubbing) or seeks arrive faster than the settle window.
+    const fast = this.scrubbing || now < this.fastSeekUntilMs;
+    if (!fast) {
       this.seekTo(entry, target, now);
       return;
     }
@@ -1497,7 +1545,8 @@ class Engine implements PreviewEngine {
 
   private playElement(el: HTMLMediaElement): void {
     void el.play().catch((err: unknown) => {
-      if (err instanceof DOMException && err.name === 'AbortError') return;
+      // Aborted by a pause, or a source the element cannot play (reported through onerror instead).
+      if (err instanceof DOMException && (err.name === 'AbortError' || err.name === 'NotSupportedError')) return;
       this.reportError(err);
     });
   }
@@ -1569,6 +1618,7 @@ class Engine implements PreviewEngine {
       lastSeekTarget: Number.NaN,
       gapMs: SEEK_GAP_MS,
       nudging: false,
+      resync: false,
     };
     el.onseeked = () => this.onSeeked(entry);
     el.onerror = () => this.failStream(mediaId, stream);
@@ -1668,7 +1718,6 @@ class Engine implements PreviewEngine {
   private prefetch(plan: RenderPlan, t: Tick): void {
     const now = performance.now();
     const items = upcoming(plan, t, secToTick(PREFETCH_HORIZON_S));
-    this.prefetchIds = new Set(items.map((item) => item.mediaId));
     for (const item of items) {
       if (this.keepIds.has(item.mediaId)) continue;
       if (this.prefetched.get(item.mediaId) === item.startsAt) continue;

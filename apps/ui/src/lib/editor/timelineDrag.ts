@@ -259,7 +259,8 @@ function alignedClamp(t: Tick, lo: Tick, hi: Tick, rate: Rate): Tick {
 
 /** Clips that move with `ids`: the clips themselves plus group and link partners. */
 export function movingClips(project: Project, ids: readonly string[]): Clip[] {
-  const selected = project.clips.filter((c) => ids.includes(c.id));
+  const idSet = new Set(ids);
+  const selected = project.clips.filter((c) => idSet.has(c.id));
   const groups = new Set<string>();
   const links = new Set<string>();
   for (const c of selected) {
@@ -268,7 +269,7 @@ export function movingClips(project: Project, ids: readonly string[]): Clip[] {
   }
   const partners = project.clips.filter(
     (c) =>
-      !ids.includes(c.id) &&
+      !idSet.has(c.id) &&
       ((c.group_id !== null && groups.has(c.group_id)) || (c.link_id !== null && links.has(c.link_id))),
   );
   return [...selected, ...partners];

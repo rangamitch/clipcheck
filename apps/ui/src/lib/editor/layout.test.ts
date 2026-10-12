@@ -687,3 +687,57 @@ describe('envelope geometry helpers', () => {
     expect(envelopeDbAt(5, { x: 0, y: 0, w: 10, h: 0 })).toBe(-60);
   });
 });
+
+describe('hitTest uses the drawn width of clips narrower than the minimum', () => {
+  // 0.012 s at 100 px/s is 1.2 px of time; the clip is drawn 2 px wide, so the pointer must hit it there.
+  const tiny = project([track('V0', 'video')], [clip('T', 'V0', 2, 0.012)]);
+  const rows = trackLayout(tiny, 0);
+  const x0 = tickToX(tiny.clips[0]!.start, VIEW);
+
+  it('the tiny clip is drawn 2 px wide', () => {
+    expect(clipRect(tiny.clips[0]!, rows, VIEW)?.w).toBe(2);
+  });
+  it('a pointer on the drawn right half of a tiny clip hits that clip, not empty track', () => {
+    const h = hitTest(tiny, rows, VIEW, x0 + 1.9, 56);
+    expect(h.clipId).toBe('T');
+    expect(h.kind === 'clip' || h.kind === 'edge-end').toBe(true);
+  });
+});
+
+describe('hitEnvelopePoint with a selection', () => {
+  // Flat gain line (no points) at 0 dB on an audio clip at 1 s..3 s, drawn 200 px wide.
+  const audioTrack = track('A0', 'audio');
+  const flat = clip('E', 'A0', 1, 2, { kind: 'audio', audio: { ...defaultClipAudio(), gain_db: 0 } });
+  const withPoint = clip('E', 'A0', 1, 2, {
+    kind: 'audio',
+    audio: { ...defaultClipAudio(), envelope: [{ t: 0, db: 0 }] },
+  });
+  const build = (c: Clip) => {
+    const proj = project([audioTrack], [c]);
+    return { proj, rows: trackLayout(proj, 0) };
+  };
+
+  it('a gain-line hit on an unselected clip is ignored when a selection is given', () => {
+    const { proj, rows } = build(flat);
+    const rect = clipRect(flat, rows, VIEW)!;
+    expect(hitEnvelopePoint(proj, rows, VIEW, rect.x + rect.w / 2, envelopeY(0, rect), [])).toBeNull();
+  });
+  it('a gain-line hit on a selected clip still counts', () => {
+    const { proj, rows } = build(flat);
+    const rect = clipRect(flat, rows, VIEW)!;
+    const hit = hitEnvelopePoint(proj, rows, VIEW, rect.x + rect.w / 2, envelopeY(0, rect), ['E']);
+    expect(hit?.clipId).toBe('E');
+    expect(hit?.index).toBeNull();
+  });
+  it('a point hit counts on an unselected clip', () => {
+    const { proj, rows } = build(withPoint);
+    const rect = clipRect(withPoint, rows, VIEW)!;
+    const hit = hitEnvelopePoint(proj, rows, VIEW, rect.x, envelopeY(0, rect), []);
+    expect(hit?.index).toBe(0);
+  });
+  it('without a selection argument the gain line counts as before', () => {
+    const { proj, rows } = build(flat);
+    const rect = clipRect(flat, rows, VIEW)!;
+    expect(hitEnvelopePoint(proj, rows, VIEW, rect.x + rect.w / 2, envelopeY(0, rect))?.index).toBeNull();
+  });
+});

@@ -104,7 +104,7 @@ export function createClock(timeSource: TimeSource = defaultTimeSource): Clock {
     let v: number;
     const heard = audio !== null && anchorAudio !== null ? audioHeard(audio) : null;
     if (anchorAudio !== null && heard !== null) {
-      // The anchor is the raw context time, so the clock holds for one output latency after a start.
+      // The anchor is also a heard time, so the clock advances from the first audible sample on.
       v = Math.max(0, heard - anchorAudio);
     } else {
       v = wallNow() - anchorWall;
@@ -149,7 +149,9 @@ export function createClock(timeSource: TimeSource = defaultTimeSource): Clock {
     anchorTick = t;
     lastTick = t;
     anchorWall = wallNow();
-    anchorAudio = audio !== null && Number.isFinite(audio.currentTime) ? audio.currentTime : null;
+    // Anchor on the same latency-corrected (heard) time that elapsedSec reads, so re-basing does not
+    // stall the playhead by the output latency. Raw currentTime would be ahead of what is heard.
+    anchorAudio = audio !== null ? audioHeard(audio) : null;
   }
 
   return {

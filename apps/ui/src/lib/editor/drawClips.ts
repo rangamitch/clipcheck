@@ -87,12 +87,12 @@ const FALLBACK_PALETTE: Palette = {
   danger: '#ff6b6b',
 };
 
-/** Palette read per element. Cleared by `refreshPalette` when the theme changes. */
+/** Palette read per element. The UI has a single theme, so an element's palette is read once. */
 const paletteCache = new WeakMap<Element, Palette>();
 
 /**
  * Reads the app palette from the CSS variables that apply to `el`. Missing values fall back.
- * The result is cached per element; call `refreshPalette` after the theme changes.
+ * The result is cached per element for the element's lifetime.
  */
 export function readPalette(el: Element): Palette {
   const cached = paletteCache.get(el);
@@ -121,21 +121,12 @@ export function readPalette(el: Element): Palette {
   return palette;
 }
 
-/** Forgets the cached palette of `el` so the next `readPalette` call reads the CSS variables again. */
-export function refreshPalette(el: Element): void {
-  paletteCache.delete(el);
-}
-
-/**
- * Everything `drawTimeline` needs for one frame. `playhead` is not drawn here (the Timeline draws
- * the playhead as a DOM element); it stays in the type so existing callers keep compiling.
- */
+/** Everything `drawTimeline` needs for one frame. The playhead is not part of it (the Timeline draws it as a DOM element). */
 export interface DrawArgs {
   project: Project;
   rows: TrackRow[];
   view: View;
   selection: string[];
-  playhead?: Tick;
   snapTick: Tick | null;
   dragGhosts: { clipId: string; rect: ClipRect }[];
   marquee: { x0: number; y0: number; x1: number; y1: number } | null;
@@ -198,7 +189,10 @@ function formatSpeed(speed: number): string {
   return speed.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
-/** Adds a rounded rectangle path to the current path (does not fill or stroke). */
+/**
+ * Adds a rounded rectangle path to a new path (does not fill or stroke). `left` and `right` say
+ * whether that end gets rounded corners; an end that is off screen passes false and stays square.
+ */
 function roundRectPath(
   ctx: CanvasRenderingContext2D,
   x: number,
@@ -206,15 +200,49 @@ function roundRectPath(
   w: number,
   h: number,
   radius: number,
+  left = true,
+  right = true,
 ): void {
   const r = Math.max(0, Math.min(radius, w / 2, h / 2));
+  const rl = left ? r : 0;
+  const rr = right ? r : 0;
   ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
+  ctx.moveTo(x + rl, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rl);
+  ctx.arcTo(x, y, x + w, y, rl);
   ctx.closePath();
+}
+
+/** Px beyond each view edge that path shapes still reach, so rounded ends just off screen stay correct. */
+const PATH_OVERSHOOT_PX = 64;
+
+/** Horizontal extent of a clip for path drawing: clamped to just past the view. */
+interface PathSpan {
+  x: number;
+  w: number;
+  /** True when the clip's left end is on screen, so its corners are rounded. */
+  left: boolean;
+  /** True when the clip's right end is on screen, so its corners are rounded. */
+  right: boolean;
+}
+
+/**
+ * Clamps a clip's horizontal extent to `-PATH_OVERSHOOT_PX .. viewWidth + PATH_OVERSHOOT_PX`. A clip
+ * far wider than the view (long media at high zoom) would otherwise hand the canvas coordinates
+ * with float32 precision errors. The clamp does not change what is visible; the unclamped rect
+ * still maps thumbnails and waveforms.
+ */
+export function pathSpan(x: number, w: number, viewWidth: number): PathSpan {
+  const x0 = Math.max(x, -PATH_OVERSHOOT_PX);
+  const x1 = Math.min(x + w, viewWidth + PATH_OVERSHOOT_PX);
+  return {
+    x: x0,
+    w: Math.max(0, x1 - x0),
+    left: x >= 0 && x <= viewWidth,
+    right: x + w >= 0 && x + w <= viewWidth,
+  };
 }
 
 /**
@@ -340,6 +368,50 @@ function drawThumbs(
   }
 }
 
+/**
+ * X positions of the waveform columns that start inside `x0..x1`. Columns sit on a grid anchored
+ * at the clip's left edge `rectX`, so the grid moves with the clip and does not shimmer while the
+ * view scrolls. Pure; exported for tests.
+ */
+export function waveformGridXs(rectX: number, x0: number, x1: number, step: number): number[] {
+  if (!(step > 0) || !(x1 > x0) || !Number.isFinite(rectX)) return [];
+  const xs: number[] = [];
+  const k0 = Math.ceil((x0 - rectX) / step);
+  for (let k = k0; ; k += 1) {
+    const x = rectX + k * step;
+    if (x >= x1) break;
+    xs.push(x);
+  }
+  return xs;
+}
+
+/**
+ * Largest peak (0..1) of the buckets `[b0, b1)` covered by the fraction range `fromFrac..toFrac` of
+ * a clip (0 = clip start, 1 = clip end). A reversed clip plays its source backwards, so the range
+ * is mirrored. Taking the maximum keeps short transients visible when zoomed out. Pure; exported for tests.
+ */
+export function columnPeak(
+  peaks: ArrayLike<number>,
+  b0: number,
+  b1: number,
+  fromFrac: number,
+  toFrac: number,
+  reverse: boolean,
+): number {
+  const span = b1 - b0;
+  if (span <= 0) return 0;
+  const lo = clamp(reverse ? 1 - toFrac : fromFrac, 0, 1);
+  const hi = clamp(reverse ? 1 - fromFrac : toFrac, 0, 1);
+  const first = clamp(b0 + Math.floor(lo * span), b0, b1 - 1);
+  const last = clamp(b0 + Math.ceil(hi * span) - 1, first, b1 - 1);
+  let peak = 0;
+  for (let i = first; i <= last; i += 1) {
+    const v = clamp(peaks[i] ?? 0, 0, 1);
+    if (v > peak) peak = v;
+  }
+  return peak;
+}
+
 /** Mirrored peak bars across the clip's source range. Only columns inside the view are drawn. */
 function drawWaveform(
   ctx: CanvasRenderingContext2D,
@@ -359,13 +431,11 @@ function drawWaveform(
   const half = Math.max(1, rect.h / 2 - 5);
 
   ctx.fillStyle = `rgba(255, 255, 255, ${alpha})`;
-  const x0 = Math.max(rect.x, 0);
-  const x1 = Math.min(rect.x + rect.w, view.width);
-  for (let x = x0; x < x1; x += WAVE_STEP_PX) {
-    const f = clamp((x - rect.x + WAVE_STEP_PX / 2) / rect.w, 0, 1);
-    const ff = clip.reverse ? 1 - f : f;
-    const bucket = Math.min(b1 - 1, b0 + Math.floor(ff * (b1 - b0)));
-    const amp = clamp(peaks[bucket] ?? 0, 0, 1);
+  const xs = waveformGridXs(rect.x, Math.max(rect.x, 0), Math.min(rect.x + rect.w, view.width), WAVE_STEP_PX);
+  for (const x of xs) {
+    const fromFrac = (x - rect.x) / rect.w;
+    const toFrac = (x + WAVE_STEP_PX - rect.x) / rect.w;
+    const amp = columnPeak(peaks, b0, b1, fromFrac, toFrac, clip.reverse);
     const bar = Math.max(1, amp * half);
     ctx.fillRect(x, mid - bar, 1.5, bar * 2);
   }
@@ -541,19 +611,21 @@ function drawClip(
   const bodyY = rect.y + 1;
   const bodyW = rect.w;
   const bodyH = Math.max(0, rect.h - 2);
+  // Path shapes use the clamped span; thumbnails and waveforms keep the unclamped rect (above).
+  const span = pathSpan(rect.x, rect.w, view.width);
   const pxPerSec = view.pxPerSec;
 
   ctx.save();
   ctx.globalAlpha = clip.enabled ? 1 : 0.4;
 
   // Body fill.
-  roundRectPath(ctx, bodyX, bodyY, bodyW, bodyH, 4);
+  roundRectPath(ctx, span.x, bodyY, span.w, bodyH, 4, span.left, span.right);
   ctx.fillStyle = fill;
   ctx.fill();
 
   // Content, clipped to the body.
   ctx.save();
-  roundRectPath(ctx, bodyX, bodyY, bodyW, bodyH, 4);
+  roundRectPath(ctx, span.x, bodyY, span.w, bodyH, 4, span.left, span.right);
   ctx.clip();
 
   if (clip.kind === 'video' && mediaRef && !isMissing) {
@@ -585,7 +657,7 @@ function drawClip(
 
   if (isMissing) {
     ctx.fillStyle = 'rgba(255, 107, 107, 0.3)';
-    ctx.fillRect(bodyX, bodyY, bodyW, bodyH);
+    ctx.fillRect(span.x, bodyY, span.w, bodyH);
     hatch(ctx, bodyX, bodyY, bodyW, bodyH, palette.danger, 10, view.width);
   }
 
@@ -604,19 +676,19 @@ function drawClip(
 
   // Outline: accent when selected, subtle border otherwise.
   if (isSelected) {
-    roundRectPath(ctx, rect.x + 1, rect.y + 1, Math.max(0, rect.w - 2), Math.max(0, rect.h - 2), 4);
+    roundRectPath(ctx, span.x + 1, rect.y + 1, Math.max(0, span.w - 2), Math.max(0, rect.h - 2), 4, span.left, span.right);
     ctx.strokeStyle = ACCENT;
     ctx.lineWidth = 2;
     ctx.stroke();
   } else {
-    roundRectPath(ctx, bodyX + 0.5, bodyY + 0.5, Math.max(0, bodyW - 1), Math.max(0, bodyH - 1), 4);
+    roundRectPath(ctx, span.x + 0.5, bodyY + 0.5, Math.max(0, span.w - 1), Math.max(0, bodyH - 1), 4, span.left, span.right);
     ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
     ctx.lineWidth = 1;
     ctx.stroke();
   }
   // Linked or grouped partners of the selection: dashed, muted accent, inside the bounds.
   if (isPartner) {
-    roundRectPath(ctx, bodyX + 0.75, bodyY + 0.75, Math.max(0, bodyW - 1.5), Math.max(0, bodyH - 1.5), 4);
+    roundRectPath(ctx, span.x + 0.75, bodyY + 0.75, Math.max(0, span.w - 1.5), Math.max(0, bodyH - 1.5), 4, span.left, span.right);
     ctx.save();
     ctx.globalAlpha *= 0.55;
     ctx.strokeStyle = ACCENT;

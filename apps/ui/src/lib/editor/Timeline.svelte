@@ -36,7 +36,7 @@
     zoomBy,
     zoomToFit,
   } from './store';
-  import { cancelDragRequest } from './actions';
+  import { setDragCanceller } from './actions';
   import {
     RULER_HEIGHT,
     TRACK_GAP,
@@ -71,7 +71,7 @@
     type PointerLike,
   } from './timelineDrag';
   import { clipEnd, formatTimecode, secToTick, tickToSec } from './ticks';
-  import type { ApplyReply, Command, MediaRef, Project, Tick, Track, TrackKind } from './types';
+  import type { ApplyReply, Clip, Command, MediaRef, Project, Tick, Track, TrackKind } from './types';
 
   /** Width of the track header column, px. */
   const HEADER_WIDTH = 140;
@@ -91,6 +91,11 @@
   const FADE_HIT_PX = 10;
   /** Fade handles sit in the top this many px of an audio clip. */
   const FADE_ZONE_PX = 8;
+  /**
+   * On a selected audio clip, a press this close to a fade handle (and in the fade zone) takes the
+   * handle over the trim edge. Keeps a fade at 0 grabbable when it sits on the clip edge.
+   */
+  const FADE_EDGE_PREF_PX = 6;
   /** Audio clips narrower than this many px have no fade handles. */
   const FADE_MIN_CLIP_PX = 60;
   /** Drag-and-drop payload type for recordings dragged from the recordings list. */
@@ -139,6 +144,8 @@
   let armed = false;
   /** Clip to select alone when a press on a multi-selection ends without a drag. */
   let collapseTo: string | null = null;
+  /** Playhead when a ruler drag began, restored by Escape. */
+  let playheadAtPress: Tick | null = null;
   let rafDraw = 0;
   let rafScroll = 0;
   let scrollDir = 0;
@@ -240,7 +247,7 @@
     if (drag?.kind === 'trim-start' || drag?.kind === 'trim-end') return 'trim';
     if (drag?.kind === 'roll') return 'roll';
     if (drag !== null) return '';
-    if ($tool === 'razor') return 'razor';
+    if ($tool === 'razor') return 'cut';
     if ($tool === 'zoom') return 'zoom';
     if (hoverEdge !== null) return 'trim';
     if ($tool === 'select' && hover?.kind === 'gap') return 'gap';
@@ -250,6 +257,11 @@
   // Any selection change ends the gap selection (a gap is only selected while no clip is).
   $effect(() => {
     if ($selection.length > 0) selectedGap = null;
+  });
+  // Any project change (undo, redo, edits) ends the gap selection, since the gap may be gone.
+  $effect(() => {
+    void proj;
+    selectedGap = null;
   });
 
   const playX = $derived(tickToX($playhead, view));
@@ -346,10 +358,6 @@
     const limit = maxScrollY;
     if (get(scrollY) > limit) scrollY.set(Math.max(0, limit));
   });
-  $effect(() => {
-    const limit = maxScrollY;
-    if (get(scrollY) > limit) scrollY.set(Math.max(0, limit));
-  });
 
   // Track the viewport size.
   $effect(() => {
@@ -418,16 +426,11 @@
     return () => media?.removeEventListener('change', onChange);
   });
 
-  // Esc cancels the active drag. The store's first value is the initial one, so skip it.
+  // Escape (actions.ts) cancels the active drag first and clears the selection only when none was
+  // active. Registered while the timeline is mounted.
   $effect(() => {
-    let first = true;
-    return cancelDragRequest.subscribe(() => {
-      if (first) {
-        first = false;
-        return;
-      }
-      cancelActiveDrag();
-    });
+    setDragCanceller(() => cancelActiveDrag(true));
+    return () => setDragCanceller(null);
   });
 
   // Media-bin drags are tracked on the window while the bin reports one, so the pointer can
@@ -637,7 +640,10 @@
     pressX = p.x;
     pressY = p.y;
     armed = immediate || state.kind === 'playhead';
-    if (state.kind === 'playhead') startScrub();
+    if (state.kind === 'playhead') {
+      playheadAtPress = get(playhead);
+      startScrub();
+    }
     try {
       viewportEl?.setPointerCapture(e.pointerId);
     } catch {
@@ -663,9 +669,10 @@
     const current = proj;
 
     if (!wasArmed) {
-      // A plain click: marquee clears the selection and seeks, a multi-selection collapses.
+      // A plain click: a marquee clears the selection (unless Shift or Ctrl adds to it) and seeks;
+      // a multi-selection collapses.
       if (state.kind === 'marquee' && current) {
-        selection.set([]);
+        if (!state.additive) selection.set([]);
         seek(xToTick(state.originX, view));
       } else if (state.kind === 'move' && collapseTo !== null) {
         selectClips([collapseTo], 'replace');
@@ -676,15 +683,23 @@
     collapseTo = null;
     if (cancelled || !current) return;
     const commands: Command[] = finishDrag(state, { project: current });
-    for (const cmd of commands) {
+    const sends = commands.map((cmd) => {
       const sent = dispatch(cmd);
       if (cmd.type === 'duplicate_clips') void sent.then(selectDuplicates);
-    }
-    // Magnetic mode keeps the tracks the clips left free of holes. Queued after the move.
-    if (current.modes.magnetic) {
-      for (const trackId of sourceTracksLeft(current, commands)) {
-        void dispatch({ type: 'close_all_gaps', track_id: trackId });
-      }
+      return sent;
+    });
+    // Magnetic mode keeps the tracks the clips left free of holes. Queued after the move, and only
+    // when the move went through (dispatch resolves to null on failure).
+    const moveIndex = commands.findIndex((cmd) => cmd.type === 'move_clips');
+    const moveSent = sends[moveIndex];
+    if (current.modes.magnetic && moveSent !== undefined) {
+      const tracks = sourceTracksLeft(current, commands);
+      void moveSent.then((reply) => {
+        if (reply === null) return;
+        for (const trackId of tracks) {
+          void dispatch({ type: 'close_all_gaps', track_id: trackId });
+        }
+      });
     }
   }
 
@@ -713,22 +728,31 @@
   }
 
   /**
-   * Drops the active drag without committing it: Esc, a new press, or lost pointer capture.
-   * The view keeps whatever preview the drag already showed.
+   * Drops the active drag without committing it: Esc, a new press, or lost pointer capture. With
+   * `restore` (Esc), a ruler drag puts the playhead back where the press was and a marquee puts back
+   * the selection it started from. Otherwise the view keeps the preview the drag already showed.
+   * Returns true when a drag was active.
    */
-  function cancelActiveDrag(): void {
+  function cancelActiveDrag(restore = false): boolean {
     stopScrub();
-    if (drag === null) return;
+    const state = drag;
+    if (state === null) return false;
     try {
       if (viewportEl?.hasPointerCapture(pointerId)) viewportEl.releasePointerCapture(pointerId);
     } catch {
       // Capture was already released.
     }
     stopAutoscroll();
+    if (restore) {
+      if (state.kind === 'marquee') selection.set([...state.base]);
+      else if (state.kind === 'playhead' && playheadAtPress !== null) seek(playheadAtPress);
+    }
     drag = null;
     frame = EMPTY_FRAME;
     armed = false;
     collapseTo = null;
+    playheadAtPress = null;
+    return true;
   }
 
   function onLostCapture(e: PointerEvent): void {
@@ -774,22 +798,26 @@
 
   /**
    * Fade handle under the pointer, or null. Only audio clips at least FADE_MIN_CLIP_PX wide have
-   * one: pointer within the top FADE_ZONE_PX of the clip and within FADE_HIT_PX of the fade apex.
-   * Callers check the clip edges first so trimming always wins.
+   * one: pointer within the top FADE_ZONE_PX of the clip and within `maxDistPx` of the fade apex.
+   * With `selectedOnly`, only selected clips count (used to take a handle over a trim edge).
    */
   function fadeHandleAt(
     current: Project,
     p: PointerLike,
+    maxDistPx: number,
+    selectedOnly: boolean,
   ): { clipId: string; edge: 'in' | 'out' } | null {
+    const selected = get(selection);
     for (const clip of current.clips) {
       if (clip.kind !== 'audio') continue;
+      if (selectedOnly && !selected.includes(clip.id)) continue;
       const r = clipRect(clip, rows, view);
       if (!r || r.w < FADE_MIN_CLIP_PX) continue;
       if (p.y < r.y || p.y > r.y + FADE_ZONE_PX) continue;
       const inX = tickToX(clip.start + clip.audio.fade_in, view);
       const outX = tickToX(clipEnd(clip) - clip.audio.fade_out, view);
-      if (Math.abs(p.x - inX) <= FADE_HIT_PX) return { clipId: clip.id, edge: 'in' };
-      if (Math.abs(p.x - outX) <= FADE_HIT_PX) return { clipId: clip.id, edge: 'out' };
+      if (Math.abs(p.x - inX) <= maxDistPx) return { clipId: clip.id, edge: 'in' };
+      if (Math.abs(p.x - outX) <= maxDistPx) return { clipId: clip.id, edge: 'out' };
     }
     return null;
   }
@@ -850,15 +878,17 @@
       return;
     }
 
-    // Edges first, so trimming an audio clip always works. Fades and envelope points come next.
+    // Fade handles and envelope points come before the clip body. Trim edges win over them, except
+    // a fade handle on a selected audio clip that is close to the press (see FADE_EDGE_PREF_PX).
     const onEdge = hit.kind === 'edge-start' || hit.kind === 'edge-end';
+    const fade = fadeHandleAt(current, p, onEdge ? FADE_EDGE_PREF_PX : FADE_HIT_PX, onEdge);
+    if (fade) {
+      beginState(beginFadeDrag(current, fade.clipId, fade.edge, p), e, p, false);
+      return;
+    }
     if (!onEdge) {
-      const fade = fadeHandleAt(current, p);
-      if (fade) {
-        beginState(beginFadeDrag(current, fade.clipId, fade.edge, p), e, p, false);
-        return;
-      }
-      const env = hitEnvelopePoint(current, rows, view, p.x, p.y);
+      // The envelope's gain line counts only on selected clips; an envelope point always counts.
+      const env = hitEnvelopePoint(current, rows, view, p.x, p.y, get(selection));
       if (env !== null) {
         // A point drags that point; the gain line inserts a point at the press and drags it.
         const envState =
@@ -1058,10 +1088,17 @@
     const canUnmute = muteClips.some((c) => c.audio.muted);
     const canEnable = clips.some((c) => !c.enabled);
     const canDisable = clips.some((c) => c.enabled);
+    // Edits are off when any selected clip sits on a locked track (or on no known track).
+    const lockedClip = (c: Clip): boolean => current.tracks.find((t) => t.id === c.track_id)?.locked ?? true;
+    const canEdit = clips.length > 0 && !clips.some(lockedClip);
+    // Split needs the playhead strictly inside a selected clip; speed needs a media (video or audio) clip.
+    const canSplit = canEdit && clips.some((c) => play > c.start && play < clipEnd(c));
+    const canSpeed = canEdit && clips.some((c) => c.kind === 'video' || c.kind === 'audio');
     return [
       {
         label: 'Split at playhead',
         shortcut: 'Ctrl+K',
+        disabled: !canSplit,
         action: () => {
           void dispatch({ type: 'split_at', time: play, ids });
         },
@@ -1070,6 +1107,7 @@
       {
         label: 'Cut',
         shortcut: 'Ctrl+X',
+        disabled: !canEdit,
         action: () => {
           // Delete only when the copy went through.
           void copySelection().then((reply) => {
@@ -1094,6 +1132,7 @@
       {
         label: 'Duplicate',
         shortcut: 'Ctrl+D',
+        disabled: !canEdit,
         action: () => {
           // The offset is measured on the latest project, not the one the menu was opened on.
           void dispatchWith((latest) => {
@@ -1109,6 +1148,7 @@
       {
         label: 'Delete',
         shortcut: 'Delete',
+        disabled: !canEdit,
         action: () => {
           void dispatch({ type: 'delete_clips', ids, ripple: false });
         },
@@ -1116,6 +1156,7 @@
       {
         label: 'Ripple delete',
         shortcut: 'Shift+Delete',
+        disabled: !canEdit,
         action: () => {
           void dispatch({ type: 'delete_clips', ids, ripple: true });
         },
@@ -1124,7 +1165,7 @@
       {
         label: 'Group',
         shortcut: 'Ctrl+G',
-        disabled: !canGroup,
+        disabled: !canEdit || !canGroup,
         action: () => {
           void dispatch({ type: 'group_clips', ids });
         },
@@ -1132,21 +1173,21 @@
       {
         label: 'Ungroup',
         shortcut: 'Ctrl+Shift+G',
-        disabled: !canUngroup,
+        disabled: !canEdit || !canUngroup,
         action: () => {
           void dispatch({ type: 'ungroup', ids });
         },
       },
       {
         label: 'Link audio and video',
-        disabled: !canLink,
+        disabled: !canEdit || !canLink,
         action: () => {
           void dispatch({ type: 'link_clips', ids });
         },
       },
       {
         label: 'Unlink audio and video',
-        disabled: !canUnlink,
+        disabled: !canEdit || !canUnlink,
         action: () => {
           void dispatch({ type: 'unlink_clips', ids });
         },
@@ -1154,7 +1195,7 @@
       SEPARATOR,
       {
         label: 'Detach audio',
-        disabled: !hasVideo,
+        disabled: !canEdit || !hasVideo,
         action: () => {
           for (const c of clips) {
             if (c.kind === 'video') void dispatch({ type: 'detach_audio', clip_id: c.id });
@@ -1163,28 +1204,28 @@
       },
       {
         label: 'Mute clip',
-        disabled: !canMute,
+        disabled: !canEdit || !canMute,
         action: () => {
           void dispatch({ type: 'patch_clips', ids: muteIds, patch: { muted: true } });
         },
       },
       {
         label: 'Unmute clip',
-        disabled: !canUnmute,
+        disabled: !canEdit || !canUnmute,
         action: () => {
           void dispatch({ type: 'patch_clips', ids: muteIds, patch: { muted: false } });
         },
       },
       {
         label: 'Enable clip',
-        disabled: !canEnable,
+        disabled: !canEdit || !canEnable,
         action: () => {
           void dispatch({ type: 'patch_clips', ids, patch: { enabled: true } });
         },
       },
       {
         label: 'Disable clip',
-        disabled: !canDisable,
+        disabled: !canEdit || !canDisable,
         action: () => {
           void dispatch({ type: 'patch_clips', ids, patch: { enabled: false } });
         },
@@ -1192,6 +1233,7 @@
       SEPARATOR,
       ...[0.5, 1, 2].map((speed) => ({
         label: `Speed ${speed}x`,
+        disabled: !canSpeed,
         action: () => {
           for (const id of ids) {
             void dispatch({ type: 'set_speed', clip_id: id, speed, ripple: true });
@@ -1201,7 +1243,7 @@
       SEPARATOR,
       {
         label: 'Freeze frame at playhead',
-        disabled: !(clicked?.kind === 'video' && inside),
+        disabled: !canEdit || !(clicked?.kind === 'video' && inside),
         action: () => {
           void dispatch({
             type: 'freeze_frame',
@@ -1706,7 +1748,7 @@
     cursor: grabbing;
   }
 
-  .viewport.razor {
+  .viewport.cut {
     cursor: crosshair;
   }
 

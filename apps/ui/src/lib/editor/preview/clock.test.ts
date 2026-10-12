@@ -289,39 +289,54 @@ describe('audio output latency', () => {
     return { currentTime, ...over };
   }
 
-  it('elapsed time subtracts the output latency', () => {
+  it('a constant output latency does not change elapsed time', () => {
     const a = latent(10, { outputLatency: 0.5 });
     clock.start(0);
     clock.attachAudio(a);
     a.currentTime = 12;
-    expect(clock.now()).toBe(Math.round(1.5 * S));
+    expect(clock.now()).toBe( 2 * S);
   });
 
-  it('elapsed time subtracts the base latency', () => {
+  it('a constant base latency does not change elapsed time', () => {
     const a = latent(10, { baseLatency: 0.25 });
     clock.start(0);
     clock.attachAudio(a);
     a.currentTime = 12;
-    expect(clock.now()).toBe(Math.round(1.75 * S));
+    expect(clock.now()).toBe( 2 * S);
   });
 
-  it('output and base latency are both subtracted', () => {
+  it('constant output and base latency together do not change elapsed time', () => {
     const a = latent(10, { outputLatency: 0.1, baseLatency: 0.2 });
     clock.start(0);
     clock.attachAudio(a);
     a.currentTime = 12;
-    expect(clock.now()).toBe(Math.round(1.7 * S));
+    expect(clock.now()).toBe( 2 * S);
   });
 
-  it('the clock holds at the anchor until the latency has passed', () => {
+  it('re-basing on attach anchors on the heard time, so the playhead does not stall', () => {
+    // Attaching at audio time 10 with 0.5 s latency means the listener hears 9.5 s now. The
+    // re-base holds the playhead at 1 s, and it advances as soon as heard audio time moves on.
     const a = latent(10, { outputLatency: 0.5 });
     clock.start(0);
     wall = 1;
     clock.attachAudio(a);
+    expect(clock.now()).toBe(S);
     a.currentTime = 10.3;
-    expect(clock.now()).toBe(S);
+    expect(clock.now()).toBe(Math.round(1.3 * S));
     a.currentTime = 10.5;
-    expect(clock.now()).toBe(S);
+    expect(clock.now()).toBe(Math.round(1.5 * S));
+  });
+
+  it('a re-base mid-playback (setRate) does not stall for the output latency', () => {
+    const a = latent(10, { outputLatency: 0.5 });
+    clock.start(0);
+    clock.attachAudio(a);
+    a.currentTime = 12;
+    expect(clock.now()).toBe(2 * S);
+    // Re-anchoring at 2 s must not wait another 0.5 s before the playhead moves again.
+    clock.setRate(1);
+    a.currentTime = 12.2;
+    expect(clock.now()).toBe(Math.round(2.2 * S));
   });
 
   it('a NaN latency counts as no latency', () => {
@@ -340,13 +355,23 @@ describe('audio output latency', () => {
     expect(clock.now()).toBe(2 * S);
   });
 
-  it('latency is removed before the playback rate scales the elapsed time', () => {
+  it('the playback rate scales latency-neutral elapsed audio time', () => {
     const a = latent(0, { outputLatency: 0.5 });
     clock.start(0, 2);
     clock.attachAudio(a);
     a.currentTime = 1;
-    // (1 s - 0.5 s latency) at rate 2 is 1 s of timeline.
-    expect(clock.now()).toBe(S);
+    // 1 s of heard audio since the attach, at rate 2, is 2 s of timeline.
+    expect(clock.now()).toBe(2 * S);
+  });
+
+  it('a latency change after the anchor shows up as elapsed time', () => {
+    const a = latent(10, { outputLatency: 0.5 });
+    clock.start(0);
+    clock.attachAudio(a);
+    // Anchor is heard 9.5 s. Now the latency drops to 0: heard time is 11 s, so 1.5 s elapsed.
+    a.outputLatency = 0;
+    a.currentTime = 11;
+    expect(clock.now()).toBe(Math.round(1.5 * S));
   });
 
   it('a missing latency field behaves like zero', () => {
@@ -361,14 +386,14 @@ describe('audio output latency', () => {
     const a = latent(10, { outputLatency: 0.5 });
     clock.start(0);
     wall = 1;
-    // Attaching re-bases on tick 1 s; then 2 s of audio minus 0.5 s latency adds 1.5 s.
+    // Attaching re-bases on tick 1 s (heard anchor 9.5 s); then 2 s of heard audio adds 2 s.
     clock.attachAudio(a);
     a.currentTime = 12;
-    expect(clock.now()).toBe(Math.round(2.5 * S));
+    expect(clock.now()).toBe(Math.round(3 * S));
     clock.attachAudio(null);
-    expect(clock.now()).toBe(Math.round(2.5 * S));
+    expect(clock.now()).toBe(Math.round(3 * S));
     // Detached: wall time counts with no latency subtracted.
     wall = 2;
-    expect(clock.now()).toBe(Math.round(3.5 * S));
+    expect(clock.now()).toBe(Math.round(4 * S));
   });
 });

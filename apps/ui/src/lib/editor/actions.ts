@@ -49,10 +49,18 @@ export const shuttleRate = writable<number>(1);
 export const loopInOut = writable<boolean>(false);
 
 /**
- * Incremented by Escape. The timeline watches it and cancels any drag in progress. Only the
- * change matters, not the value.
+ * Cancels the drag in progress, if any, and returns true when one was cancelled. The timeline
+ * registers it while mounted (see `setDragCanceller`).
  */
-export const cancelDragRequest = writable<number>(0);
+export type DragCanceller = () => boolean;
+
+/** The registered drag canceller, or null when no timeline is mounted. */
+let dragCanceller: DragCanceller | null = null;
+
+/** Registers (or, with null, clears) the canceller that Escape calls first. */
+export function setDragCanceller(fn: DragCanceller | null): void {
+	dragCanceller = fn;
+}
 
 /** A request to insert or overwrite the source monitor's range (handled by SourceMonitor). */
 export interface SourceRequest {
@@ -409,10 +417,12 @@ export function runAction(id: ActionId, ctx: ActionContext): void | Promise<void
 			sourceRequest.set({ action: 'overwrite' });
 			return;
 
-		case ACTIONS.escape:
-			cancelDragRequest.update((n) => n + 1);
-			selection.set([]);
+		case ACTIONS.escape: {
+			// Escape first cancels a drag. The selection is cleared only when no drag was cancelled.
+			const cancelled = dragCanceller?.() ?? false;
+			if (!cancelled) selection.set([]);
 			return;
+		}
 		case ACTIONS.show_shortcuts:
 			ctx.showShortcuts();
 			return;
