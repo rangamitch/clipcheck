@@ -16,8 +16,11 @@
 // - One element per media id: when two timeline sources of the same media need different source
 //   times in one segment, the first (video layer, then audio source) wins and the other source
 //   plays the wrong part. Linked audio and video of one clip always agree.
-// - Only the default audio stream of a file is audible (see audioGraph.ts). Other audio tracks are
-//   skipped, with one message per media and track.
+// - The default audio stream (source_track 0) plays from the pooled <video> element. Every other
+//   stream plays from its own hidden <audio> element whose source is an extracted single-stream
+//   file (editorApi.audioStreamUrl), pooled to MAX_AUDIO_ELEMENTS. A video element is audible only
+//   while a track-0 source of its media is active, so an unplaced Mix never plays under the editor.
+// - Painting skips ticks where nothing changed (no new video frame, same segment, no transition).
 // - More than MAX_ELEMENTS media needed at once exceed the pool cap rather than stop playback.
 // - While the window is hidden the picture stops (rAF); the clock keeps running on a 100 ms timer
 //   that updates audio, time and levels without painting.
@@ -26,7 +29,8 @@ import type { AudioSource, PlanSegment, Project, RenderPlan, Rgba, Tick, Transfo
 import { secToTick, tickToSec } from '../ticks';
 import { createClock } from './clock';
 import { AudioGraph } from './audioGraph';
-import { gainRamp, segmentAt, sourceTimeFor, upcoming, type GainPoint } from './scheduler';
+import { gainRamp, segmentAt, sourceTimeFor, upcoming, upcomingStreams, type GainPoint } from './scheduler';
+import { editorApi } from '../api';
 import { composeFrame, type SourceFrames } from './compose';
 
 /** Preview resolution as a fraction of the project canvas. */
@@ -83,15 +87,21 @@ export interface PreviewEngineOptions {
 
 /** Maximum number of pooled video elements (media that are not needed are evicted first). */
 const MAX_ELEMENTS = 4;
+/** Maximum number of pooled audio-stream elements (least recently used unneeded one is evicted). */
+const MAX_AUDIO_ELEMENTS = 8;
 /** Playback rate magnitude bounds (the clock limits the timeline rate to 8 as well). */
 const MIN_RATE = 0.0625;
 const MAX_RATE = 8;
 /** Drift (seconds) above which a playing element is re-seeked. Smaller drift is nudged. */
-const DRIFT_SEEK_S = 0.5;
-/** Drift (seconds) above which a playing element is nudged. Smaller drift runs at nominal rate. */
-const DRIFT_NUDGE_S = 0.04;
+const DRIFT_SEEK_S = 0.25;
+/** Drift (seconds) above which a playing element starts to be nudged. */
+const DRIFT_NUDGE_S = 0.1;
+/** Drift (seconds) below which a nudged element returns to its nominal rate (hysteresis). */
+const DRIFT_NUDGE_OFF_S = 0.04;
 /** Relative rate change applied while nudging a playing element. */
-const NUDGE_FACTOR = 0.05;
+const NUDGE_FACTOR = 0.03;
+/** Minimum gap between two attempts to resume a suspended audio context while playing (ms). */
+const RESUME_RETRY_MS = 500;
 /** Drift (seconds) above which a paused element is re-seeked (about one frame). */
 const DRIFT_PAUSED_S = 0.02;
 /** Minimum gap between two playing seeks of the same element (ms). Doubles up to the maximum. */
@@ -132,10 +142,9 @@ const QUALITY_SCALE: Record<PreviewQuality, number> = { full: 1, half: 0.5, quar
 
 const SILENT_LEVELS: { master: number; tracks: number[] } = { master: -120, tracks: [] };
 
-/** One pooled video element. */
-interface ElementEntry {
-  mediaId: string;
-  el: HTMLVideoElement;
+/** Seek and drift state shared by video and audio-stream elements. */
+interface PlayEntry {
+  el: HTMLMediaElement;
   /** True once the playable URL has been assigned to `el`. */
   hasSrc: boolean;
   lastUsed: number;
@@ -147,6 +156,35 @@ interface ElementEntry {
   seekCostMs: number;
   /** Current minimum gap between playing re-seeks (ms). */
   gapMs: number;
+  /** True while the element runs at a nudged rate (drift hysteresis). */
+  nudging: boolean;
+}
+
+/** One pooled video element. */
+interface ElementEntry extends PlayEntry {
+  mediaId: string;
+  el: HTMLVideoElement;
+  /** Number of video frames presented so far (requestVideoFrameCallback), to skip idle paints. */
+  frameSeq: number;
+}
+
+/** One pooled hidden audio element playing one extracted stream of a media. */
+interface AudioEntry extends PlayEntry {
+  key: string;
+  mediaId: string;
+  stream: number;
+  el: HTMLAudioElement;
+}
+
+/** An audio stream that a segment needs from its own element. */
+interface StreamNeed extends MediaNeed {
+  mediaId: string;
+  stream: number;
+}
+
+/** Key of a (media, stream) pair: audio element pool key and audio graph source key. */
+function streamKey(mediaId: string, stream: number): string {
+  return `${mediaId}#${stream}`;
 }
 
 /** What one media id must show or sound at the current time. */
@@ -210,7 +248,7 @@ function notifyAll<T>(set: Set<(value: T) => void>, value: T): void {
 }
 
 /** Sets the preload hint only when it changes. */
-function setPreload(entry: ElementEntry, value: 'metadata' | 'auto'): void {
+function setPreload(entry: PlayEntry, value: 'metadata' | 'auto'): void {
   if (entry.el.preload !== value) entry.el.preload = value;
 }
 
@@ -238,7 +276,28 @@ class Engine implements PreviewEngine {
   /** Media ids the last prefetch scan wants loaded (preload 'auto'). */
   private prefetchIds = new Set<string>();
   /** Media ids needed by the current segment. Never evicted. */
-  private keepIds = new Set<string>();
+  private readonly keepIds = new Set<string>();
+  /** Pooled audio-stream elements by `streamKey`. */
+  private readonly audioEls = new Map<string, AudioEntry>();
+  /** Resolved extracted-stream URL per `streamKey`, or null when extraction failed. */
+  private readonly streamUrls = new Map<string, Promise<string | null>>();
+  /** Streams whose extraction or playback failed. They are not retried until the media changes. */
+  private readonly failedStreams = new Set<string>();
+  /** Last segment start prefetched per `streamKey`. */
+  private readonly prefetchedStreams = new Map<string, Tick>();
+  /** Stream keys needed by the current segment. Never evicted. */
+  private readonly keepAudioKeys = new Set<string>();
+  /** Scratch maps reused by every tick (filled by collectNeeds). */
+  private readonly needs = new Map<string, MediaNeed>();
+  private readonly streamNeeds = new Map<string, StreamNeed>();
+  /** Paint skipping: true when something other than a video frame changed since the last paint. */
+  private paintDirty = true;
+  private lastPaintSeg: PlanSegment | null = null;
+  private lastPaintFrames = -1;
+  private lastPaintMs = 0;
+  private lastResumeMs = 0;
+  private readonly hasFrameCallback =
+    typeof HTMLVideoElement !== 'undefined' && 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
   /** Audio source keys (clip ids) that currently have a gain curve. */
   private activeKeys = new Set<string>();
   /** Audio source keys that have ever had a chain. Chains of removed clips are dropped. */
@@ -315,6 +374,7 @@ class Engine implements PreviewEngine {
     this.dropStaleChains(plan);
     this.reportedGeneric = false;
     this.prefetched.clear();
+    this.prefetchedStreams.clear();
     this.segStart = null;
     this.applyCanvasSize();
     if (!this.clock.isRunning()) {
@@ -332,6 +392,7 @@ class Engine implements PreviewEngine {
     const target = clampTo(plan, t);
     this.setClockPosition(target);
     this.prefetched.clear();
+    this.prefetchedStreams.clear();
     this.segStart = null;
     this.emitTime(target);
     this.scheduleRedraw();
@@ -342,10 +403,7 @@ class Engine implements PreviewEngine {
     const plan = this.plan;
     if (!plan) return;
     this.rate = signedRate(rate);
-    const ctx = this.audio.ctx;
-    void this.audio.resume().then(() => {
-      if (!this.destroyed && ctx.state === 'running') this.clock.attachAudio(ctx);
-    });
+    this.resumeAudio();
     if (this.clock.isRunning()) {
       this.clock.setRate(this.rate);
       this.segStart = null;
@@ -366,6 +424,15 @@ class Engine implements PreviewEngine {
     this.resetDropWindow(performance.now());
     this.updateHiddenTimer();
     if (this.rafId === null) this.rafId = requestAnimationFrame(this.loop);
+  }
+
+  /** Resumes a suspended audio context and attaches the audio clock once it runs. Never throws. */
+  private resumeAudio(): void {
+    const ctx = this.audio.ctx;
+    if (ctx.state === 'running') return;
+    void this.audio.resume().then(() => {
+      if (!this.destroyed && ctx.state === 'running') this.clock.attachAudio(ctx);
+    });
   }
 
   pause(): void {
@@ -450,11 +517,19 @@ class Engine implements PreviewEngine {
     }
     for (const entry of this.elements.values()) this.disposeEntry(entry);
     this.elements.clear();
+    for (const entry of this.audioEls.values()) this.disposeEntry(entry);
+    this.audioEls.clear();
+    this.streamUrls.clear();
+    this.failedStreams.clear();
+    this.keepAudioKeys.clear();
+    this.needs.clear();
+    this.streamNeeds.clear();
     for (const img of this.images.values()) disposeImage(img);
     this.images.clear();
     this.urls.clear();
     this.failed.clear();
     this.prefetched.clear();
+    this.prefetchedStreams.clear();
     this.prefetchIds = new Set<string>();
     this.overrides.clear();
     this.mediaKeys.clear();
@@ -573,6 +648,11 @@ class Engine implements PreviewEngine {
         return;
       }
       const now = performance.now();
+      if (this.audio.ctx.state === 'suspended' && now - this.lastResumeMs >= RESUME_RETRY_MS) {
+        // Elements routed through a suspended context stall, so keep asking until it runs.
+        this.lastResumeMs = now;
+        this.resumeAudio();
+      }
       const seg = segmentAt(plan, t);
       if (seg) {
         this.syncMedia(seg, t, true, now);
@@ -583,10 +663,20 @@ class Engine implements PreviewEngine {
         }
       }
       if (paint) {
-        this.frameMissed = false;
-        if (seg) this.paintSegment(seg, t);
-        else this.paintBlank();
-        this.countFrame(this.frameMissed || performance.now() - started > DROP_STEP_MS, now);
+        if (seg && !this.needsPaint(seg, now)) {
+          this.countFrame(false, now);
+        } else {
+          this.frameMissed = false;
+          this.paintDirty = false;
+          if (seg) this.paintSegment(seg, t);
+          else this.paintBlank();
+          this.lastPaintSeg = seg;
+          this.lastPaintFrames = this.frameTotal();
+          this.lastPaintMs = now;
+          // Keep painting every tick until all sources have a frame.
+          if (this.frameMissed) this.paintDirty = true;
+          this.countFrame(this.frameMissed || performance.now() - started > DROP_STEP_MS, now);
+        }
       }
       this.emitTime(t);
       if (now - this.lastLevelsMs >= LEVELS_MS) {
@@ -600,6 +690,26 @@ class Engine implements PreviewEngine {
     } catch (err) {
       this.reportError(err);
     }
+  }
+
+  /** Sum of the presented-frame counters of all video elements. */
+  private frameTotal(): number {
+    let n = 0;
+    for (const entry of this.elements.values()) n += entry.frameSeq;
+    return n;
+  }
+
+  /**
+   * True when painting now can change the picture: something marked the canvas dirty, the segment
+   * changed, a video presented a new frame, a transition animates with time, or the last paint is
+   * older than two frames at 60 Hz (a floor in case frame callbacks under-fire for detached elements).
+   */
+  private needsPaint(seg: PlanSegment, now: number): boolean {
+    if (!this.hasFrameCallback || this.paintDirty || seg !== this.lastPaintSeg) return true;
+    if (now - this.lastPaintMs >= 34) return true;
+    if (this.frameTotal() !== this.lastPaintFrames) return true;
+    for (const layer of seg.video) if (layer.transition !== null) return true;
+    return false;
   }
 
   /** Records one playing frame and emits the dropped-frame ratio once per window. */
@@ -643,6 +753,7 @@ class Engine implements PreviewEngine {
   }
 
   private scheduleRedraw(): void {
+    this.paintDirty = true;
     if (this.destroyed || this.redrawTimer !== null) return;
     this.redrawTimer = setTimeout(() => {
       this.redrawTimer = null;
@@ -796,7 +907,17 @@ class Engine implements PreviewEngine {
       seekStartMs: null,
       seekCostMs: 0,
       gapMs: SEEK_GAP_MS,
+      nudging: false,
+      frameSeq: 0,
     };
+    if (this.hasFrameCallback) {
+      const onFrame = (): void => {
+        if (this.destroyed || this.elements.get(mediaId) !== entry) return;
+        entry.frameSeq++;
+        el.requestVideoFrameCallback(onFrame);
+      };
+      el.requestVideoFrameCallback(onFrame);
+    }
     el.onseeked = () => {
       this.onSeeked(entry);
       this.scheduleRedraw();
@@ -823,7 +944,7 @@ class Engine implements PreviewEngine {
   }
 
   /** Records the cost of a completed seek. */
-  private onSeeked(entry: ElementEntry): void {
+  private onSeeked(entry: PlayEntry): void {
     if (entry.seekStartMs === null) return;
     const cost = performance.now() - entry.seekStartMs;
     entry.seekCostMs = Math.min(SEEK_COST_MAX_MS, Math.max(0, cost));
@@ -831,7 +952,7 @@ class Engine implements PreviewEngine {
   }
 
   /** Assigns a seek and records when it started, so its cost can be measured. */
-  private seekTo(entry: ElementEntry, sec: number, now: number): void {
+  private seekTo(entry: PlayEntry, sec: number, now: number): void {
     entry.el.currentTime = sec;
     entry.lastSeekMs = now;
     entry.seekStartMs = performance.now();
@@ -871,7 +992,7 @@ class Engine implements PreviewEngine {
     this.elements.delete(victim.mediaId);
   }
 
-  private disposeEntry(entry: ElementEntry): void {
+  private disposeEntry(entry: PlayEntry): void {
     const el = entry.el;
     el.onseeked = null;
     el.onloadeddata = null;
@@ -910,6 +1031,19 @@ class Engine implements PreviewEngine {
     this.urls.delete(mediaId);
     this.prefetched.delete(mediaId);
     this.releaseMedia(mediaId);
+    const prefix = `${mediaId}#`;
+    for (const [key, entry] of this.audioEls) {
+      if (entry.mediaId !== mediaId) continue;
+      this.disposeEntry(entry);
+      this.audio.detach(key);
+      this.audioEls.delete(key);
+    }
+    for (const map of [this.streamUrls, this.prefetchedStreams]) {
+      for (const key of [...map.keys()]) if (key.startsWith(prefix)) map.delete(key);
+    }
+    for (const key of [...this.failedStreams]) if (key.startsWith(prefix)) this.failedStreams.delete(key);
+    this.pendingTracks.delete(mediaId);
+    this.warnedMedia.delete(mediaId);
   }
 
   /**
@@ -961,16 +1095,24 @@ class Engine implements PreviewEngine {
     for (const entry of this.elements.values()) {
       if (!entry.el.paused) entry.el.pause();
     }
+    for (const entry of this.audioEls.values()) {
+      if (!entry.el.paused) entry.el.pause();
+    }
   }
 
   // ---- positioning ------------------------------------------------------------------------
 
   /**
-   * The media each source needs at `t`. A video layer wins over an audio source of the same media.
-   * Audio sources on tracks other than the default stream are skipped (reported once per pair).
+   * Fills `this.needs` (media played from a pooled video element) and `this.streamNeeds` (audio
+   * streams played from their own element) for the segment at `t`. A video layer wins over a
+   * default-stream audio source of the same media. Sources with `source_track` 0 use the video
+   * element; every other track uses an extracted-stream audio element.
    */
-  private collectNeeds(seg: PlanSegment, t: Tick): Map<string, MediaNeed> {
-    const needs = new Map<string, MediaNeed>();
+  private collectNeeds(seg: PlanSegment, t: Tick): void {
+    const needs = this.needs;
+    const streams = this.streamNeeds;
+    needs.clear();
+    streams.clear();
     for (const layer of seg.video) {
       if (layer.kind !== 'video' || layer.media_id === null) continue;
       if (needs.has(layer.media_id)) continue;
@@ -981,38 +1123,45 @@ class Engine implements PreviewEngine {
       });
     }
     for (const src of seg.audio) {
-      if (src.source_track !== 0) {
-        this.reportUnplayableTrack(src);
+      if (src.source_track === 0) {
+        if (needs.has(src.media_id)) continue;
+        needs.set(src.media_id, {
+          src: sourceTimeFor(src, seg.start, t),
+          speed: src.speed,
+          reverse: src.reverse,
+        });
         continue;
       }
-      if (needs.has(src.media_id)) continue;
-      needs.set(src.media_id, {
+      const key = streamKey(src.media_id, src.source_track);
+      if (streams.has(key)) continue;
+      streams.set(key, {
+        mediaId: src.media_id,
+        stream: src.source_track,
         src: sourceTimeFor(src, seg.start, t),
         speed: src.speed,
         reverse: src.reverse,
       });
     }
-    return needs;
   }
 
   /**
-   * Collects an audio track that cannot be previewed. Tracks of one media are gathered and reported
-   * in a single debounced toast, and each media is warned about at most once per session.
+   * Collects an audio stream that could not be prepared. Streams of one media are gathered and
+   * reported in a single debounced toast, and each media is warned about at most once per session.
    */
-  private reportUnplayableTrack(src: AudioSource): void {
-    if (this.destroyed || this.warnedMedia.has(src.media_id)) return;
-    let tracks = this.pendingTracks.get(src.media_id);
+  private reportUnplayableTrack(mediaId: string, stream: number): void {
+    if (this.destroyed || this.warnedMedia.has(mediaId)) return;
+    let tracks = this.pendingTracks.get(mediaId);
     if (!tracks) {
       tracks = new Set<number>();
-      this.pendingTracks.set(src.media_id, tracks);
+      this.pendingTracks.set(mediaId, tracks);
     }
-    if (tracks.has(src.source_track)) return;
-    tracks.add(src.source_track);
+    if (tracks.has(stream)) return;
+    tracks.add(stream);
     if (this.trackToastTimer !== null) clearTimeout(this.trackToastTimer);
     this.trackToastTimer = setTimeout(() => this.flushTrackToasts(), TRACK_TOAST_DEBOUNCE_MS);
   }
 
-  /** Emits one toast per media with the collected unplayable audio tracks. */
+  /** Emits one toast per media with the collected audio streams that failed. */
   private flushTrackToasts(): void {
     this.trackToastTimer = null;
     if (this.destroyed) return;
@@ -1022,7 +1171,7 @@ class Engine implements PreviewEngine {
       const list = [...tracks].sort((a, b) => a - b).join(', ');
       const noun = tracks.size === 1 ? 'audio track' : 'audio tracks';
       this.emitError(
-        `${name}: ${noun} ${list} cannot be previewed yet (only the default stream plays in preview; export includes every track)`,
+        `${name}: ${noun} ${list} could not be prepared for preview (export still includes every track)`,
       );
     }
     this.pendingTracks.clear();
@@ -1034,22 +1183,40 @@ class Engine implements PreviewEngine {
    * While paused they are seeked to the exact frame and never play.
    */
   private syncMedia(seg: PlanSegment, t: Tick, playing: boolean, now: number): void {
-    const needs = this.collectNeeds(seg, t);
-    this.keepIds = new Set(needs.keys());
+    this.collectNeeds(seg, t);
+    const needs = this.needs;
+    this.keepIds.clear();
+    for (const id of needs.keys()) this.keepIds.add(id);
     for (const entry of this.elements.values()) {
       if (needs.has(entry.mediaId)) continue;
       if (!entry.el.paused) entry.el.pause();
-      setPreload(entry, this.prefetchIds.has(entry.mediaId) ? 'auto' : 'metadata');
     }
     for (const [mediaId, need] of needs) {
       const entry = this.ensureElement(mediaId, now);
       if (!entry) continue;
       setPreload(entry, 'auto');
-      this.positionElement(entry, need, playing, now);
+      this.positionElement(entry, need, playing, now, false);
+    }
+
+    const streams = this.streamNeeds;
+    this.keepAudioKeys.clear();
+    for (const key of streams.keys()) this.keepAudioKeys.add(key);
+    for (const [key, entry] of this.audioEls) {
+      if (streams.has(key)) continue;
+      if (!entry.el.paused) entry.el.pause();
+    }
+    for (const need of streams.values()) {
+      const entry = this.ensureAudioElement(need.mediaId, need.stream, now);
+      if (!entry) continue;
+      this.positionElement(entry, need, playing, now, true);
     }
   }
 
-  private positionElement(entry: ElementEntry, need: MediaNeed, playing: boolean, now: number): void {
+  /**
+   * Keeps one element on its source time. `audioOnly` elements never step frames: frozen,
+   * reversed and reverse-shuttled sources are simply paused (silent).
+   */
+  private positionElement(entry: PlayEntry, need: MediaNeed, playing: boolean, now: number, audioOnly: boolean): void {
     if (!entry.hasSrc) return;
     const el = entry.el;
     const target = tickToSec(need.src);
@@ -1057,6 +1224,7 @@ class Engine implements PreviewEngine {
     if (need.speed <= 0 || need.reverse || (playing && this.rate < 0)) {
       // Frozen, reversed or reverse-shuttled: cannot play backwards, so step the frame.
       if (!el.paused) el.pause();
+      if (audioOnly) return;
       const stepOk = !playing || now - entry.lastSeekMs >= STEP_MS;
       if (stepOk && !el.seeking && Math.abs(el.currentTime - target) > DRIFT_PAUSED_S) {
         this.seekTo(entry, target, now);
@@ -1069,42 +1237,162 @@ class Engine implements PreviewEngine {
     if (!playing) {
       if (el.playbackRate !== nominal) el.playbackRate = nominal;
       if (!el.paused) el.pause();
+      entry.nudging = false;
       if (!el.seeking && Math.abs(el.currentTime - target) > DRIFT_PAUSED_S) {
         this.seekTo(entry, target, now);
       }
       return;
     }
 
-    // Playing: positive drift means the element is ahead of its source time.
+    // Playing: never touch an element that is mid-seek (a second seek restarts the load).
+    if (el.seeking) {
+      if (el.paused) this.playElement(el);
+      return;
+    }
+    // Positive drift means the element is ahead of its source time.
     const drift = el.currentTime - target;
     const abs = Math.abs(drift);
-    if (abs > DRIFT_SEEK_S && !el.seeking && now - entry.lastSeekMs >= entry.gapMs) {
+    if (abs > DRIFT_SEEK_S && now - entry.lastSeekMs >= entry.gapMs) {
       // Lead the target by the cost of the seek, since the element keeps playing while it loads.
       this.seekTo(entry, target + (entry.seekCostMs / 1000) * nominal, now);
       entry.gapMs = Math.min(SEEK_GAP_MAX_MS, entry.gapMs * 2);
+      entry.nudging = false;
       if (el.playbackRate !== nominal) el.playbackRate = nominal;
-    } else if (abs > DRIFT_NUDGE_S) {
+    } else if (abs > (entry.nudging ? DRIFT_NUDGE_OFF_S : DRIFT_NUDGE_S)) {
+      // Hysteresis: once nudging, keep the corrected rate until the drift is almost gone.
+      entry.nudging = true;
       const factor = drift > 0 ? 1 - NUDGE_FACTOR : 1 + NUDGE_FACTOR;
       const nudged = clampRate(nominal * factor);
       if (el.playbackRate !== nudged) el.playbackRate = nudged;
     } else {
+      entry.nudging = false;
       if (el.playbackRate !== nominal) el.playbackRate = nominal;
       entry.gapMs = SEEK_GAP_MS;
     }
     if (el.paused) this.playElement(el);
   }
 
-  private playElement(el: HTMLVideoElement): void {
+  private playElement(el: HTMLMediaElement): void {
     void el.play().catch((err: unknown) => {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       this.reportError(err);
     });
   }
 
+  // ---- audio streams ----------------------------------------------------------------------
+
+  /** Resolves the extracted-stream URL of (media, stream) once. Never rejects; failure marks the stream. */
+  private streamUrlFor(mediaId: string, stream: number): Promise<string | null> {
+    const key = streamKey(mediaId, stream);
+    let p = this.streamUrls.get(key);
+    if (!p) {
+      p = Promise.resolve()
+        .then(() => editorApi.audioStreamUrl(mediaId, stream))
+        .then(
+          (url) => url,
+          () => {
+            this.failStream(mediaId, stream);
+            return null;
+          },
+        );
+      this.streamUrls.set(key, p);
+    }
+    return p;
+  }
+
+  /** Marks a stream unavailable (never retried), drops its element and queues the aggregated toast. */
+  private failStream(mediaId: string, stream: number): void {
+    if (this.destroyed) return;
+    const key = streamKey(mediaId, stream);
+    if (this.failedStreams.has(key)) return;
+    this.failedStreams.add(key);
+    const entry = this.audioEls.get(key);
+    if (entry) {
+      this.disposeEntry(entry);
+      this.audio.detach(key);
+      this.audioEls.delete(key);
+    }
+    this.reportUnplayableTrack(mediaId, stream);
+  }
+
+  /** Returns the pooled audio element of (media, stream), creating it and its graph source if needed. */
+  private ensureAudioElement(mediaId: string, stream: number, now: number): AudioEntry | null {
+    const key = streamKey(mediaId, stream);
+    if (this.destroyed || this.failed.has(mediaId) || this.failedStreams.has(key)) return null;
+    const existing = this.audioEls.get(key);
+    if (existing) {
+      existing.lastUsed = now;
+      return existing;
+    }
+    this.evictAudioIfFull();
+
+    const el = document.createElement('audio');
+    el.preload = 'auto';
+    el.muted = false;
+    el.volume = 1;
+    el.preservesPitch = false;
+    // The file comes from another origin. Web Audio needs CORS or the source is silent.
+    el.crossOrigin = 'anonymous';
+    const entry: AudioEntry = {
+      key,
+      mediaId,
+      stream,
+      el,
+      hasSrc: false,
+      lastUsed: now,
+      lastSeekMs: 0,
+      seekStartMs: null,
+      seekCostMs: 0,
+      gapMs: SEEK_GAP_MS,
+      nudging: false,
+    };
+    el.onseeked = () => this.onSeeked(entry);
+    el.onerror = () => this.failStream(mediaId, stream);
+    this.audioEls.set(key, entry);
+
+    try {
+      this.audio.attach(key, el);
+    } catch {
+      this.failStream(mediaId, stream);
+      return null;
+    }
+
+    void this.streamUrlFor(mediaId, stream).then((url) => {
+      if (url === null || this.destroyed) return;
+      if (this.audioEls.get(key) !== entry) return;
+      entry.hasSrc = true;
+      el.src = url;
+    });
+    return entry;
+  }
+
+  /** True when one more audio element fits, or an unneeded one can be evicted to make room. */
+  private hasAudioRoom(): boolean {
+    if (this.audioEls.size < MAX_AUDIO_ELEMENTS) return true;
+    for (const key of this.audioEls.keys()) {
+      if (!this.keepAudioKeys.has(key)) return true;
+    }
+    return false;
+  }
+
+  /** Makes room for one more audio element by dropping the least recently used unneeded one. */
+  private evictAudioIfFull(): void {
+    if (this.audioEls.size < MAX_AUDIO_ELEMENTS) return;
+    let victim: AudioEntry | null = null;
+    for (const entry of this.audioEls.values()) {
+      if (this.keepAudioKeys.has(entry.key)) continue;
+      if (victim === null || entry.lastUsed < victim.lastUsed) victim = entry;
+    }
+    if (victim === null) return;
+    this.disposeEntry(victim);
+    this.audio.detach(victim.key);
+    this.audioEls.delete(victim.key);
+  }
+
   // ---- audio ------------------------------------------------------------------------------
 
   /**
-   * Refreshes the gain curve of every default-stream audio source of the segment and silences the
+   * Refreshes the gain curve of every audio source of the segment (any stream) and silences the
    * others. Reverse playback is silent. Gain offsets are scaled to wall time by the timeline rate.
    */
   private syncAudio(seg: PlanSegment, t: Tick): void {
@@ -1116,8 +1404,10 @@ class Engine implements PreviewEngine {
     const mag = Math.abs(this.rate);
     const seen = new Set<string>();
     for (const src of seg.audio) {
-      if (src.source_track !== 0 || seen.has(src.clip_id)) continue;
+      if (seen.has(src.clip_id)) continue;
       seen.add(src.clip_id);
+      // Track 0 plays from the media's video element, every other track from its stream element.
+      const sourceKey = src.source_track === 0 ? src.media_id : streamKey(src.media_id, src.source_track);
       const ramp: GainPoint[] = gainRamp(src, t, t + secToTick(RAMP_SPAN_S), RAMP_STEP_S).map((p) => ({
         offsetSec: p.offsetSec / mag,
         gain: p.gain,
@@ -1125,7 +1415,7 @@ class Engine implements PreviewEngine {
       this.chainKeys.add(src.clip_id);
       this.audio.setSourceParams(
         src.clip_id,
-        src.media_id,
+        sourceKey,
         src.track_index,
         ramp,
         src.audio.pan,
@@ -1165,6 +1455,19 @@ class Engine implements PreviewEngine {
       // The URL resolves asynchronously: retry on a later scan until the source is set.
       if (!entry.hasSrc) continue;
       this.prefetched.set(item.mediaId, item.startsAt);
+      const target = tickToSec(item.srcTime);
+      if (entry.el.paused && !entry.el.seeking && Math.abs(entry.el.currentTime - target) > DRIFT_PAUSED_S) {
+        this.seekTo(entry, target, now);
+      }
+    }
+    for (const item of upcomingStreams(plan, t, secToTick(PREFETCH_HORIZON_S))) {
+      const key = streamKey(item.mediaId, item.stream);
+      if (this.keepAudioKeys.has(key)) continue;
+      if (this.prefetchedStreams.get(key) === item.startsAt) continue;
+      if (!this.audioEls.has(key) && !this.hasAudioRoom()) continue;
+      const entry = this.ensureAudioElement(item.mediaId, item.stream, now);
+      if (!entry || !entry.hasSrc) continue;
+      this.prefetchedStreams.set(key, item.startsAt);
       const target = tickToSec(item.srcTime);
       if (entry.el.paused && !entry.el.seeking && Math.abs(entry.el.currentTime - target) > DRIFT_PAUSED_S) {
         this.seekTo(entry, target, now);

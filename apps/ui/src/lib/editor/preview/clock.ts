@@ -21,6 +21,12 @@ export interface AudioClockSource {
   readonly outputLatency?: number;
   /** Seconds of base processing latency, when the browser reports it. */
   readonly baseLatency?: number;
+  /**
+   * Pairs a context time (the sample being output now) with the `performance.now()` ms at which
+   * it was captured. Gives a smooth, latency-corrected reading between the coarse `currentTime`
+   * steps. Optional: absent in fakes and old engines.
+   */
+  getOutputTimestamp?: () => { contextTime?: number; performanceTime?: number };
 }
 
 /** Playback clock in ticks. */
@@ -77,6 +83,8 @@ export function createClock(timeSource: TimeSource = defaultTimeSource): Clock {
   let anchorWall = 0;
   let anchorAudio: number | null = null;
   let audio: AudioClockSource | null = null;
+  // Monotonic guard: jitter in the reported latency must not move the playhead against its direction.
+  let lastTick: Tick = 0;
 
   /** Wall time in seconds; a non-finite reading counts as 0. */
   function wallNow(): number {
@@ -91,23 +99,52 @@ export function createClock(timeSource: TimeSource = defaultTimeSource): Clock {
    */
   function elapsedSec(): number {
     let v: number;
-    if (anchorAudio !== null && audio !== null && Number.isFinite(audio.currentTime)) {
-      v = Math.max(0, audio.currentTime - outputLatencySec(audio) - anchorAudio);
+    const heard = audio !== null && anchorAudio !== null ? audioHeard(audio) : null;
+    if (anchorAudio !== null && heard !== null) {
+      // The anchor is the raw context time, so the clock holds for one output latency after a start.
+      v = Math.max(0, heard - anchorAudio);
     } else {
       v = wallNow() - anchorWall;
     }
     return Number.isFinite(v) ? v : 0;
   }
 
+  /**
+   * Audio time (seconds) that the listener hears now. Prefers `getOutputTimestamp` extrapolated with
+   * the wall clock (smooth); otherwise `currentTime` minus the reported latencies. Null when the
+   * audio clock gives no finite reading.
+   */
+  function audioHeard(a: AudioClockSource): number | null {
+    if (typeof a.getOutputTimestamp === 'function') {
+      try {
+        const ts = a.getOutputTimestamp();
+        const c = ts.contextTime;
+        const p = ts.performanceTime;
+        if (c !== undefined && p !== undefined && Number.isFinite(c) && Number.isFinite(p) && c > 0 && p > 0) {
+          const extra = (wallNow() * 1000 - p) / 1000;
+          if (Number.isFinite(extra) && extra >= 0 && extra < 0.5) return c + extra;
+        }
+      } catch {
+        // Fall through to currentTime.
+      }
+    }
+    if (!Number.isFinite(a.currentTime)) return null;
+    return a.currentTime - outputLatencySec(a);
+  }
+
   /** Playhead tick now. While stopped this is the stored anchor tick. */
   function nowTick(): Tick {
     if (!running) return anchorTick;
-    return toPlayTick(anchorTick + elapsedSec() * rate * TICKS_PER_SECOND);
+    const raw = toPlayTick(anchorTick + elapsedSec() * rate * TICKS_PER_SECOND);
+    const t = rate >= 0 ? Math.max(lastTick, raw) : Math.min(lastTick, raw);
+    lastTick = t;
+    return t;
   }
 
   /** Re-bases the anchor so that `t` is the tick at this instant, using the current audio source. */
   function anchorAt(t: Tick): void {
     anchorTick = t;
+    lastTick = t;
     anchorWall = wallNow();
     anchorAudio = audio !== null && Number.isFinite(audio.currentTime) ? audio.currentTime : null;
   }

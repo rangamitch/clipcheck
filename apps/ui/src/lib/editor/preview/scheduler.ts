@@ -164,27 +164,81 @@ export interface UpcomingMedia {
   srcTime: Tick;
 }
 
+/** Index of the first segment whose start is greater than `t` (segments are sorted). */
+function firstSegmentAfter(plan: RenderPlan, t: Tick): number {
+  const segs = plan.segments;
+  let lo = 0;
+  let hi = segs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    const s = segs[mid];
+    if (s !== undefined && s.start <= t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 /**
  * Media that starts within `(t, t + horizon]` and is not active at `t`, for preloading. Video and
- * audio entries are merged by `mediaId`, keeping the earliest. The result is sorted by `startsAt`.
- * A non-positive or NaN horizon, or NaN `t`, gives an empty list.
+ * default-stream (source_track 0) audio entries are merged by `mediaId`, keeping the earliest.
+ * Other audio streams have their own elements, see {@link upcomingStreams}. The result is sorted by
+ * `startsAt`. A non-positive or NaN horizon, or NaN `t`, gives an empty list.
  */
 export function upcoming(plan: RenderPlan, t: Tick, horizon: Tick): UpcomingMedia[] {
   if (Number.isNaN(t) || !(horizon > 0)) return [];
   const limit = t + horizon;
-  const active = activeNow(plan, t);
-  const busy = new Set<string>([...active.video, ...active.audio]);
+  const cur = segmentAt(plan, t);
+  const busy = new Set<string>();
+  if (cur) {
+    for (const l of cur.video) if (l.media_id !== null) busy.add(l.media_id);
+    for (const a of cur.audio) if (a.source_track === 0) busy.add(a.media_id);
+  }
   const seen = new Map<string, UpcomingMedia>();
-  for (const seg of plan.segments) {
-    if (!(seg.start > t) || seg.start > limit) continue;
+  for (let i = firstSegmentAfter(plan, t); i < plan.segments.length; i++) {
+    const seg = plan.segments[i];
+    if (seg === undefined || seg.start > limit) break;
     for (const layer of seg.video) {
       addUpcoming(seen, busy, layer.media_id, seg.start, layer.src_time);
     }
     for (const src of seg.audio) {
+      if (src.source_track !== 0) continue;
       addUpcoming(seen, busy, src.media_id, seg.start, src.src_time);
     }
   }
   return Array.from(seen.values()).sort((a, b) => a.startsAt - b.startsAt);
+}
+
+/** A non-default audio stream that becomes active soon. */
+export interface UpcomingStream {
+  mediaId: string;
+  /** Source stream index (never 0). */
+  stream: number;
+  startsAt: Tick;
+  srcTime: Tick;
+}
+
+/**
+ * Non-default audio streams (source_track != 0) that are not active at `t` but start within
+ * `(t, t + horizon]`, earliest first, one entry per (media, stream).
+ */
+export function upcomingStreams(plan: RenderPlan, t: Tick, horizon: Tick): UpcomingStream[] {
+  if (Number.isNaN(t) || !(horizon > 0)) return [];
+  const limit = t + horizon;
+  const cur = segmentAt(plan, t);
+  const busy = new Set<string>();
+  if (cur) for (const a of cur.audio) busy.add(`${a.media_id}#${a.source_track}`);
+  const seen = new Map<string, UpcomingStream>();
+  for (let i = firstSegmentAfter(plan, t); i < plan.segments.length; i++) {
+    const seg = plan.segments[i];
+    if (seg === undefined || seg.start > limit) break;
+    for (const src of seg.audio) {
+      if (src.source_track === 0) continue;
+      const key = `${src.media_id}#${src.source_track}`;
+      if (busy.has(key) || seen.has(key)) continue;
+      seen.set(key, { mediaId: src.media_id, stream: src.source_track, startsAt: seg.start, srcTime: src.src_time });
+    }
+  }
+  return Array.from(seen.values());
 }
 
 /** Records `mediaId` in `seen` unless it is busy or already recorded. */

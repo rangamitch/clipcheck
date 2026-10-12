@@ -15,9 +15,11 @@ import { panGains } from './scheduler';
 // the mixer conventions in ../../player/mixer.ts: a 10 ms time constant for static changes, and
 // disconnect helpers that swallow errors from nodes that are already gone.
 //
-// Limitation (first version): an HTMLMediaElement exposes all audio streams of a file, but
-// WebView2 plays only the default stream. Stream selection is therefore limited to the default
-// stream. A future sidecar hook can replace the element for a media id through `attach`.
+// Streams: an HTMLMediaElement of a video file plays only its default stream (index 0) in WebView2.
+// Every other stream is played by its own hidden audio element (an extracted single-stream file).
+// The engine attaches each such element under the key `<mediaId>#<stream>` (the `mediaId` argument of
+// `attach` and `setSourceParams` is just a source key). A media element source that no chain uses is
+// connected to nothing and is therefore silent, so the picture-only video of an unplaced Mix never plays.
 //
 // CORS: media is served from another origin (clip protocol). The element must request CORS
 // (crossOrigin 'anonymous') before its load starts, or the source node outputs silence. The
@@ -155,7 +157,15 @@ export class AudioGraph {
   private closed = false;
 
   constructor() {
-    this.ctx = new AudioContext();
+    // 'playback' uses larger device buffers: fewer underruns (crackle) while the main thread paints.
+    // The clock subtracts the reported output latency, so picture and sound stay aligned.
+    let ctx: AudioContext;
+    try {
+      ctx = new AudioContext({ latencyHint: 'playback' });
+    } catch {
+      ctx = new AudioContext();
+    }
+    this.ctx = ctx;
     this.master = this.ctx.createGain();
     this.masterMeter = this.ctx.createAnalyser();
     this.masterMeter.fftSize = METER_FFT;
