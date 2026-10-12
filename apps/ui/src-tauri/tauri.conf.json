@@ -27,7 +27,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; media-src 'self' http://clip.localhost http://127.0.0.1:*; img-src 'self' data: http://clip.localhost; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; script-src 'self'; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; media-src 'self' blob: http://clip.localhost http://127.0.0.1:*; img-src 'self' data: http://clip.localhost; connect-src 'self' ipc: http://ipc.localhost http://127.0.0.1:*; script-src 'self'; style-src 'self' 'unsafe-inline'"
     }
   },
   "bundle": {
