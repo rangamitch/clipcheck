@@ -36,6 +36,7 @@ Windows' own Media Foundation and ClipCheck's own MP4 muxer.
   microphone, chosen apps (Discord by default) and other apps. Per-source gain and a mic noise gate.
 - **Gallery.** Search, filter, sort, rename, favourite and delete recordings. Extra folders (for
   example an old clips folder) can be indexed in place without moving anything.
+- **Video editor (new, untested).** A multi-track timeline editor: cut, trim, group, edit audio and volume, choose canvas size, and export to its own `Exports` folder with quality, resolution and size presets. See `docs/design/13-video-editor.md`.
 - **Player and trimmer.** Built-in player with volume, speed and per-track audio controls, plus a
   timeline trimmer that saves a new clip or replaces the original.
 - **In-app updates.** An update button appears when a new version is out. Updates are signature

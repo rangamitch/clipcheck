@@ -2,6 +2,8 @@
 //! In-process probing and decoding. Contract: docs/impl/ffmpeg-removal.md, R3.
 
 #[cfg(windows)]
+pub mod audio;
+#[cfg(windows)]
 mod mf;
 #[cfg(windows)]
 mod wic;

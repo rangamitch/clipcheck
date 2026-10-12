@@ -44,6 +44,8 @@ export interface GeneralConfig {
 
 export interface StorageConfig {
   root: string;
+  /** Video editor export folder; "" or absent = `<root>\Exports`. Optional so older fixtures still type-check. */
+  export_dir?: string;
   per_game_folders: boolean;
   quota_gb: number;
   quota_action: QuotaAction;
@@ -238,7 +240,7 @@ export const AUTOSAVE_MS = 700;
  * Paths whose text is typed (`PathField` reports every keystroke). A change made while a text
  * input has focus waits for the field to lose focus; a Browse pick saves on the normal debounce.
  */
-const BLUR_COMMIT_PATHS: ReadonlySet<string> = new Set(['storage.root', 'replay.location']);
+const BLUR_COMMIT_PATHS: ReadonlySet<string> = new Set(['storage.root', 'storage.export_dir', 'replay.location']);
 
 const REJECTED_NOTICE = 'Not saved. Fix the highlighted fields.';
 

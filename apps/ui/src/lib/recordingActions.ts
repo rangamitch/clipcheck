@@ -8,6 +8,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { request, isErrorReply, type Reply } from './daemon';
 import { isTauriRuntime } from './window';
+import { openEditor } from './nav';
 
 /** Turns a daemon error reply into a readable Error. */
 function replyError(reply: Extract<Reply, { type: 'error' }>): Error {
@@ -65,6 +66,14 @@ export async function openFolder(path: string): Promise<void> {
 export async function pickFolder(initial?: string): Promise<string | null> {
   if (!isTauriRuntime()) return null;
   return invoke<string | null>('pick_folder', { initial: initial ?? null });
+}
+
+/**
+ * Opens the video editor on a new project built from one recording. `range` (ms, source time)
+ * is the player trim selection; omit it to place the full recording.
+ */
+export function editInEditor(id: string, range?: { startMs: number; endMs: number }): void {
+  openEditor({ projectId: null, recordingIds: [id], ...(range ? { range } : {}) });
 }
 
 /** Sets or clears the favourite flag of a recording. Throws on failure. */

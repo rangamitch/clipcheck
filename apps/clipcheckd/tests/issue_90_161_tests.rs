@@ -317,6 +317,7 @@ fn issue161_register_edited_bogus_path_returns_error_not_not_implemented() {
                 source_recording_id: None,
                 path,
                 keep_source_time: false,
+                game: None,
             });
             match &reply {
                 Reply::Error { code, .. } => {

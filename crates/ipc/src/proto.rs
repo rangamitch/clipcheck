@@ -141,6 +141,10 @@ pub enum Command {
         /// When true and the source recording exists, the new recording takes the source's
         /// creation time and favourite flag.
         keep_source_time: bool,
+        /// Game name for the new recording. Overrides the source's game when set. An empty or
+        /// missing value keeps the source's game. `Exports` (case-insensitive) may register a
+        /// file outside every configured library folder; its own folder becomes the root.
+        game: Option<String>,
     },
     /// Enable pushed events for the given topics.
     Subscribe {
@@ -315,6 +319,8 @@ enum CommandWire {
         path: String,
         #[serde(default)]
         keep_source_time: bool,
+        #[serde(default)]
+        game: Option<String>,
     },
     Subscribe {
         topics: Vec<Topic>,
@@ -413,10 +419,12 @@ impl From<Command> for CommandWire {
                 source_recording_id,
                 path,
                 keep_source_time,
+                game,
             } => CommandWire::RegisterEditedRecording {
                 source_recording_id,
                 path,
                 keep_source_time,
+                game,
             },
             Command::Subscribe { topics } => CommandWire::Subscribe { topics },
             Command::Unsubscribe { topics } => CommandWire::Unsubscribe { topics },
@@ -481,10 +489,12 @@ impl From<CommandWire> for Command {
                 source_recording_id,
                 path,
                 keep_source_time,
+                game,
             } => Command::RegisterEditedRecording {
                 source_recording_id,
                 path,
                 keep_source_time,
+                game,
             },
             CommandWire::Subscribe { topics } => Command::Subscribe { topics },
             CommandWire::Unsubscribe { topics } => Command::Unsubscribe { topics },

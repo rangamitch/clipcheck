@@ -460,6 +460,10 @@ pub struct Storage {
     pub filename_template: String,
     /// Send deletions to the Recycle Bin.
     pub delete_to_recycle_bin: bool,
+    /// Folder for video editor exports. Exports are written flat here, never grouped by game.
+    /// Empty means `<root>\Exports`. `%VARS%` are expanded by readers (see
+    /// [`Storage::export_dir_resolved`]).
+    pub export_dir: String,
     /// EXTRA library folders: scanned and shown in the gallery, never written to by recording.
     /// `[[storage.libraries]]`. Kept last so the TOML serializer emits the plain keys first.
     pub libraries: Vec<LibraryDir>,
@@ -474,6 +478,7 @@ impl Default for Storage {
             quota_action: QuotaAction::Warn,
             filename_template: "{game} {yyyy-MM-dd HH-mm-ss} {kind}".to_owned(),
             delete_to_recycle_bin: true,
+            export_dir: String::new(),
             libraries: Vec::new(),
         }
     }
@@ -543,6 +548,55 @@ impl Storage {
         };
         format!(r"{root}\{folder}\{game}")
     }
+
+    /// Folder for video editor exports, with `%VARS%` expanded from the process environment.
+    ///
+    /// The configured `export_dir` is used when it is not blank. Otherwise the result is
+    /// `<root>\Exports`, with the expanded root's trailing separators dropped. This function does
+    /// not check the result or create it.
+    pub fn export_dir_resolved(&self) -> PathBuf {
+        let configured = self.export_dir.trim();
+        if !configured.is_empty() {
+            return PathBuf::from(expand_vars_with(configured, |name| {
+                std::env::var(name).ok()
+            }));
+        }
+        let root = expand_vars_with(&self.root.to_string_lossy(), |name| {
+            std::env::var(name).ok()
+        });
+        let root = root.trim_end_matches(['\\', '/']);
+        PathBuf::from(format!(r"{root}\Exports"))
+    }
+}
+
+/// Replaces each `%NAME%` with the value from `lookup`. A reference that `lookup` does not know,
+/// an empty name (`%%`) and an unmatched `%` are kept exactly as written. The same rules as the
+/// daemon's root expansion.
+pub(crate) fn expand_vars_with<F>(input: &str, lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(open) = rest.find('%') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('%') else {
+            break;
+        };
+        let name = &after_open[..close];
+        out.push_str(&rest[..open]);
+        match if name.is_empty() { None } else { lookup(name) } {
+            Some(value) => out.push_str(&value),
+            None => {
+                out.push('%');
+                out.push_str(name);
+                out.push('%');
+            }
+        }
+        rest = &after_open[close + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Characters removed from a game folder name (Windows forbids them in file names).
@@ -2005,6 +2059,7 @@ quota_gb = 0                    # 0 = unlimited; otherwise total size cap for re
 quota_action = "warn"           # "warn" | "delete_oldest_clips" | "stop_recording"
 filename_template = "{game} {yyyy-MM-dd HH-mm-ss} {kind}"
 delete_to_recycle_bin = true    # deletions (quota, UI) go to the Recycle Bin
+export_dir = ""                 # video editor exports; "" = root\Exports; %VARS% expanded at load
 
 # Extra library folders: scanned and shown in the gallery, never moved. New recordings still
 # go to root. At most 16 entries. Uncomment to add one.

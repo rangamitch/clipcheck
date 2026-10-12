@@ -526,11 +526,13 @@ fn every_command_variant_roundtrips() {
             source_recording_id: Some("r1".into()),
             path: r"C:\out\edit.mp4".into(),
             keep_source_time: false,
+            game: None,
         },
         Command::RegisterEditedRecording {
             source_recording_id: None,
             path: r"C:\out\edit.mp4".into(),
             keep_source_time: false,
+            game: None,
         },
         Command::Subscribe {
             topics: vec![Topic::Levels],

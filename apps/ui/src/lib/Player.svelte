@@ -11,7 +11,7 @@
     type PlayerOpenDto,
     type RecordingDto,
   } from './api';
-  import { openRecording, playerRow, updatePlayerRow } from './nav';
+  import { closePlayer, openRecording, playerRow, updatePlayerRow } from './nav';
   import {
     isMuted,
     loadVolume,
@@ -22,6 +22,7 @@
   } from './player/volumeprefs';
   import {
     deleteRecording,
+    editInEditor,
     renameRecording,
     revealRecording,
     setFavorite,
@@ -615,6 +616,16 @@
 
   const mode = $derived<TrimMode>(exactCut ? 'precise' : 'lossless');
 
+  /**
+   * Opens a new editor project from this recording (F-UX-9). The trim selection travels as
+   * `range` only when it is an actual trim; otherwise the full recording is placed.
+   */
+  function openInEditor() {
+    const range = trimmed ? { startMs: selection.startMs, endMs: selection.endMs } : undefined;
+    closePlayer();
+    editInEditor(id, range);
+  }
+
   function resetTrim() {
     selection = clampSelection({ startMs: 0, endMs: durationMs }, durationMs);
     trimError = '';
@@ -1014,6 +1025,7 @@
             <button type="button" class="btn" onclick={cancelSave}>Cancel</button>
           </div>
         {:else}
+          <button type="button" class="btn" onclick={openInEditor}>Open in editor</button>
           {#if trimmed}
             <button type="button" class="btn" onclick={resetTrim}>
               <Icon name="reset" size={16} /> Reset

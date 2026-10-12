@@ -2,7 +2,7 @@ import { writable } from 'svelte/store';
 import type { RecordingDto } from './api';
 
 /** Top-level views the main window can show. */
-export const VIEWS = ['gallery', 'settings'] as const;
+export const VIEWS = ['gallery', 'editor', 'settings'] as const;
 export type View = (typeof VIEWS)[number];
 
 /** Currently active view. Starts on the gallery. */
@@ -19,6 +19,34 @@ export const playerFileName = writable<string | null>(null);
  * date instantly. Null when closed or when opened by id only.
  */
 export const playerRow = writable<RecordingDto | null>(null);
+
+/**
+ * What the Editor view should show: null = the home screen (recent projects); otherwise open the
+ * project with this id, or create one from the library recordings (ids) when `projectId` is null.
+ */
+export interface EditorTarget {
+  projectId: string | null;
+  recordingIds: string[];
+  /** Optional source range (ms) from the player trimmer; the editor applies it to the new clip. */
+  range?: { startMs: number; endMs: number };
+}
+
+/** Editor view target (see {@link EditorTarget}). */
+export const editorTarget = writable<EditorTarget | null>(null);
+
+/**
+ * Counts the requests to open the editor. The Editor view is keyed on it, so only a request from
+ * outside the editor remounts it. Replacing the target from inside the editor does not change it.
+ */
+export const editorNonce = writable<number>(0);
+
+/** Opens the editor on a saved project, or on a new project built from recordings. */
+export function openEditor(target: EditorTarget | null = null): void {
+  closePlayer();
+  editorTarget.set(target);
+  editorNonce.update((n) => n + 1);
+  activeView.set('editor');
+}
 
 /** Switches the active view. Any open clip is left first (D60), so the rail always navigates. */
 export function setView(view: View): void {

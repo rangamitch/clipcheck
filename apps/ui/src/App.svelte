@@ -8,13 +8,18 @@
   import { daemonConnected, onConnection, onEvent } from './lib/daemon';
   import { refreshesGallery } from './lib/gallerysync';
   import { startLiveStatus } from './lib/status';
-  import { VIEWS, activeView, setView, playerTarget, playerFileName, closePlayer, type View } from './lib/nav';
+  import { VIEWS, activeView, setView, playerTarget, playerFileName, closePlayer, editorTarget, editorNonce, type View } from './lib/nav';
   import Player from './lib/Player.svelte';
+  import Editor from './lib/editor/Editor.svelte';
+  import EditorHome from './lib/editor/EditorHome.svelte';
+  import ExportPill from './lib/editor/ExportPill.svelte';
+  import Toasts from './lib/editor/Toasts.svelte';
   import ExitConfirm from './lib/ExitConfirm.svelte';
   import UpdateModal from './lib/UpdateModal.svelte';
 
   const LABELS: Record<View, string> = {
     gallery: 'Gallery',
+    editor: 'Editor',
     settings: 'Settings',
   };
 
@@ -109,6 +114,9 @@
     {#snippet leading()}
       <RecorderBar />
     {/snippet}
+    {#snippet status()}
+      <ExportPill />
+    {/snippet}
   </TitleBar>
 
   <div class="body">
@@ -135,6 +143,14 @@
         <div class="gallery-view">
           <Gallery bind:this={gallery} />
         </div>
+      {:else if $activeView === 'editor'}
+        {#if $editorTarget === null}
+          <EditorHome />
+        {:else}
+          {#key $editorNonce}
+            <Editor target={$editorTarget} />
+          {/key}
+        {/if}
       {:else}
         <Settings />
       {/if}
@@ -143,6 +159,8 @@
 </div>
 
 <ExitConfirm />
+
+<Toasts />
 <UpdateModal />
 
 <style>

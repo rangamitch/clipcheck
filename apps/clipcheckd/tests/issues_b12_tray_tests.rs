@@ -260,6 +260,7 @@ mod recording_commands {
                 source_recording_id: None,
                 path: "relative\\edited.mp4".into(),
                 keep_source_time: false,
+                game: None,
             },
         );
         assert_error_code(

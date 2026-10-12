@@ -47,6 +47,23 @@
   </FieldRow>
 
   <FieldRow
+    label="Export folder"
+    path="storage.export_dir"
+    help="Where the video editor saves exported videos. Exports are not grouped by game."
+  >
+    {#snippet children(ctl)}
+      <PathField
+        {...ctl}
+        value={storage.export_dir ?? ''}
+        placeholder={storage.root ? `${storage.root}\\Exports` : 'Exports folder inside the recordings folder'}
+        showOpen={(storage.export_dir ?? '').trim() !== ''}
+        {disabled}
+        onchange={(v) => setPath('storage.export_dir', v)}
+      />
+    {/snippet}
+  </FieldRow>
+
+  <FieldRow
     label="Save each game in its own folder"
     path="storage.per_game_folders"
     help="Creates a folder for each game inside the recordings folder."

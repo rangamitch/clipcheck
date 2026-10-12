@@ -9,7 +9,13 @@
 
 <script lang="ts">
   import { tick } from 'svelte';
-  import { deleteRecording, renameRecording, revealRecording, setFavorite } from './recordingActions';
+  import {
+    deleteRecording,
+    editInEditor,
+    renameRecording,
+    revealRecording,
+    setFavorite,
+  } from './recordingActions';
 
   type Change =
     | { kind: 'renamed'; id: string; name: string }
@@ -252,6 +258,12 @@
     );
   }
 
+  function onEditClick() {
+    if (!ready) return;
+    closeMenu(false);
+    editInEditor(id);
+  }
+
   function onRevealClick() {
     closeMenu(false);
     revealRecording(id).catch((e: unknown) => {
@@ -367,6 +379,9 @@
     </button>
     <button type="button" role="menuitem" tabindex="-1" disabled={!ready} aria-disabled={!ready} onclick={onFavoriteClick}>
       {isFavorite ? 'Remove from favourites' : 'Add to favourites'}
+    </button>
+    <button type="button" role="menuitem" tabindex="-1" disabled={!ready} aria-disabled={!ready} onclick={onEditClick}>
+      Edit in video editor
     </button>
     <button type="button" role="menuitem" tabindex="-1" onclick={onRevealClick}>
       Open file location

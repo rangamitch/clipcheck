@@ -1,0 +1,14 @@
+[package]
+name = "clipcheck-timeline"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure video-editor model: ticks, projects, edit operations, undo, render plan (docs/design/13-video-editor.md)"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]

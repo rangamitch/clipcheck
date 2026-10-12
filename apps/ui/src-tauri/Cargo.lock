@@ -656,6 +656,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipcheck-render"
+version = "0.4.1"
+dependencies = [
+ "clipcheck-aacenc",
+ "clipcheck-hwenc",
+ "clipcheck-mfdec",
+ "clipcheck-mp4",
+ "clipcheck-timeline",
+ "clipcheck-util",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "clipcheck-session"
 version = "0.4.1"
 dependencies = [
@@ -674,15 +690,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipcheck-timeline"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "ulid",
+]
+
+[[package]]
 name = "clipcheck-ui"
 version = "0.4.1"
 dependencies = [
  "clipcheck-clipedit",
+ "clipcheck-hwenc",
  "clipcheck-ipc",
  "clipcheck-library",
  "clipcheck-mfdec",
  "clipcheck-mp4",
+ "clipcheck-render",
  "clipcheck-testkit",
+ "clipcheck-timeline",
  "clipcheck-util",
  "clipcheckd",
  "serde",

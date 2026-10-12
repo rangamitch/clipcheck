@@ -245,6 +245,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipcheck-render"
+version = "0.4.1"
+dependencies = [
+ "clipcheck-aacenc",
+ "clipcheck-hwenc",
+ "clipcheck-mfdec",
+ "clipcheck-mp4",
+ "clipcheck-timeline",
+ "clipcheck-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "windows",
+]
+
+[[package]]
 name = "clipcheck-session"
 version = "0.4.1"
 dependencies = [
@@ -262,6 +279,16 @@ dependencies = [
  "clipcheck-mp4",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "clipcheck-timeline"
+version = "0.4.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ulid",
 ]
 
 [[package]]

@@ -7,10 +7,11 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 use super::schema::{
-    normalize_game_key, AudioApp, AudioCodec, Codec, Config, DetectionMode, EncoderChoice, Fps,
-    GameOverride, KeyChord, MuteMode, Preset, Press, RateControl, ReplayStorage, Resolution,
-    CONFIG_VERSION, MAX_AUDIO_APPS, MAX_AUDIO_TRACKS, MAX_LIBRARIES, MAX_LIBRARY_LABEL_CHARS,
-    MAX_UPDATE_ENDPOINT_CHARS, UPDATE_INTERVAL_HOURS_MAX, UPDATE_INTERVAL_HOURS_MIN,
+    expand_vars_with, normalize_game_key, AudioApp, AudioCodec, Codec, Config, DetectionMode,
+    EncoderChoice, Fps, GameOverride, KeyChord, MuteMode, Preset, Press, RateControl,
+    ReplayStorage, Resolution, Storage, CONFIG_VERSION, MAX_AUDIO_APPS, MAX_AUDIO_TRACKS,
+    MAX_LIBRARIES, MAX_LIBRARY_LABEL_CHARS, MAX_UPDATE_ENDPOINT_CHARS, UPDATE_INTERVAL_HOURS_MAX,
+    UPDATE_INTERVAL_HOURS_MIN,
 };
 use super::vk::{VK_DELETE, VK_F4, VK_L, VK_PRINT_SCREEN, VK_TAB};
 
@@ -70,6 +71,10 @@ pub const MAX_CLIP_HOTKEYS: usize = 8;
 const MAX_RENDERED_NAME: usize = 180;
 /// Characters Windows forbids in file names (CFG-S003).
 const ILLEGAL_NAME_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+/// Longest expanded `storage.export_dir` in characters (CFG-S015).
+const MAX_EXPORT_DIR_CHARS: usize = 240;
+/// Characters refused in an expanded `storage.export_dir` (CFG-S015). `:` is allowed for drives.
+const EXPORT_DIR_ILLEGAL_CHARS: &[char] = &['*', '?', '"', '<', '>', '|'];
 
 /// Checks `config` against the rules in doc 09 section 6.4.
 ///
@@ -225,6 +230,47 @@ fn check_storage(config: &Config, out: &mut Vec<Diagnostic>) {
         );
     }
     check_template(&s.filename_template, out);
+    check_export_dir(s, out);
+}
+
+/// Checks `storage.export_dir` after `%VARS%` expansion (CFG-S015). An empty value means the
+/// default `<root>\Exports` and is always valid. Otherwise the folder must be an absolute drive
+/// or UNC path, at most 240 characters, free of `* ? " < > |`, and must not name an existing
+/// file. The file check is the one filesystem read in this module.
+fn check_export_dir(s: &Storage, out: &mut Vec<Diagnostic>) {
+    const PATH: &str = "storage.export_dir";
+    let raw = s.export_dir.trim();
+    if raw.is_empty() {
+        return;
+    }
+    let expanded = expand_vars_with(raw, |name| std::env::var(name).ok());
+    let reason = if !is_absolute_expanded(&expanded) {
+        "must be an absolute path such as D:\\Exports or \\\\server\\share\\Exports"
+    } else if expanded.chars().count() > MAX_EXPORT_DIR_CHARS {
+        "is longer than 240 characters"
+    } else if expanded.contains(EXPORT_DIR_ILLEGAL_CHARS) {
+        "contains a character Windows does not allow in folder names (* ? \" < > |)"
+    } else if std::path::Path::new(&expanded).is_file() {
+        "names an existing file. Choose a folder"
+    } else {
+        return;
+    };
+    error(
+        out,
+        "CFG-S015",
+        PATH,
+        format!("storage.export_dir '{expanded}' {reason}"),
+    );
+}
+
+/// True for an expanded drive path (`D:\` or `D:/`) or a UNC path (`\\server\share`).
+fn is_absolute_expanded(path: &str) -> bool {
+    let mut chars = path.chars();
+    let drive = matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(d), Some(':'), Some('\\' | '/')) if d.is_ascii_alphabetic()
+    );
+    drive || path.starts_with(r"\\") || path.starts_with("//")
 }
 
 /// Normalized form of a folder path for comparisons: `/` becomes `\`, surrounding spaces and

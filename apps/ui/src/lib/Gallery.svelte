@@ -19,7 +19,7 @@
     type SortKey,
     type StatsDto,
   } from './api';
-  import { openRecording } from './nav';
+  import { openEditor, openRecording } from './nav';
   import { warmRecording } from './player/warm';
   import { debounce } from './debounce';
   import { formatBytes, formatDuration, formatRelativeDate } from './format';
@@ -412,6 +412,20 @@
     confirmingBulk = false;
   }
 
+  /** Opens the editor on the selected recordings, in the order they appear in the list. */
+  function editSelectedTogether(): void {
+    const recordingIds = items.filter((r) => selected.has(r.id)).map((r) => r.id);
+    if (recordingIds.length < 2) return;
+    openEditor({ projectId: null, recordingIds });
+  }
+
+  /** Puts a recording on the drag data so an open editor can accept it (F-UX-8). */
+  function onCardDragStart(e: DragEvent, r: RecordingDto): void {
+    if (!e.dataTransfer) return;
+    e.dataTransfer.effectAllowed = 'copy';
+    e.dataTransfer.setData('application/x-clipcheck-recording', JSON.stringify({ recordingId: r.id }));
+  }
+
   /** Deletes the selected recordings one by one; failures stay selected and are reported. */
   async function deleteSelected(): Promise<void> {
     bulkBusy = true;
@@ -645,6 +659,14 @@
       {:else}
         <button
           type="button"
+          class="control"
+          disabled={selected.size < 2 || bulkBusy}
+          onclick={editSelectedTogether}
+        >
+          Edit together
+        </button>
+        <button
+          type="button"
           class="control danger"
           disabled={selected.size === 0 || bulkBusy}
           onclick={() => (confirmingBulk = true)}
@@ -689,6 +711,8 @@
                   class:picked={selecting && selected.has(r.id)}
                   class:selecting
                   data-rid={r.id}
+                  draggable={!selecting && ready ? 'true' : undefined}
+                  ondragstart={(e) => onCardDragStart(e, r)}
                   oncontextmenu={(e) => onContextMenu(e, r.id)}
                 >
                   <button

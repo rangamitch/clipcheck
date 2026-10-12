@@ -10,6 +10,7 @@ pub mod closing;
 pub mod commands;
 pub mod daemon;
 pub mod details;
+pub mod editor;
 pub mod fileops;
 pub mod ipc;
 pub mod media;
@@ -62,6 +63,7 @@ pub fn run() {
             // `daemon-connection` with `{ "connected": bool }`.
             // Close settings are cached from the daemon's config (see `closing`).
             app.manage(closing::new_cache());
+            app.manage(editor::EditorState::default());
             // The callbacks run on the connection thread, which can start before this setup
             // reaches `manage`. They read the client from this slot, filled right after start,
             // so they never poll for managed state.
@@ -133,6 +135,47 @@ pub fn run() {
             updater::skip_update_version,
             updater::get_update_state,
             updater::get_pending_update,
+            editor::dialogs::editor_pick_files,
+            editor::settings::editor_get_settings,
+            editor::settings::editor_set_settings,
+            editor::projects::editor_list_projects,
+            editor::projects::editor_new_project,
+            editor::projects::editor_open_project,
+            editor::projects::editor_recover_autosave,
+            editor::projects::editor_save_project,
+            editor::projects::editor_autosave,
+            editor::projects::editor_close_project,
+            editor::projects::editor_rename_project,
+            editor::projects::editor_duplicate_project,
+            editor::projects::editor_delete_project,
+            editor::session_cmds::editor_apply,
+            editor::session_cmds::editor_undo,
+            editor::session_cmds::editor_redo,
+            editor::session_cmds::editor_set_ui_state,
+            editor::session_cmds::editor_plan,
+            editor::session_cmds::editor_snap_points,
+            editor::session_cmds::editor_clipboard_len,
+            editor::session_cmds::editor_current_snapshot,
+            editor::media::editor_probe_media,
+            editor::media::editor_media_from_recording,
+            editor::media::editor_media_status,
+            editor::media::editor_waveform,
+            editor::media::editor_thumbnails,
+            editor::media::editor_media_url,
+            editor::media::editor_measure_clip_loudness,
+            editor::export::editor_export_defaults,
+            editor::export::editor_estimate_export,
+            editor::export::editor_check_smart_export,
+            editor::export::editor_export_start,
+            editor::export::editor_export_cancel,
+            editor::export::editor_export_pause,
+            editor::export::editor_export_pause_override,
+            editor::export::editor_export_queue,
+            editor::export::editor_export_dismiss,
+            editor::export::editor_export_reorder,
+            editor::export::editor_export_still,
+            editor::export::editor_save_preset,
+            editor::export::editor_delete_preset,
             ipc::daemon_connection_error
         ])
         .run(tauri::generate_context!())

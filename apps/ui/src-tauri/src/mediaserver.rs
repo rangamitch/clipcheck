@@ -8,7 +8,7 @@ use std::fs::File;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -28,6 +28,9 @@ pub struct MediaServer {
 
 static SERVER: OnceLock<Option<MediaServer>> = OnceLock::new();
 static PATHS: Mutex<Option<HashMap<String, (PathBuf, Instant)>>> = Mutex::new(None);
+/// Imported files registered with [`register_extra_path`], keyed by their random URL key. Only
+/// these exact canonical paths are served under `/{token}/imp/{key}`.
+static IMPORTS: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
 
 /// Starts the server once (idempotent). `None` when binding failed.
 pub fn start() -> Option<&'static MediaServer> {
@@ -212,6 +215,8 @@ fn parse_request(lines: &[String]) -> Option<Request> {
 enum Route {
     Rec(String),
     Aud(String, u32),
+    /// An imported file registered with `register_extra_path` (key, not a recording id).
+    Imp(String),
 }
 
 /// Matches `/{token}/rec/{id}` and `/{token}/aud/{id}/{n}`; `None` for anything else.
@@ -226,6 +231,9 @@ fn match_route(target: &str, token: &str) -> Option<Route> {
                 return None;
             }
             Some(Route::Aud((*id).into(), n.parse().ok()?))
+        }
+        [t, "imp", key] if *t == token && media::is_valid_id(key) => {
+            Some(Route::Imp((*key).into()))
         }
         _ => None,
     }
@@ -315,10 +323,99 @@ fn recording_path(id: &str, force: bool) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Opens an imported file by its registered key. `None` for unknown keys.
+fn open_import(key: &str) -> Option<(File, &'static str, std::fs::Metadata)> {
+    let path = {
+        let guard = IMPORTS.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().and_then(|m| m.get(key)).cloned()?
+    };
+    let file = File::open(&path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let ct = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(media::content_type_for_ext)
+        .unwrap_or("application/octet-stream");
+    Some((file, ct, meta))
+}
+
+/// Registers an imported media file for playback and returns its loopback URL
+/// (`http://127.0.0.1:{port}/{token}/imp/{key}`). Only registered files are served, each under a
+/// fresh random key; registering the same file again returns the same URL. `None` when the file
+/// is not a regular file or the server is not running.
+pub fn register_extra_path(path: &Path) -> Option<String> {
+    let server = start()?;
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !canonical.is_file() {
+        return None;
+    }
+    let ext = canonical
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !IMPORT_EXTS.contains(&ext.as_str()) {
+        return None;
+    }
+    let mut guard = IMPORTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let existing = map
+        .iter()
+        .find(|(_, p)| **p == canonical)
+        .map(|(k, _)| k.clone());
+    let key = match existing {
+        Some(k) => k,
+        None => {
+            let k = generate_token();
+            map.insert(k.clone(), canonical);
+            k
+        }
+    };
+    Some(format!("{}/imp/{key}", server.base_url()))
+}
+
+/// Forgets every registered import. Their URLs stop working until the files are registered again.
+pub fn clear_imports() {
+    let mut guard = IMPORTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(map) = guard.as_mut() {
+        map.clear();
+    }
+}
+
+/// Extensions accepted by [`register_extra_path`] (lower case).
+const IMPORT_EXTS: &[&str] = &[
+    "mp4", "m4v", "mov", "m4a", "mp3", "wav", "flac", "aac", "ogg", "wma", "png", "jpg", "jpeg",
+    "bmp",
+];
+
+/// Largest answer to an open-ended `Range: bytes=N-` request on a recording or import. Browsers
+/// allow only six connections per host, so an unbounded answer would block the others.
+const OPEN_RANGE_CAP: u64 = 8 * 1024 * 1024;
+
+/// Byte cap for a recording or import response: bounded only for an open-ended Range request.
+fn media_cap(req: &Request) -> u64 {
+    let open_ended = req
+        .range
+        .as_deref()
+        .is_some_and(|r| r.trim_end().ends_with('-'));
+    if open_ended {
+        OPEN_RANGE_CAP
+    } else {
+        u64::MAX
+    }
+}
+
 /// Opens the file a route points to. Returns the file, its content type and metadata.
 fn open_route(route: &Route) -> Option<(File, &'static str, std::fs::Metadata)> {
+    if let Route::Imp(key) = route {
+        return open_import(key);
+    }
     let id = match route {
         Route::Rec(id) | Route::Aud(id, _) => id,
+        Route::Imp(_) => return None,
     };
     for force in [false, true] {
         let rec = recording_path(id, force)?;
@@ -340,6 +437,7 @@ fn open_route(route: &Route) -> Option<(File, &'static str, std::fs::Metadata)> 
                     "audio/mp4",
                 )
             }
+            Route::Imp(_) => return None,
         };
         if let Ok(file) = File::open(&target.0) {
             if let Ok(meta) = file.metadata() {
@@ -362,7 +460,7 @@ fn handle_request(w: &mut TcpStream, req: &Request, token: &str) -> bool {
                 None => write_simple(w, 404, false),
                 Some((file, ct, meta)) => {
                     let cap = match route {
-                        Route::Rec(_) => u64::MAX,
+                        Route::Rec(_) | Route::Imp(_) => media_cap(req),
                         Route::Aud(..) => AUDIO_CHUNK,
                     };
                     serve(w, file, ct, &meta, req, method == "HEAD", cap)

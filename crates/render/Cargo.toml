@@ -1,0 +1,30 @@
+[package]
+name = "clipcheck-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Video-editor export engine: CPU reference compositor, audio mixer/DSP, pipeline, native export (docs/design/13-video-editor.md)"
+
+[dependencies]
+clipcheck-timeline = { path = "../timeline" }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+clipcheck-mfdec = { path = "../mfdec" }
+clipcheck-hwenc = { path = "../hwenc" }
+clipcheck-aacenc = { path = "../aacenc" }
+clipcheck-mp4 = { path = "../mp4" }
+clipcheck-util = { path = "../util" }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -510,11 +510,13 @@ fn dispatch(
             source_recording_id,
             path,
             keep_source_time,
+            game,
         } => recordings::register_edited(
             state,
             source_recording_id.as_deref(),
             &path,
             keep_source_time,
+            game.as_deref(),
         ),
         command @ (Command::ListLibraries
         | Command::ScanLibraries { .. }

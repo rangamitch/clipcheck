@@ -11,6 +11,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use clipcheck_core::config::schema::sanitize_game_folder;
 use clipcheck_engine::catalog::{register_recording, CatalogError, RegisterMeta};
 use clipcheck_ipc::proto::{ErrorCode, Event, Reply};
 use clipcheck_library::fsops::FsOpError;
@@ -132,9 +133,14 @@ pub(crate) fn set_favorite(state: &AppState, recording_id: &str, favorite: bool)
     }
 }
 
-/// Registers a finished file, typically a trimmer output, as a recording. The file must lie
-/// under a configured library folder. `source_recording_id` supplies the game of the parent
-/// recording. Replies `RecordingRegistered` with the new id.
+/// Game name that lets a file outside every configured library folder be registered. Its own
+/// folder then becomes the root (D74).
+const EXPORTS_GAME: &str = "Exports";
+
+/// Registers a finished file, typically a trimmer output or an editor export, as a recording.
+/// The file must lie under a configured library folder, except a file registered with game
+/// `Exports`, whose folder becomes the root. `source_recording_id` supplies the game of the
+/// parent recording unless `game` names a game. Replies `RecordingRegistered` with the new id.
 ///
 /// When `keep_source_time` is true and the source recording exists, the new recording takes the
 /// source's creation time, and its favourite flag if the source is a favourite.
@@ -146,6 +152,7 @@ pub(crate) fn register_edited(
     source_recording_id: Option<&str>,
     path: &str,
     keep_source_time: bool,
+    game: Option<&str>,
 ) -> Reply {
     let file = PathBuf::from(path);
     if !file.is_absolute() || !file.is_file() {
@@ -160,7 +167,7 @@ pub(crate) fn register_edited(
         Err(reply) => return reply,
     };
     let mut source_time: Option<(i64, bool)> = None;
-    let game = match source_recording_id {
+    let source_game = match source_recording_id {
         Some(id) => match lookup(&lib, id) {
             Ok(row) => {
                 if keep_source_time {
@@ -172,12 +179,29 @@ pub(crate) fn register_edited(
         },
         None => String::new(),
     };
-    let Some(root) = configured_root_for(state, path) else {
-        return error(
-            ErrorCode::BadRequest,
-            "the file is not inside a configured library folder",
-            false,
-        );
+    // A non-empty requested game replaces the source's game.
+    let requested = game.map(str::trim).filter(|name| !name.is_empty());
+    let is_exports = requested.is_some_and(|name| name.eq_ignore_ascii_case(EXPORTS_GAME));
+    let game = match requested {
+        Some(name) => match requested_game_id(&lib, name) {
+            Ok(id) => id,
+            Err(reply) => return reply,
+        },
+        None => source_game,
+    };
+    let root = match configured_root_for(state, path) {
+        Some(root) => root,
+        None if is_exports => match file.parent() {
+            Some(dir) => dir.to_path_buf(),
+            None => return error(ErrorCode::BadRequest, "the file has no folder", false),
+        },
+        None => {
+            return error(
+                ErrorCode::BadRequest,
+                "the file is not inside a configured library folder",
+                false,
+            )
+        }
     };
     if !state.service.library().is_ready() {
         return error(
@@ -236,6 +260,19 @@ fn open(state: &AppState) -> Result<Library, Reply> {
             true,
         )
     })
+}
+
+/// The game id for a game name given by a caller. A game whose folder name matches the
+/// sanitized name keeps its id, so this path and the scanner share one game row per folder (the
+/// games table requires a unique folder name). Otherwise the trimmed name is the id, as the
+/// import tool does.
+fn requested_game_id(lib: &Library, name: &str) -> Result<String, Reply> {
+    let folder = sanitize_game_folder(name);
+    match lib.game_id_for_folder(&folder) {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => Ok(name.to_owned()),
+        Err(e) => Err(error(ErrorCode::Internal, format!("library: {e}"), false)),
+    }
 }
 
 /// Loads one recording row, or a `bad_request` reply when the id is unknown.
