@@ -161,7 +161,7 @@
   });
 
   // Horizontal scrollbar and zoom slider (bottom bar).
-  const ZOOM_MIN = 2;
+  const ZOOM_MIN = 0.05;
   const ZOOM_MAX = 4000;
   let trackEl: HTMLDivElement | undefined = $state();
   let trackW = $state(0);

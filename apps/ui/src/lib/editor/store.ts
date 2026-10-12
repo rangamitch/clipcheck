@@ -16,7 +16,7 @@ export type EditorTool = 'select' | 'razor' | 'hand' | 'zoom';
 export type SelectMode = 'replace' | 'add' | 'toggle';
 
 /** Zoom limits in pixels per second. */
-const MIN_PX_PER_SEC = 2;
+const MIN_PX_PER_SEC = 0.05;
 const MAX_PX_PER_SEC = 4000;
 /** Default zoom (pixels per second). */
 const DEFAULT_PX_PER_SEC = 80;
@@ -349,7 +349,7 @@ export function seek(t: Tick): void {
 }
 
 /**
- * Multiplies the zoom by `factor` (clamped to 2..4000 px per second). Scroll is adjusted so the
+ * Multiplies the zoom by `factor` (clamped to 0.05..4000 px per second). Scroll is adjusted so the
  * anchor tick (default: the playhead) keeps its screen x position.
  */
 export function zoomBy(factor: number, anchorTick?: Tick): void {
