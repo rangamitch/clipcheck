@@ -8,7 +8,7 @@ use clipcheck_timeline::error::EditError;
 use clipcheck_timeline::model::{new_id, Clip, ClipKind, Group, Project, TrackKind};
 use clipcheck_timeline::ops_basic::PlaceMode;
 use clipcheck_timeline::ops_range::{
-    close_all_gaps, close_gap, freeze_frame, paste_clips, remove_range,
+    close_all_gaps, close_gap, close_gap_all, freeze_frame, paste_clips, remove_range,
 };
 use clipcheck_timeline::time::{Rate, Tick, TICKS_PER_SECOND};
 
@@ -448,6 +448,20 @@ fn close_gap_moves_later_clips_left_over_the_gap() {
     raw(&mut p, &t, ClipKind::Video, s(5), s(2));
     close_gap(&mut p, &t, s(3)).unwrap();
     assert_eq!(layout(&p, &t), vec![(s(0), s(2)), (s(2), s(2))]);
+}
+
+#[test]
+fn close_gap_all_ripples_linked_audio_with_the_video_gap() {
+    let mut p = project();
+    let v = v1(&p);
+    let a = a1(&p);
+    raw(&mut p, &v, ClipKind::Video, s(0), s(2));
+    raw(&mut p, &v, ClipKind::Video, s(5), s(2));
+    raw(&mut p, &a, ClipKind::Audio, s(0), s(2));
+    raw(&mut p, &a, ClipKind::Audio, s(5), s(2));
+    close_gap_all(&mut p, &v, s(3)).unwrap();
+    assert_eq!(layout(&p, &v), vec![(s(0), s(2)), (s(2), s(2))]);
+    assert_eq!(layout(&p, &a), vec![(s(0), s(2)), (s(2), s(2))]);
 }
 
 #[test]

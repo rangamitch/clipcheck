@@ -178,40 +178,16 @@ pub fn remove_range(
     Ok(())
 }
 
-/// Closes the gap that contains `at` on a track (shifts later clips left). No-op `Ok` when `at`
-/// is not in a gap.
+/// Closes the gap that contains `at` on one track only (shifts that track's later clips left).
+/// No-op `Ok` when `at` is not in a gap. Other tracks are untouched, so this can desync linked
+/// audio/video; the editor's default is [`close_gap_all`].
 pub fn close_gap(p: &mut Project, track_id: &str, at: Tick) -> EditResult<()> {
     ensure_unlocked(p, track_id)?;
     check_time(at, "gap position")?;
-    let spans: Vec<(Tick, Tick)> = p
-        .clips
-        .iter()
-        .filter(|c| c.track_id == track_id)
-        .map(|c| (c.start, c.end()))
-        .collect();
-    // `at` sits on a clip: no gap.
-    if spans.iter().any(|&(s, e)| (s..e).contains(&at)) {
-        return Ok(());
-    }
-    // No clip after `at`: nothing to close.
-    let Some(gap_end) = spans
-        .iter()
-        .filter(|&&(s, _)| s > at)
-        .map(|&(s, _)| s)
-        .min()
-    else {
+    let Some((gap_start, gap_end)) = gap_span(p, track_id, at) else {
         return Ok(());
     };
-    let gap_start = spans
-        .iter()
-        .filter(|&&(_, e)| e <= at)
-        .map(|&(_, e)| e)
-        .max()
-        .unwrap_or(Tick::ZERO);
-    let len = gap_end.saturating_sub(gap_start);
-    if len.0 <= 0 {
-        return Ok(());
-    }
+    let len = gap_end - gap_start;
     let mut q = p.clone();
     for x in q.clips.iter_mut() {
         if x.track_id == track_id && x.start >= gap_end {
@@ -221,6 +197,77 @@ pub fn close_gap(p: &mut Project, track_id: &str, at: Tick) -> EditResult<()> {
     check(&q)?;
     *p = q;
     Ok(())
+}
+
+/// Ripple-closes the gap that contains `at` on `track_id` across ALL unlocked tracks, so linked
+/// audio and video stay aligned. The gap is `[gap_start, gap_end)` on `track_id` (see
+/// [`gap_span`]) and `d` is its length. On every unlocked track, each clip starting at or after
+/// `gap_end` moves left by `d_track = min(d, free)`, where
+/// `free = gap_end - max(gap_start, end of the clips on that track that start before gap_end)`.
+/// So no clip ever moves onto an earlier one. A track with a clip crossing `gap_end` (or a clip
+/// spanning the gap) does not move. Locked tracks keep their clips. Normally every track is free
+/// over the range, so everything shifts by exactly `d`. No-op `Ok` when `at` is not in a gap.
+pub fn close_gap_all(p: &mut Project, track_id: &str, at: Tick) -> EditResult<()> {
+    ensure_unlocked(p, track_id)?;
+    check_time(at, "gap position")?;
+    let Some((gap_start, gap_end)) = gap_span(p, track_id, at) else {
+        return Ok(());
+    };
+    let len = gap_end - gap_start;
+    let mut q = p.clone();
+    for t in p.tracks.iter().filter(|t| !t.locked) {
+        let prev_end = p
+            .clips
+            .iter()
+            .filter(|c| c.track_id == t.id && c.start < gap_end)
+            .map(Clip::end)
+            .fold(gap_start, Tick::max);
+        let free = gap_end.saturating_sub(prev_end);
+        let d = len.min(free);
+        if d.0 <= 0 {
+            continue;
+        }
+        for x in q.clips.iter_mut() {
+            if x.track_id == t.id && x.start >= gap_end {
+                x.start = x.start.saturating_sub(d);
+            }
+        }
+    }
+    check(&q)?;
+    *p = q;
+    Ok(())
+}
+
+/// The gap that contains `at` on a track, as `(gap_start, gap_end)`. Start is the previous clip
+/// end (or zero), end is the next clip start. `None` when `at` sits on a clip, no clip starts
+/// after `at`, or the gap is empty.
+fn gap_span(p: &Project, track_id: &str, at: Tick) -> Option<(Tick, Tick)> {
+    let spans: Vec<(Tick, Tick)> = p
+        .clips
+        .iter()
+        .filter(|c| c.track_id == track_id)
+        .map(|c| (c.start, c.end()))
+        .collect();
+    // `at` sits on a clip: no gap.
+    if spans.iter().any(|&(s, e)| (s..e).contains(&at)) {
+        return None;
+    }
+    // No clip after `at`: nothing to close.
+    let gap_end = spans
+        .iter()
+        .filter(|&&(s, _)| s > at)
+        .map(|&(s, _)| s)
+        .min()?;
+    let gap_start = spans
+        .iter()
+        .filter(|&&(_, e)| e <= at)
+        .map(|&(_, e)| e)
+        .max()
+        .unwrap_or(Tick::ZERO);
+    if gap_end.saturating_sub(gap_start).0 <= 0 {
+        return None;
+    }
+    Some((gap_start, gap_end))
 }
 
 /// Closes every gap on a track (clips become contiguous from the first clip's start).

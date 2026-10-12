@@ -62,8 +62,14 @@ pub enum Command {
         track_ids: Vec<String>,
         ripple: bool,
     },
-    /// Close one gap.
-    CloseGap { track_id: String, at: Tick },
+    /// Close the gap at `at` on `track_id`. `all_tracks` (default true) ripples every unlocked
+    /// track so linked A/V stay in sync; `false` shifts only `track_id`.
+    CloseGap {
+        track_id: String,
+        at: Tick,
+        #[serde(default = "default_true")]
+        all_tracks: bool,
+    },
     /// Close all gaps on a track.
     CloseAllGaps { track_id: String },
     /// Freeze frame.
@@ -181,6 +187,11 @@ pub enum Command {
         dur: Tick,
         color: Rgba,
     },
+}
+
+/// Serde default for boolean command flags that default to `true`.
+fn default_true() -> bool {
+    true
 }
 
 /// What a successful command produced.
@@ -365,7 +376,17 @@ fn run(p: &mut Project, cmd: Command, clipboard: &[Clip]) -> EditResult<()> {
             track_ids,
             ripple,
         } => ops_range::remove_range(p, start, end, &track_ids, ripple),
-        Command::CloseGap { track_id, at } => ops_range::close_gap(p, &track_id, at),
+        Command::CloseGap {
+            track_id,
+            at,
+            all_tracks,
+        } => {
+            if all_tracks {
+                ops_range::close_gap_all(p, &track_id, at)
+            } else {
+                ops_range::close_gap(p, &track_id, at)
+            }
+        }
         Command::CloseAllGaps { track_id } => ops_range::close_all_gaps(p, &track_id),
         Command::FreezeFrame { clip_id, at, dur } => {
             ops_range::freeze_frame(p, &clip_id, at, dur).map(|_| ())

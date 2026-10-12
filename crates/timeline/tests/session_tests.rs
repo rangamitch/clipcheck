@@ -744,6 +744,7 @@ fn media_and_range_commands_round_trip_through_json() {
     round_trip(Command::CloseGap {
         track_id: "v".to_string(),
         at: Tick::from_secs(2),
+        all_tracks: true,
     });
     round_trip(Command::CloseAllGaps {
         track_id: "v".to_string(),
