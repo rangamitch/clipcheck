@@ -120,6 +120,9 @@ const RAMP_SPAN_S = 0.5;
 const RAMP_STEP_S = 0.02;
 /** Debounce for redraws requested by seeks and load events (ms). */
 const REDRAW_DEBOUNCE_MS = 30;
+
+/** Quiet time before the unplayable-audio-track toast is shown, so one media gets one toast. */
+const TRACK_TOAST_DEBOUNCE_MS = 150;
 /** Smallest canvas side (pixels). */
 const MIN_CANVAS_PX = 64;
 /** Message of a codec the webview cannot decode (no video size after metadata). */
@@ -244,8 +247,11 @@ class Engine implements PreviewEngine {
   private readonly mediaKeys = new Map<string, string>();
   /** Transform overrides per clip id (painting only). */
   private readonly overrides = new Map<string, Transform>();
-  /** Media and track pairs reported as unplayable since the last setProject. */
-  private readonly reportedTracks = new Set<string>();
+  /** Unplayable audio track indices per media id, collected until the debounced toast fires. */
+  private readonly pendingTracks = new Map<string, Set<number>>();
+  /** Media ids already warned about this session (one toast per media). */
+  private readonly warnedMedia = new Set<string>();
+  private trackToastTimer: ReturnType<typeof setTimeout> | null = null;
 
   private readonly timeCbs = new Set<(t: Tick) => void>();
   private readonly levelCbs = new Set<(l: { master: number; tracks: number[] }) => void>();
@@ -308,7 +314,6 @@ class Engine implements PreviewEngine {
     this.syncMediaKeys(project);
     this.dropStaleChains(plan);
     this.reportedGeneric = false;
-    this.reportedTracks.clear();
     this.prefetched.clear();
     this.segStart = null;
     this.applyCanvasSize();
@@ -454,7 +459,10 @@ class Engine implements PreviewEngine {
     this.overrides.clear();
     this.mediaKeys.clear();
     this.chainKeys.clear();
-    this.reportedTracks.clear();
+    if (this.trackToastTimer !== null) clearTimeout(this.trackToastTimer);
+    this.trackToastTimer = null;
+    this.pendingTracks.clear();
+    this.warnedMedia.clear();
     this.audio.close();
     this.timeCbs.clear();
     this.levelCbs.clear();
@@ -987,15 +995,37 @@ class Engine implements PreviewEngine {
     return needs;
   }
 
-  /** Reports an audio track that cannot be previewed, once per media and track. */
+  /**
+   * Collects an audio track that cannot be previewed. Tracks of one media are gathered and reported
+   * in a single debounced toast, and each media is warned about at most once per session.
+   */
   private reportUnplayableTrack(src: AudioSource): void {
-    const key = `${src.media_id}#${src.source_track}`;
-    if (this.reportedTracks.has(key)) return;
-    this.reportedTracks.add(key);
-    const name = this.project?.media.find((m) => m.id === src.media_id)?.name ?? src.media_id;
-    this.emitError(
-      `Audio track ${src.source_track} of ${name} cannot be previewed yet (only the default stream plays)`,
-    );
+    if (this.destroyed || this.warnedMedia.has(src.media_id)) return;
+    let tracks = this.pendingTracks.get(src.media_id);
+    if (!tracks) {
+      tracks = new Set<number>();
+      this.pendingTracks.set(src.media_id, tracks);
+    }
+    if (tracks.has(src.source_track)) return;
+    tracks.add(src.source_track);
+    if (this.trackToastTimer !== null) clearTimeout(this.trackToastTimer);
+    this.trackToastTimer = setTimeout(() => this.flushTrackToasts(), TRACK_TOAST_DEBOUNCE_MS);
+  }
+
+  /** Emits one toast per media with the collected unplayable audio tracks. */
+  private flushTrackToasts(): void {
+    this.trackToastTimer = null;
+    if (this.destroyed) return;
+    for (const [mediaId, tracks] of this.pendingTracks) {
+      this.warnedMedia.add(mediaId);
+      const name = this.project?.media.find((m) => m.id === mediaId)?.name ?? mediaId;
+      const list = [...tracks].sort((a, b) => a - b).join(', ');
+      const noun = tracks.size === 1 ? 'audio track' : 'audio tracks';
+      this.emitError(
+        `${name}: ${noun} ${list} cannot be previewed yet (only the default stream plays in preview; export includes every track)`,
+      );
+    }
+    this.pendingTracks.clear();
   }
 
   /**
