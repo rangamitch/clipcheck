@@ -660,6 +660,7 @@ name = "clipcheck-render"
 version = "0.4.1"
 dependencies = [
  "clipcheck-aacenc",
+ "clipcheck-gpuconv",
  "clipcheck-hwenc",
  "clipcheck-mfdec",
  "clipcheck-mp4",
