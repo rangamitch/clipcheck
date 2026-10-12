@@ -61,10 +61,13 @@ pub fn cache_dir(editor_root: &Path, cache_dir_setting: &str) -> PathBuf {
     }
 }
 
-/// Waveform cache file: `<cache>\peaks\<size>-<mtime_ms>-<stream>-<buckets>.pk`.
+/// Waveform cache file: `<cache>\peaks\v2\<size>-<mtime_ms>-<stream>-<buckets>.pk`.
+/// The `v2` folder invalidates peaks decoded before the per-stream audio fix (older entries could
+/// hold the wrong audio stream).
 pub fn peaks_file(cache: &Path, size: u64, mtime_ms: i64, stream: u32, buckets: usize) -> PathBuf {
     cache
         .join("peaks")
+        .join("v2")
         .join(format!("{size}-{mtime_ms}-{stream}-{buckets}.pk"))
 }
 

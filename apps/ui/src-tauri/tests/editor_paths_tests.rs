@@ -190,13 +190,16 @@ fn cache_dir_override_wins_and_is_trimmed() {
 #[test]
 fn peaks_file_format_is_size_mtime_stream_buckets() {
     let p = peaks_file(Path::new(r"C:\c"), 1234, 1_700_000_000_000, 1, 800);
-    assert_eq!(p, PathBuf::from(r"C:\c\peaks\1234-1700000000000-1-800.pk"));
+    assert_eq!(
+        p,
+        PathBuf::from(r"C:\c\peaks\v2\1234-1700000000000-1-800.pk")
+    );
 }
 
 #[test]
 fn peaks_file_negative_mtime_keeps_sign() {
     let p = peaks_file(Path::new(r"C:\c"), 10, -5, 0, 4);
-    assert_eq!(p, PathBuf::from(r"C:\c\peaks\10--5-0-4.pk"));
+    assert_eq!(p, PathBuf::from(r"C:\c\peaks\v2\10--5-0-4.pk"));
 }
 
 #[test]
@@ -213,7 +216,7 @@ fn peaks_file_max_size_formats_fully() {
 #[test]
 fn peaks_file_lives_under_peaks_folder() {
     let p = peaks_file(Path::new(r"C:\c"), 1, 1, 0, 1);
-    assert_eq!(p.parent(), Some(Path::new(r"C:\c\peaks")));
+    assert_eq!(p.parent(), Some(Path::new(r"C:\c\peaks\v2")));
 }
 
 // ---- export_dir ---------------------------------------------------------------------------------
