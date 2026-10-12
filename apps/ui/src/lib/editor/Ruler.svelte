@@ -1,7 +1,9 @@
 <script lang="ts">
   // Time ruler above the track area: tick marks and labels, the work area (in/out) band with
-  // draggable ends, marker flags, and the playhead handle. Pointer down or drag seeks.
+  // draggable ends and marker flags. Pointer down or drag seeks. The playhead is drawn by Timeline.
   import { onDestroy } from 'svelte';
+  import { get } from 'svelte/store';
+  import { setDragCanceller } from './actions';
   import { beginScrub, dispatch, endScrub, playhead } from './store';
   import {
     RULER_HEIGHT,
@@ -42,6 +44,10 @@
   let seeking = false;
   /** True while a scrub is open in the store; keeps beginScrub/endScrub paired once per drag. */
   let scrubActive = false;
+  /** Pointer of the current press (capture), or null. */
+  let pressPointer: number | null = null;
+  /** Playhead at the press of the current drag, restored by Escape. */
+  let pressPlayhead: Tick | null = null;
 
   function startScrub(): void {
     if (scrubActive) return;
@@ -56,6 +62,12 @@
   }
 
   onDestroy(stopScrub);
+
+  // Escape (actions.ts) cancels a ruler drag too, under its own owner key while mounted.
+  $effect(() => {
+    setDragCanceller(cancelRulerDrag, 'ruler');
+    return () => setDragCanceller(null, 'ruler');
+  });
   /** Tick where an Alt- or Shift-drag on empty ruler started; null when not creating a work area. */
   let createAnchor: Tick | null = null;
 
@@ -88,21 +100,15 @@
     return { start: frameFloor(Math.min(a, b)), end: frameCeil(Math.max(a, b)) };
   }
 
-  /**
-   * Playhead x in CSS px, from the store. Only the DOM handle below reads it, so playback repaints
-   * the handle and not the canvas.
-   */
-  const headX = $derived(Math.round(tickToX($playhead, view)));
-
   // Ticks, labels, work area and markers redraw on zoom, scroll, resize, project or work area
-  // changes. The canvas effect must not read `$playhead`, or every playback frame repaints it.
+  // changes. The playhead is not drawn here (Timeline draws it), so playback never repaints this canvas.
   $effect(() => {
     const c = canvas;
     if (!c) return;
     draw(c, view, project, areaPreview);
   });
 
-  /** Draws the ruler (not the playhead handle) into `c` for the given view and state. */
+  /** Draws the ruler (ticks, work area, markers) into `c` for the given view and state. */
   function draw(c: HTMLCanvasElement, v: View, p: Project, preview: WorkArea | null): void {
     const width = Math.max(0, v.width);
     const dpr = typeof window !== 'undefined' && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
@@ -253,6 +259,8 @@
     if (e.button !== 0 || !canvas) return;
     const { x, y } = localPoint(e);
     canvas.setPointerCapture(e.pointerId);
+    pressPointer = e.pointerId;
+    pressPlayhead = get(playhead);
 
     const handle = handleAt(x, project.work_area);
     if (handle) {
@@ -303,10 +311,36 @@
     }
   }
 
+  /**
+   * Escape during a ruler drag: drops a work area end or creation preview (nothing was dispatched yet)
+   * and puts a playhead scrub back where the press was. Returns true when a drag was active.
+   */
+  function cancelRulerDrag(): boolean {
+    if (!seeking && areaDrag === null && createAnchor === null) return false;
+    if (seeking && pressPlayhead !== null) onseek(pressPlayhead);
+    try {
+      if (canvas && pressPointer !== null && canvas.hasPointerCapture(pressPointer)) {
+        canvas.releasePointerCapture(pressPointer);
+      }
+    } catch {
+      // Capture was already released.
+    }
+    seeking = false;
+    stopScrub();
+    areaDrag = null;
+    createAnchor = null;
+    areaPreview = null;
+    pressPointer = null;
+    pressPlayhead = null;
+    return true;
+  }
+
   function onPointerUp(e: PointerEvent): void {
     if (canvas?.hasPointerCapture(e.pointerId)) {
       canvas.releasePointerCapture(e.pointerId);
     }
+    pressPointer = null;
+    pressPlayhead = null;
     seeking = false;
     stopScrub();
     if (createAnchor !== null) {
@@ -366,8 +400,6 @@
     onlostpointercapture={onLostCapture}
     ondblclick={onDoubleClick}
   ></canvas>
-  <!-- Playhead handle: a DOM element moved with transform, so playback does not repaint the canvas. -->
-  <div class="playhead-handle" style="transform: translateX({headX - 6}px)" aria-hidden="true"></div>
 </div>
 
 <style>
@@ -381,34 +413,5 @@
     touch-action: none;
     cursor: default;
     border-bottom: 1px solid var(--border);
-  }
-  /* Accent colour as in drawClips.ts (ACCENT). The handle is 12 px wide, its apex at its centre. */
-  .playhead-handle {
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 12px;
-    height: 100%;
-    pointer-events: none;
-    will-change: transform;
-  }
-  .playhead-handle::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 0;
-    width: 12px;
-    height: 8px;
-    background: #ed1c24;
-    clip-path: polygon(0 0, 100% 0, 50% 100%);
-  }
-  .playhead-handle::after {
-    content: '';
-    position: absolute;
-    left: 5.25px;
-    top: 8px;
-    bottom: 0;
-    width: 1.5px;
-    background: #ed1c24;
   }
 </style>

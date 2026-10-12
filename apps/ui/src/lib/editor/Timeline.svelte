@@ -93,9 +93,11 @@
   const FADE_ZONE_PX = 8;
   /**
    * On a selected audio clip, a press this close to a fade handle (and in the fade zone) takes the
-   * handle over the trim edge. Keeps a fade at 0 grabbable when it sits on the clip edge.
+   * handle over the trim edge, when the fade is longer than 0 or the press is below the clip top.
    */
   const FADE_EDGE_PREF_PX = 6;
+  /** Depth below the clip top (px) a press needs to take a zero-length fade over a trim edge. */
+  const FADE_EDGE_MIN_DEPTH_PX = 2;
   /** Audio clips narrower than this many px have no fade handles. */
   const FADE_MIN_CLIP_PX = 60;
   /** Drag-and-drop payload type for recordings dragged from the recordings list. */
@@ -816,8 +818,15 @@
       if (p.y < r.y || p.y > r.y + FADE_ZONE_PX) continue;
       const inX = tickToX(clip.start + clip.audio.fade_in, view);
       const outX = tickToX(clipEnd(clip) - clip.audio.fade_out, view);
-      if (Math.abs(p.x - inX) <= maxDistPx) return { clipId: clip.id, edge: 'in' };
-      if (Math.abs(p.x - outX) <= maxDistPx) return { clipId: clip.id, edge: 'out' };
+      // With selectedOnly (the take-over of a trim edge), a zero-length fade only counts when the
+      // press is clearly below the clip top, so an edge trim from the top corner stays a trim.
+      const deep = p.y - r.y >= FADE_EDGE_MIN_DEPTH_PX;
+      if (Math.abs(p.x - inX) <= maxDistPx && (!selectedOnly || clip.audio.fade_in > 0 || deep)) {
+        return { clipId: clip.id, edge: 'in' };
+      }
+      if (Math.abs(p.x - outX) <= maxDistPx && (!selectedOnly || clip.audio.fade_out > 0 || deep)) {
+        return { clipId: clip.id, edge: 'out' };
+      }
     }
     return null;
   }

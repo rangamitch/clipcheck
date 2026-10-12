@@ -32,4 +32,19 @@ describe('playingSeekDue', () => {
     expect(playingSeekDue(0.3, true, false, true)).toBe(true);
     expect(playingSeekDue(0.2, true, false, true)).toBe(false);
   });
+
+  it('a segment boundary keeps a continuous element within 0.25 s (decoder latency, no seek)', () => {
+    expect(playingSeekDue(0.05, false, false, true, true)).toBe(false);
+    expect(playingSeekDue(-0.08, false, false, false, true)).toBe(false);
+    expect(playingSeekDue(0.2, true, false, false, true)).toBe(false);
+  });
+
+  it('a segment boundary re-seeks an element whose source jumped by more than 0.25 s, bypassing the gap', () => {
+    expect(playingSeekDue(0.3, false, false, false, true)).toBe(true);
+    expect(playingSeekDue(-1.5, true, false, false, true)).toBe(true);
+  });
+
+  it('a seek or rate change still resyncs exactly, even at a boundary-sized offset', () => {
+    expect(playingSeekDue(0.05, false, true, false, false)).toBe(true);
+  });
 });

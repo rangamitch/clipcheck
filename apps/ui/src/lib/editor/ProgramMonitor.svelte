@@ -519,8 +519,12 @@
         lastEngineTick = t;
         playhead.set(t);
         if (!get(playing)) return;
+        // The loop ends at the work area end, or at the timeline end when the work area reaches beyond it
+        // (the engine stops there). A loop start at or after the timeline end cannot play: no loop then.
         const wa = get(project)?.work_area ?? null;
-        if (get(loopInOut) && wa !== null && wa.end > wa.start && t >= wa.end) {
+        const planEnd = timelineEndTick(get(project));
+        const loopEnd = wa === null ? 0 : Math.min(wa.end, planEnd);
+        if (get(loopInOut) && wa !== null && wa.end > wa.start && wa.start < loopEnd && t >= loopEnd) {
           lastEngineTick = wa.start;
           playhead.set(wa.start);
           e.seek(wa.start);
@@ -528,14 +532,16 @@
           return;
         }
         // Also true for an empty timeline (end 0), so play stops at once there.
-        if (t >= timelineEndTick(get(project))) playing.set(false);
+        if (t >= planEnd) playing.set(false);
       }),
       e.onEnded(() => {
+        // Stopped by the user or by the time listener: nothing to restart (and no play while paused).
+        if (!get(playing)) return;
         // The time listener has already restarted a loop when it is still running.
         if (e.isPlaying()) return;
-        // Loop In/Out with the work area ending at the plan end: restart at its start instead of stopping.
+        // Loop In/Out: restart at the work area start instead of stopping, when that start is on the timeline.
         const wa = get(project)?.work_area ?? null;
-        if (get(loopInOut) && wa !== null && wa.end > wa.start) {
+        if (get(loopInOut) && wa !== null && wa.end > wa.start && wa.start < timelineEndTick(get(project))) {
           lastEngineTick = wa.start;
           playhead.set(wa.start);
           e.seek(wa.start);

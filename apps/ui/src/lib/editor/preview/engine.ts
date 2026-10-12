@@ -131,6 +131,11 @@ const NUDGE_FACTOR = 0.03;
 const RESUME_RETRY_MS = 500;
 /** Drift (seconds) above which a paused element is re-seeked (about one frame). */
 const DRIFT_PAUSED_S = 0.02;
+/**
+ * Playing element off by more than this (seconds) at a segment change or project edit is re-seeked
+ * exactly. Smaller offsets are decoder latency of a continuous play and are left alone (no hitch).
+ */
+const DRIFT_BOUNDARY_S = 0.25;
 /** Minimum gap between two playing seeks of the same element (ms). Doubles up to the maximum. */
 const SEEK_GAP_MS = 200;
 const SEEK_GAP_MAX_MS = 2000;
@@ -188,10 +193,15 @@ interface PlayEntry {
   /** True while the element runs at a nudged rate (drift hysteresis). */
   nudging: boolean;
   /**
-   * Set by a segment change, seek or rate change while playing: the next positioning seeks the
-   * element exactly when it is off by more than DRIFT_PAUSED_S, bypassing the re-seek gap.
+   * Set by a seek, play or rate change while playing: the next positioning seeks the element
+   * exactly when it is off by more than DRIFT_PAUSED_S, bypassing the re-seek gap.
    */
   resync: boolean;
+  /**
+   * Set by a segment change or project edit while playing: the next positioning seeks the element
+   * only when it is off by more than DRIFT_BOUNDARY_S (its continuation is otherwise kept).
+   */
+  boundary: boolean;
 }
 
 /** One pooled video element. */
@@ -318,14 +328,22 @@ function hostElement(el: HTMLMediaElement): void {
 
 /** Detaches every handler of an image and releases its source. */
 /**
- * Whether a playing element is due for a seek. A resync (segment change, seek or rate change) seeks
- * any element off by more than DRIFT_PAUSED_S and bypasses the gap. Free-running drift seeks only
- * past the audio (DRIFT_SEEK_S) or video (DRIFT_SEEK_VIDEO_S) threshold and only when the gap is open.
+ * Whether a playing element is due for a seek. A resync (seek or rate change) seeks any element off
+ * by more than DRIFT_PAUSED_S and bypasses the gap. A boundary (segment change or project edit)
+ * seeks only past DRIFT_BOUNDARY_S, also bypassing the gap. Free-running drift seeks only past the
+ * audio (DRIFT_SEEK_S) or video (DRIFT_SEEK_VIDEO_S) threshold and only when the gap is open.
  * `drift` is element time minus source time (positive: ahead).
  */
-export function playingSeekDue(drift: number, audioOnly: boolean, resync: boolean, gapOpen: boolean): boolean {
+export function playingSeekDue(
+  drift: number,
+  audioOnly: boolean,
+  resync: boolean,
+  gapOpen: boolean,
+  boundary = false,
+): boolean {
   const abs = Math.abs(drift);
   if (resync) return abs > DRIFT_PAUSED_S;
+  if (boundary) return abs > DRIFT_BOUNDARY_S;
   return gapOpen && abs > (audioOnly ? DRIFT_SEEK_S : DRIFT_SEEK_VIDEO_S);
 }
 
@@ -417,6 +435,8 @@ class Engine implements PreviewEngine {
   /** Signed timeline rate used while the clock runs. Negative rates play in reverse. */
   private rate = 1;
   private segStart: Tick | null = null;
+  /** Set by seek, play and rate changes: the next playing positioning resyncs exactly. */
+  private exactResync = false;
   private lastAudioMs = 0;
   private lastLevelsMs = 0;
   private lastPrefetchMs = 0;
@@ -485,6 +505,7 @@ class Engine implements PreviewEngine {
     this.prefetched.clear();
     this.prefetchedStreams.clear();
     this.segStart = null;
+    this.exactResync = true;
     this.emitTime(target);
     if (this.clock.isRunning()) {
       // Let every element jump to the new position at once (no re-seek back-off).
@@ -587,6 +608,7 @@ class Engine implements PreviewEngine {
     if (this.clock.isRunning()) {
       this.clock.setRate(this.rate);
       this.segStart = null;
+      this.exactResync = true;
       this.resetDropWindow(performance.now());
       return;
     }
@@ -600,6 +622,7 @@ class Engine implements PreviewEngine {
     }
     this.clock.start(from, this.rate);
     this.segStart = null;
+    this.exactResync = true;
     this.lastAudioMs = 0;
     this.resetStats(performance.now());
     this.resetDropWindow(performance.now());
@@ -1117,6 +1140,7 @@ class Engine implements PreviewEngine {
       gapMs: SEEK_GAP_MS,
       nudging: false,
       resync: false,
+      boundary: false,
       frameSeq: 0,
     };
     if (this.hasFrameCallback) {
@@ -1400,8 +1424,14 @@ class Engine implements PreviewEngine {
    * While paused they are seeked to the exact frame and never play.
    */
   private syncMedia(seg: PlanSegment, t: Tick, playing: boolean, now: number): void {
-    // A new segment (also after a seek or a rate change, which clear segStart) needs exact positions.
-    if (playing && this.segStart !== seg.start) this.markResync();
+    // Seeks, play starts and rate changes resync exactly. A plain segment change (or project edit,
+    // which also clears segStart) only re-seeks elements whose source position really jumped.
+    if (playing && this.exactResync) {
+      this.exactResync = false;
+      this.markResync();
+    } else if (playing && this.segStart !== seg.start) {
+      this.markBoundary();
+    }
     this.collectNeeds(seg, t);
     const needs = this.needs;
     this.keepIds.clear();
@@ -1443,6 +1473,12 @@ class Engine implements PreviewEngine {
     for (const entry of this.audioEls.values()) entry.resync = true;
   }
 
+  /** Marks every pooled element for a re-seek on its next playing positioning if it jumped. */
+  private markBoundary(): void {
+    for (const entry of this.elements.values()) entry.boundary = true;
+    for (const entry of this.audioEls.values()) entry.boundary = true;
+  }
+
   /**
    * Keeps one element on its source time. `audioOnly` elements never step frames: frozen,
    * reversed and reverse-shuttled sources are simply paused (silent).
@@ -1461,6 +1497,7 @@ class Engine implements PreviewEngine {
       // Frozen, reversed or reverse-shuttled: cannot play backwards, so step the frame.
       if (!el.paused) el.pause();
       entry.resync = false;
+      entry.boundary = false;
       if (audioOnly) return;
       const stepOk = !playing || now - entry.lastSeekMs >= STEP_MS;
       if (stepOk && !el.seeking && Math.abs(el.currentTime - target) > DRIFT_PAUSED_S) {
@@ -1490,12 +1527,14 @@ class Engine implements PreviewEngine {
     const drift = el.currentTime - target;
     const abs = Math.abs(drift);
     const resync = entry.resync;
+    const boundary = entry.boundary;
     entry.resync = false;
-    if (playingSeekDue(drift, audioOnly, resync, now - entry.lastSeekMs >= entry.gapMs)) {
+    entry.boundary = false;
+    if (playingSeekDue(drift, audioOnly, resync, now - entry.lastSeekMs >= entry.gapMs, boundary)) {
       // Lead the target by the cost of the seek, since the element keeps playing while it loads.
       this.seekTo(entry, target + (entry.seekCostMs / 1000) * nominal, now);
-      // A resync seek is exact and does not back the free-running gap off.
-      if (!resync) entry.gapMs = Math.min(SEEK_GAP_MAX_MS, entry.gapMs * 2);
+      // A resync or boundary seek is deliberate and does not back the free-running gap off.
+      if (!resync && !boundary) entry.gapMs = Math.min(SEEK_GAP_MAX_MS, entry.gapMs * 2);
       entry.nudging = false;
       if (el.playbackRate !== nominal) el.playbackRate = nominal;
     } else if (audioOnly && abs > (entry.nudging ? DRIFT_NUDGE_OFF_S : DRIFT_NUDGE_S)) {
@@ -1619,6 +1658,7 @@ class Engine implements PreviewEngine {
       gapMs: SEEK_GAP_MS,
       nudging: false,
       resync: false,
+      boundary: false,
     };
     el.onseeked = () => this.onSeeked(entry);
     el.onerror = () => this.failStream(mediaId, stream);

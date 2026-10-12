@@ -49,17 +49,21 @@ export const shuttleRate = writable<number>(1);
 export const loopInOut = writable<boolean>(false);
 
 /**
- * Cancels the drag in progress, if any, and returns true when one was cancelled. The timeline
- * registers it while mounted (see `setDragCanceller`).
+ * Cancels the drag in progress, if any, and returns true when one was cancelled. The timeline and
+ * the ruler register one each while mounted (see `setDragCanceller`).
  */
 export type DragCanceller = () => boolean;
 
-/** The registered drag canceller, or null when no timeline is mounted. */
-let dragCanceller: DragCanceller | null = null;
+/** Registered drag cancellers by owner ('timeline', 'ruler'). */
+const dragCancellers = new Map<string, DragCanceller>();
 
-/** Registers (or, with null, clears) the canceller that Escape calls first. */
-export function setDragCanceller(fn: DragCanceller | null): void {
-	dragCanceller = fn;
+/**
+ * Registers (or, with null, clears) the canceller of one owner that Escape calls first. Every
+ * registered canceller is called, so a drag in any owner is cancelled.
+ */
+export function setDragCanceller(fn: DragCanceller | null, owner = 'timeline'): void {
+	if (fn) dragCancellers.set(owner, fn);
+	else dragCancellers.delete(owner);
 }
 
 /** A request to insert or overwrite the source monitor's range (handled by SourceMonitor). */
@@ -418,8 +422,11 @@ export function runAction(id: ActionId, ctx: ActionContext): void | Promise<void
 			return;
 
 		case ACTIONS.escape: {
-			// Escape first cancels a drag. The selection is cleared only when no drag was cancelled.
-			const cancelled = dragCanceller?.() ?? false;
+			// Escape first cancels a drag (timeline or ruler). The selection is cleared only when no drag was cancelled.
+			let cancelled = false;
+			for (const cancel of dragCancellers.values()) {
+				if (cancel()) cancelled = true;
+			}
 			if (!cancelled) selection.set([]);
 			return;
 		}
