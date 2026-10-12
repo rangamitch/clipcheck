@@ -171,7 +171,8 @@ fn successful_new_command_clears_the_redo_stack() {
     let mut s = placed_session();
     s.undo().expect("undo");
     assert!(s.can_redo());
-    s.apply(set_modes(true, true)).expect("modes");
+    // Modes default to magnetic and snap on, so the change must be a real one to count as an edit.
+    s.apply(set_modes(false, false)).expect("modes");
     assert!(!s.can_redo());
     assert_eq!(s.redo(), Err(EditError::NothingTo("redo")));
 }
@@ -211,7 +212,8 @@ fn undo_depth_is_capped_at_the_documented_limit() {
 fn dirty_flag_follows_edits_undo_redo_and_mark_saved() {
     let mut s = Session::new(project_with_media());
     assert!(!s.is_dirty());
-    s.apply(set_modes(true, true)).expect("edit");
+    // Defaults are magnetic and snap on; turning magnetic off is a real edit.
+    s.apply(set_modes(false, true)).expect("edit");
     assert!(s.is_dirty());
     s.mark_saved();
     assert!(!s.is_dirty());

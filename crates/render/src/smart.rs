@@ -184,7 +184,14 @@ pub fn run_lossless(
 fn analyse(project: &Project, settings: &ExportSettings) -> Result<Analysis, String> {
     let range = export_range(project, settings).ok_or_else(|| NOTHING.to_string())?;
     let plan = derive_plan(project, Some(range));
-    if plan.segments.is_empty() {
+    // derive_plan skips disabled, muted and missing clips but still emits gap segments, so a range
+    // with no usable layers at all is nothing to export rather than a gap.
+    if plan.segments.is_empty()
+        || plan
+            .segments
+            .iter()
+            .all(|s| s.video.is_empty() && s.audio.is_empty())
+    {
         return Err(NOTHING.to_string());
     }
     if !matches!(settings.kind, ExportKind::Video) {

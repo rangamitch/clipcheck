@@ -339,6 +339,11 @@ pub fn join_through_edit(p: &mut Project, left_id: &str, right_id: &str) -> Edit
     let mut np = p.clone();
     let mut nl = left.clone();
     nl.dur = left.dur.saturating_add(right.dur);
+    if left.reverse {
+        // A reversed pair plays the right clip's (earlier) source last, so the joined range starts
+        // at the right clip's `src_in`, not the left's.
+        nl.src_in = right.src_in;
+    }
     nl.audio.fade_out = right.audio.fade_out;
     for e in &right.audio.envelope {
         nl.audio.envelope.push(EnvPoint {

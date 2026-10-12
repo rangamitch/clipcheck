@@ -1518,8 +1518,10 @@ fn measure_loudness_of_minus_20_dbfs_sine_is_close_to_expected() {
     let mut audio = FakeAudio::sine(0.1, 1000.0);
     let lufs = measure_loudness(&plan, &cfg(48000), &mut audio, &ctl);
     let value = lufs.expect("no error").expect("not silent");
-    // Stereo sine of amplitude A reads -0.691 + 20 log10(A) LUFS; A = 0.1 gives -20.69.
-    assert!((value - (-20.69)).abs() < 0.5, "measured {value} LUFS");
+    // Stereo sine of amplitude A reads -0.691 + 20 log10(A) LUFS before K-weighting; A = 0.1 gives
+    // -20.69. The BS.1770 pre-filter shelf adds about +0.698 dB at 1 kHz, so the expected reading
+    // is -19.99 LUFS.
+    assert!((value - (-19.99)).abs() < 0.05, "measured {value} LUFS");
 }
 
 #[test]

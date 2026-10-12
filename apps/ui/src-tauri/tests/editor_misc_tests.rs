@@ -439,16 +439,17 @@ fn new_project_has_three_video_and_four_audio_tracks() {
 }
 
 #[test]
-fn snapshot_of_serialises_camel_case_top_level() {
+fn snapshot_of_serialises_snake_case_top_level() {
+    // The UI contract (apps/ui/src/lib/editor/types.ts `EditorSnapshot`) reads snake_case keys.
     let snap = snapshot_of(&Session::new(Project::new("Demo")));
     let v = serde_json::to_value(&snap).expect("ser");
     for key in [
         "project",
-        "canUndo",
-        "canRedo",
+        "can_undo",
+        "can_redo",
         "dirty",
         "plan",
-        "clipboardLen",
+        "clipboard_len",
     ] {
         assert!(v.get(key).is_some(), "missing {key}");
     }

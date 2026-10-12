@@ -826,20 +826,22 @@ fn set_speed_fades_scale_by_current_timeline_length_across_repeated_changes() {
 #[test]
 fn set_speed_slowdown_moves_envelope_points_out_with_the_clip() {
     // Doc: "Envelope point times ... are rescaled". Half speed doubles the timeline length, so
-    // points at 2 s and 4 s move to 4 s and 8 s.
+    // points at 1 s and 2 s move to 2 s and 4 s. (A point at the old end would land exactly on the
+    // new end, which is dropped as past the end, so the fixture keeps points inside the clip.)
     let mut p = ab_project();
     {
         let a = p.clip_mut("a").expect("a");
         a.audio.envelope = vec![
-            EnvPoint { t: s(2), db: -6.0 },
-            EnvPoint { t: s(4), db: 0.0 },
+            EnvPoint { t: s(1), db: -6.0 },
+            EnvPoint { t: s(2), db: 0.0 },
         ];
     }
     set_speed(&mut p, "a", 0.5, true).expect("half speed with ripple");
     let a = get(&p, "a");
     assert_eq!(a.dur, s(8));
-    assert_eq!(a.audio.envelope[0].t, s(4));
-    assert_eq!(a.audio.envelope[1].t, s(8));
+    assert_eq!(a.audio.envelope.len(), 2);
+    assert_eq!(a.audio.envelope[0].t, s(2));
+    assert_eq!(a.audio.envelope[1].t, s(4));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1033,7 +1035,8 @@ fn join_reversed_pair_with_contiguous_source_is_ok() {
     join_through_edit(&mut p, "L", "R").expect("join ok");
     let l = get(&p, "L");
     assert_eq!(l.dur, s(7));
-    assert_eq!(l.src_in, s(5));
+    // The joined range is src 2..9, played backwards, so its start is the right clip's src_in.
+    assert_eq!(l.src_in, s(2));
     assert!(l.reverse);
 }
 
