@@ -48,7 +48,21 @@ const FADE_MIN_WIDTH_PX = 60;
 /** Clip height above which an audio clip shows its gain line, px. */
 const GAIN_MIN_HEIGHT_PX = 40;
 /** Clip width below which the name label is not drawn, px. */
-const LABEL_MIN_WIDTH_PX = 24;
+const LABEL_MIN_WIDTH_PX = 40;
+
+/** Text that fits in `maxW` px: the whole string, or a prefix with an ellipsis; '' when even that is too wide. */
+function fitLabel(ctx: CanvasRenderingContext2D, text: string, maxW: number): string {
+  if (maxW <= 0 || text === '') return '';
+  if (ctx.measureText(text).width <= maxW) return text;
+  let lo = 0;
+  let hi = text.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (ctx.measureText(text.slice(0, mid) + '…').width <= maxW) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo > 0 ? text.slice(0, lo) + '…' : '';
+}
 /** Waveform column width, px. */
 const WAVE_STEP_PX = 2;
 
@@ -551,7 +565,8 @@ function drawClip(
     ctx.fillStyle = '#ffffff';
     ctx.shadowColor = 'rgba(0, 0, 0, 0.75)';
     ctx.shadowBlur = 3;
-    ctx.fillText(clip.name, bodyX + 6, bodyY + 4, Math.max(0, bodyW - 12));
+    const label = fitLabel(ctx, clip.name, bodyW - 12);
+    if (label) ctx.fillText(label, bodyX + 6, bodyY + 4);
     ctx.shadowBlur = 0;
     ctx.shadowColor = 'rgba(0, 0, 0, 0)';
   }

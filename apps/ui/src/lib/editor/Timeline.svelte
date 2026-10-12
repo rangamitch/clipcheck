@@ -156,6 +156,59 @@
     return Math.max(0, (end + SCROLL_PAD_S) * $pxPerSec - vpWidth);
   });
 
+  // Horizontal scrollbar and zoom slider (bottom bar).
+  const ZOOM_MIN = 2;
+  const ZOOM_MAX = 4000;
+  let trackEl: HTMLDivElement | undefined = $state();
+  let trackW = $state(0);
+  $effect(() => {
+    if (!trackEl) return;
+    trackW = trackEl.clientWidth;
+    const ro = new ResizeObserver(() => {
+      trackW = trackEl?.clientWidth ?? 0;
+    });
+    ro.observe(trackEl);
+    return () => ro.disconnect();
+  });
+  const contentW = $derived(maxScrollX + vpWidth);
+  const thumbWidth = $derived(
+    contentW > 0 ? Math.min(trackW, Math.max(24, (vpWidth / contentW) * trackW)) : trackW,
+  );
+  const thumbLeft = $derived(
+    maxScrollX > 0 ? ($scrollX / maxScrollX) * Math.max(0, trackW - thumbWidth) : 0,
+  );
+  let thumbDrag: { x: number; scroll: number } | null = null;
+
+  function zoomToSlider(px: number): number {
+    const f = Math.log(Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, px)) / ZOOM_MIN) / Math.log(ZOOM_MAX / ZOOM_MIN);
+    return Math.round(f * 1000);
+  }
+  function onZoomSlider(e: Event): void {
+    const v = Number((e.currentTarget as HTMLInputElement).value);
+    const target = ZOOM_MIN * Math.pow(ZOOM_MAX / ZOOM_MIN, v / 1000);
+    zoomBy(target / get(pxPerSec), xToTick(vpWidth / 2, view));
+  }
+  function onThumbDown(e: PointerEvent): void {
+    if (maxScrollX <= 0) return;
+    e.stopPropagation();
+    thumbDrag = { x: e.clientX, scroll: get(scrollX) };
+    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+  }
+  function onThumbMove(e: PointerEvent): void {
+    if (!thumbDrag) return;
+    const room = Math.max(1, trackW - thumbWidth);
+    scrollX.set(clampX(thumbDrag.scroll + ((e.clientX - thumbDrag.x) / room) * maxScrollX));
+  }
+  function onThumbUp(): void {
+    thumbDrag = null;
+  }
+  function onTrackDown(e: PointerEvent): void {
+    if (maxScrollX <= 0 || e.target !== e.currentTarget) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const dir = e.clientX - rect.left < thumbLeft ? -1 : 1;
+    scrollX.set(clampX(get(scrollX) + dir * vpWidth * 0.9));
+  }
+
   const cursorClass = $derived.by(() => {
     if (drag?.kind === 'pan' || $tool === 'hand') return 'pan';
     if (drag?.kind === 'move') return 'moving';
@@ -1177,6 +1230,7 @@
   const dropX = $derived(dropPreview ? tickToX(dropPreview.tick, view) : 0);
 </script>
 
+<div class="shell">
 <div class="timeline">
   <div class="headers" aria-label="Track headers" bind:this={headersEl}>
     <div class="corner"></div>
@@ -1234,16 +1288,126 @@
   </div>
 </div>
 
+<div class="hbar">
+  <div class="zoombox">
+    <button type="button" class="zbtn" aria-label="Zoom out" title="Zoom out" onclick={() => zoomBy(0.8, xToTick(vpWidth / 2, view))}>&minus;</button>
+    <input
+      class="zslider"
+      type="range"
+      min="0"
+      max="1000"
+      step="1"
+      aria-label="Timeline zoom"
+      title="Timeline zoom (Ctrl + wheel also zooms)"
+      value={zoomToSlider($pxPerSec)}
+      oninput={onZoomSlider}
+    />
+    <button type="button" class="zbtn" aria-label="Zoom in" title="Zoom in" onclick={() => zoomBy(1.25, xToTick(vpWidth / 2, view))}>+</button>
+  </div>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="scrolltrack" bind:this={trackEl} onpointerdown={onTrackDown} role="scrollbar" aria-controls="" aria-orientation="horizontal" aria-valuemin="0" aria-valuemax={Math.round(maxScrollX)} aria-valuenow={Math.round($scrollX)} tabindex="-1">
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div
+      class="thumb"
+      class:inactive={maxScrollX <= 0}
+      style:left="{thumbLeft}px"
+      style:width="{thumbWidth}px"
+      onpointerdown={onThumbDown}
+      onpointermove={onThumbMove}
+      onpointerup={onThumbUp}
+      onpointercancel={onThumbUp}
+    ></div>
+  </div>
+</div>
+</div>
+
 {#if menu}
   <ContextMenu x={menu.x} y={menu.y} items={menu.items} onclose={closeMenu} />
 {/if}
 
 <style>
+  .shell {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    background: var(--bg);
+  }
+
+  .hbar {
+    flex: 0 0 18px;
+    display: flex;
+    align-items: center;
+    border-top: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .zoombox {
+    flex: 0 0 140px;
+    width: 140px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 0 6px;
+    box-sizing: border-box;
+  }
+
+  .zbtn {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    line-height: 14px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--surface-2);
+    color: var(--text);
+    cursor: pointer;
+  }
+
+  .zslider {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 12px;
+    margin: 0;
+  }
+
+  .scrolltrack {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 12px;
+    margin: 0 6px;
+    border-radius: 6px;
+    background: var(--surface-2);
+    touch-action: none;
+  }
+
+  .thumb {
+    position: absolute;
+    top: 1px;
+    height: 10px;
+    border-radius: 5px;
+    background: var(--text-dim, #8b93a1);
+    opacity: 0.7;
+    cursor: pointer;
+  }
+
+  .thumb:hover {
+    opacity: 1;
+  }
+
+  .thumb.inactive {
+    opacity: 0.25;
+    cursor: default;
+  }
+
   .timeline {
     position: relative;
     display: flex;
     width: 100%;
-    height: 100%;
+    flex: 1 1 auto;
     min-height: 0;
     background: var(--bg);
     color: var(--text);
