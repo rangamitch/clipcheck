@@ -28,8 +28,8 @@ pub struct VideoLayer {
     pub reverse: bool,
     /// Geometry.
     pub transform: Transform,
-    /// Opacity at the start of the segment (1.0 unless a transition/fade is active, see
-    /// `fade`).
+    /// The clip's `opacity` property (0..=1). Fades are not folded into this value; a transition
+    /// is carried separately in `transition`.
     pub opacity: f64,
     /// Transition into this clip when the segment lies inside it: progress is computed by the
     /// renderer as `(t - clip_start) / transition.duration`.

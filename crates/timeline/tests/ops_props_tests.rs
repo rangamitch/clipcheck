@@ -1520,3 +1520,20 @@ fn track_struct_default_is_video_unlocked_height_56() {
     assert_eq!(t.height, 56);
     assert_eq!(t.volume_db, 0.0);
 }
+
+#[test]
+fn envelope_point_at_the_clip_end_is_dropped_like_a_trimmed_fade() {
+    let mut p = mixed_project();
+    let dur = clip_ref(&p, "a").dur;
+    let pts = vec![
+        EnvPoint {
+            t: Tick::ZERO,
+            db: -6.0,
+        },
+        EnvPoint { t: dur, db: -9.0 },
+    ];
+    set_envelope(&mut p, "a", pts).expect("envelope ok");
+    let env = &clip_ref(&p, "a").audio.envelope;
+    assert_eq!(env.len(), 1, "a point at t == dur must go: {env:?}");
+    assert_eq!(env[0].t, Tick::ZERO);
+}

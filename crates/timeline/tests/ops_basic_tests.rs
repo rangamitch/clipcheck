@@ -14,6 +14,7 @@ use clipcheck_timeline::ops_basic::{
     add_media, delete_clips, duplicate_clips, move_clips, place_media, relink_media, remove_media,
     split_at, ClipMove, PlaceMode,
 };
+use clipcheck_timeline::ops_group::expand_selection;
 use clipcheck_timeline::time::{Rate, Tick, MAX_PROJECT_TICKS, TICKS_PER_SECOND};
 
 // ---------- helpers ----------
@@ -1322,22 +1323,37 @@ fn split_divides_envelope_points_and_rebases_right_piece() {
         },
     ];
     let new_ids = split_at(&mut p, s(2), std::slice::from_ref(&id)).unwrap();
+    // Boundary levels are interpolated: at 2 s the envelope is -3 + (-3) * 0.75 = -5.25 dB.
     let left = &clip(&p, &id).audio.envelope;
     let right = &clip(&p, &new_ids[0]).audio.envelope;
-    assert_eq!(
-        left,
-        &vec![EnvPoint {
-            t: ms(500),
-            db: -3.0
-        }]
-    );
-    assert_eq!(
-        right,
-        &vec![EnvPoint {
-            t: ms(500),
-            db: -6.0
-        }]
-    );
+    assert_envelope(left, &[(0, -3.0), (500, -3.0), (2000, -5.25)]);
+    assert_envelope(right, &[(0, -5.25), (500, -6.0), (2000, -6.0)]);
+}
+
+/// Checks envelope points as (ms, dB) pairs, dB to 1e-9.
+fn assert_envelope(got: &[EnvPoint], want_ms_db: &[(i64, f64)]) {
+    assert_eq!(got.len(), want_ms_db.len(), "points: {got:?}");
+    for (pt, (t_ms, db)) in got.iter().zip(want_ms_db) {
+        assert_eq!(pt.t, ms(*t_ms), "time of {pt:?}");
+        assert!((pt.db - db).abs() < 1e-9, "db of {pt:?} should be {db}");
+    }
+}
+
+#[test]
+fn split_envelope_has_no_jump_at_the_cut() {
+    // Points (0 s, -20 dB) and (10 s, 0 dB): the level at 5 s is -10 dB, which both halves share.
+    let mut p = project();
+    let t = v1(&p);
+    let id = raw(&mut p, &t, ClipKind::Video, s(0), s(10));
+    p.clip_mut(&id).unwrap().audio.envelope = vec![
+        EnvPoint { t: s(0), db: -20.0 },
+        EnvPoint { t: s(10), db: 0.0 },
+    ];
+    let new_ids = split_at(&mut p, s(5), std::slice::from_ref(&id)).unwrap();
+    let left = &clip(&p, &id).audio.envelope;
+    let right = &clip(&p, &new_ids[0]).audio.envelope;
+    assert_envelope(left, &[(0, -20.0), (5000, -10.0)]);
+    assert_envelope(right, &[(0, -10.0), (5000, 0.0)]);
 }
 
 #[test]
@@ -1692,4 +1708,109 @@ fn property_seconds_constant_matches_docs() {
     // One second is 254,016,000,000 ticks (docs/design/13-video-editor.md section 14.2).
     assert_eq!(TICKS_PER_SECOND, 254_016_000_000);
     assert_eq!(s(1), Tick(TICKS_PER_SECOND));
+}
+
+// ---------- split pieces: link and group remap on overwrite ----------
+
+/// Linked video L1 (X) and audio L1 (Y) on V1/A1 over 0..10 s, plus a linked pair Z/W (link L3)
+/// at 20 s on V1/A1. Moving Z/W to 4 s overwrites the middle of X and Y.
+fn linked_pair_under_incoming_pair() -> (Project, String, String, String) {
+    let mut p = project();
+    let (v, a) = (v1(&p), a1(&p));
+    let x = raw(&mut p, &v, ClipKind::Video, s(0), s(10));
+    let y = raw(&mut p, &a, ClipKind::Audio, s(0), s(10));
+    set_link(&mut p, &x, &y, "L1");
+    let z = raw(&mut p, &v, ClipKind::Video, s(20), s(2));
+    let w = raw(&mut p, &a, ClipKind::Audio, s(20), s(2));
+    set_link(&mut p, &z, &w, "L3");
+    move_clips(
+        &mut p,
+        &[ClipMove {
+            clip_id: z.clone(),
+            new_start: s(4),
+            new_track: None,
+        }],
+    )
+    .expect("move linked pair");
+    (p, x, y, z)
+}
+
+/// The clip on `track` that starts at `start`.
+fn clip_at(p: &Project, track: &str, start: Tick) -> Clip {
+    p.clips
+        .iter()
+        .find(|c| c.track_id == track && c.start == start)
+        .cloned()
+        .expect("clip at start")
+}
+
+#[test]
+fn overwrite_into_linked_pair_gives_right_pieces_their_own_shared_link() {
+    let (p, x, y, _z) = linked_pair_under_incoming_pair();
+    let (v, a) = (v1(&p), a1(&p));
+    assert_eq!(clip(&p, &x).link_id.as_deref(), Some("L1"));
+    assert_eq!(clip(&p, &y).link_id.as_deref(), Some("L1"));
+    let right_v = clip_at(&p, &v, s(6));
+    let right_a = clip_at(&p, &a, s(6));
+    let new_link = right_v.link_id.clone().expect("right video has a link");
+    assert_ne!(new_link, "L1", "right pieces must not keep the left link");
+    assert_eq!(right_a.link_id.as_deref(), Some(new_link.as_str()));
+    assert_ne!(right_v.id, x);
+    assert_ne!(right_a.id, y);
+}
+
+#[test]
+fn selection_expansion_of_right_piece_excludes_left_pieces() {
+    let (p, x, y, _z) = linked_pair_under_incoming_pair();
+    let (v, a) = (v1(&p), a1(&p));
+    let right_v = clip_at(&p, &v, s(6)).id;
+    let right_a = clip_at(&p, &a, s(6)).id;
+    let sel = expand_selection(&p, std::slice::from_ref(&right_v));
+    assert!(sel.contains(&right_v) && sel.contains(&right_a), "{sel:?}");
+    assert!(
+        !sel.contains(&x) && !sel.contains(&y),
+        "left pieces leaked: {sel:?}"
+    );
+    let left_sel = expand_selection(&p, std::slice::from_ref(&x));
+    assert!(
+        left_sel.contains(&y),
+        "left pieces stay linked: {left_sel:?}"
+    );
+    assert!(!left_sel.contains(&right_v), "{left_sel:?}");
+}
+
+#[test]
+fn overwrite_split_right_piece_gets_a_copy_of_its_group() {
+    let mut p = project();
+    let v = v1(&p);
+    let v2_t = v2(&p);
+    let x = raw(&mut p, &v, ClipKind::Video, s(0), s(10));
+    p.groups.push(Group {
+        id: "G1".to_string(),
+        name: "Dialogue".to_string(),
+        color: Some("#ff0000".to_string()),
+    });
+    p.clip_mut(&x).expect("x").group_id = Some("G1".to_string());
+    let z = raw(&mut p, &v2_t, ClipKind::Video, s(20), s(2));
+    move_clips(
+        &mut p,
+        &[ClipMove {
+            clip_id: z,
+            new_start: s(4),
+            new_track: Some(v.clone()),
+        }],
+    )
+    .expect("move over the middle of x");
+    let left = clip_at(&p, &v, s(0));
+    let right = clip_at(&p, &v, s(6));
+    assert_eq!(left.group_id.as_deref(), Some("G1"));
+    let right_group = right.group_id.clone().expect("right piece in a group");
+    assert_ne!(right_group, "G1");
+    let copy = p
+        .groups
+        .iter()
+        .find(|g| g.id == right_group)
+        .expect("group entry");
+    assert_eq!(copy.name, "Dialogue");
+    assert_eq!(copy.color.as_deref(), Some("#ff0000"));
 }

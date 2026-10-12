@@ -252,6 +252,8 @@ impl Session {
             self.project = before;
             return Err(e);
         }
+        // Part of the same command: a neighbour that moved or went away takes its transition with it.
+        ops_props::normalise_transitions(&mut self.project);
         if self.project == before {
             // A no-op (for example adding media that is already present): no undo entry, not dirty.
             return Ok(Applied::default());

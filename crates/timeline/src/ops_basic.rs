@@ -3,8 +3,9 @@
 //!
 //! CONTRACT (all functions): on `Err` the project is unchanged. Every operation works on a copy of
 //! the project and swaps it in only after [`check_project`] accepts the result. Locked tracks
-//! refuse edits (`EditError::Locked`). No overlaps may result on any track. Never panic on bad
-//! input.
+//! refuse edits (`EditError::Locked`). Overlaps are never left in place: an edit that lands on
+//! clips cuts, trims or removes them (overwrite semantics, see [`overwrite_under_groups`]). Never
+//! panic on bad input.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,10 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{EditError, EditResult};
 use crate::model::{
-    new_id, Clip, ClipAudio, ClipKind, EnvPoint, Group, MediaKind, MediaRef, Project, Track,
-    TrackKind,
+    new_id, Clip, ClipAudio, ClipKind, Group, MediaKind, MediaRef, Project, Track, TrackKind,
 };
 use crate::ops_group::expand_selection;
+use crate::ops_range::slice_env;
 use crate::time::{Tick, MAX_PROJECT_TICKS, MAX_TICK};
 
 /// Most video tracks a project may hold.
@@ -281,19 +282,10 @@ pub fn place_media(
 
     match mode {
         PlaceMode::Overwrite => {
-            for tid in &affected {
-                w.clips = cut(
-                    std::mem::take(&mut w.clips),
-                    tid,
-                    start,
-                    start.saturating_add(length),
-                );
-            }
+            cut_tracks(&mut w, &affected, start, start.saturating_add(length));
         }
         PlaceMode::Insert => {
-            for tid in &affected {
-                w.clips = cut(std::mem::take(&mut w.clips), tid, start, start);
-            }
+            cut_tracks(&mut w, &affected, start, start);
             for c in w.clips.iter_mut() {
                 if c.start >= start && affected.contains(&c.track_id) {
                     c.start = c.start.saturating_add(length);
@@ -363,7 +355,7 @@ pub fn place_media(
     w.clips.extend(created);
     // The new clips overwrite whatever they land on (a no-op for Overwrite and Insert, which
     // already cut or shifted the tracks above).
-    w.clips = overwrite_under(std::mem::take(&mut w.clips), &ids);
+    overwrite_project(&mut w, &ids);
     check_project(&w)?;
     *p = w;
     Ok(ids)
@@ -419,10 +411,11 @@ fn stream_label(media: &MediaRef, i: usize, count: usize) -> String {
     }
 }
 
-/// Moves clips (and their group/link partners, which keep their relative offsets). In magnetic
-/// mode (`p.modes.magnetic`) gaps left behind are NOT closed by this function (only deletes
-/// ripple). A moved clip that lands on clips that are not being moved overwrites them: those are
-/// trimmed, split or removed where the moved clips cover them (see [`overwrite_under`]).
+/// Moves clips (and their group/link partners, which keep their relative offsets). Gaps left
+/// behind are never closed by a move, whatever `p.modes.magnetic` says (only [`delete_clips`] with
+/// `ripple` shifts later clips). A moved clip that lands on clips that are not being moved
+/// overwrites them: those are trimmed, split or removed where the moved clips cover them (see
+/// [`overwrite_under_groups`]).
 pub fn move_clips(p: &mut Project, moves: &[ClipMove]) -> EditResult<()> {
     if moves.is_empty() {
         return Ok(());
@@ -501,7 +494,7 @@ pub fn move_clips(p: &mut Project, moves: &[ClipMove]) -> EditResult<()> {
         .filter(|c| deltas.contains_key(&c.id))
         .map(|c| c.id.clone())
         .collect();
-    w.clips = overwrite_under(std::mem::take(&mut w.clips), &moved);
+    overwrite_project(&mut w, &moved);
     check_project(&w)?;
     *p = w;
     Ok(())
@@ -704,7 +697,7 @@ pub fn duplicate_clips(p: &mut Project, ids: &[String], offset: Tick) -> EditRes
     let new_ids: Vec<String> = copies.iter().map(|c| c.id.clone()).collect();
     w.clips.extend(copies);
     w.groups.extend(remap.new_groups);
-    w.clips = overwrite_under(std::mem::take(&mut w.clips), &new_ids);
+    overwrite_project(&mut w, &new_ids);
     check_project(&w)?;
     *p = w;
     Ok(new_ids)
@@ -759,7 +752,8 @@ fn closure_of(p: &Project, ids: &[String]) -> HashSet<String> {
 
 /// The part of `orig` between timeline ticks `from` and `to` (both inside the clip), as a new
 /// clip with the same id. Source offsets follow the playback direction. Fades stay only where
-/// they touch the original edge, envelope points are rebased, and the transition is kept only when
+/// they touch the original edge, the envelope is sliced to the piece (see `slice_env`, boundary
+/// levels interpolated), and the transition is kept only when
 /// the piece starts where the original starts. Returns None for an empty or outside range.
 fn piece_of(orig: &Clip, from: Tick, to: Tick) -> Option<Clip> {
     let end = end_of(orig);
@@ -787,28 +781,50 @@ fn piece_of(orig: &Clip, from: Tick, to: Tick) -> Option<Clip> {
     } else {
         Tick::ZERO
     };
-    let rel_to = off_left.saturating_add(dur);
-    c.audio.envelope = orig
-        .audio
-        .envelope
-        .iter()
-        .filter(|pt| pt.t >= off_left && pt.t < rel_to)
-        .map(|pt| EnvPoint {
-            t: pt.t.saturating_sub(off_left),
-            db: pt.db,
-        })
-        .collect();
+    // Boundary points are interpolated, so the envelope of a piece starts at the level it had there.
+    c.audio.envelope = slice_env(&orig.audio.envelope, off_left, off_left.saturating_add(dur));
     if from != orig.start {
         c.transition_in = None;
     }
     Some(c)
 }
 
-/// Removes the timeline range `[from, to)` from one track's clips (`from == to` only splits the
-/// clips that span `from`). Clips on other tracks are kept in place. The first piece of a clip
-/// keeps its id, later pieces get new ids.
-fn cut(clips: Vec<Clip>, track_id: &str, from: Tick, to: Tick) -> Vec<Clip> {
-    cut_except(clips, track_id, from, to, &HashSet::new())
+/// Removes the timeline range `[from, to)` from each listed track's clips (`from == to` only
+/// splits the clips that span `from`). Clips on other tracks are kept in place. One [`Remap`] is
+/// shared by all the tracks, so linked clips split on several tracks keep pairing up.
+fn cut_tracks(p: &mut Project, tracks: &[String], from: Tick, to: Tick) {
+    let mut remap = Remap::default();
+    for tid in tracks {
+        p.clips = cut_except(
+            std::mem::take(&mut p.clips),
+            tid,
+            from,
+            to,
+            &HashSet::new(),
+            &mut remap,
+            &p.groups,
+        );
+    }
+    p.groups.extend(remap.new_groups);
+}
+
+/// Lets the clips in `incoming` overwrite what is under them, the way an overwrite edit does, and
+/// adds the group copies that split pieces need to `p.groups`. See [`overwrite_under_groups`].
+pub(crate) fn overwrite_project(p: &mut Project, incoming: &[String]) {
+    let mut new_groups: Vec<Group> = Vec::new();
+    p.clips = overwrite_under_groups(
+        std::mem::take(&mut p.clips),
+        incoming,
+        &p.groups,
+        &mut new_groups,
+    );
+    p.groups.extend(new_groups);
+}
+
+/// [`overwrite_under_groups`] for callers that cannot add groups (no group copies are made, so
+/// a split right piece keeps its group id). Prefer [`overwrite_project`] where a project is at hand.
+pub(crate) fn overwrite_under(clips: Vec<Clip>, incoming: &[String]) -> Vec<Clip> {
+    overwrite_under_groups(clips, incoming, &[], &mut Vec::new())
 }
 
 /// Lets the clips in `incoming` overwrite what is under them, the way an overwrite edit does.
@@ -819,7 +835,17 @@ fn cut(clips: Vec<Clip>, track_id: &str, from: Tick, to: Tick) -> Vec<Clip> {
 /// the others, so a selection moved together keeps its relative positions. If two incoming clips
 /// overlap each other, the one later in `incoming` wins and cuts the earlier one.
 /// Zero-length leftovers are dropped; touching clips are not affected. Unknown ids are ignored.
-pub(crate) fn overwrite_under(clips: Vec<Clip>, incoming: &[String]) -> Vec<Clip> {
+///
+/// A split keeps the left piece's id, link and group. The right piece gets a new id, and its link
+/// and group ids are remapped (one fresh id per old id for the whole call, so the right pieces of
+/// a linked pair share a link that the left pieces do not have). Copies of the groups are added to
+/// `new_groups`, taken from `groups`.
+pub(crate) fn overwrite_under_groups(
+    clips: Vec<Clip>,
+    incoming: &[String],
+    groups: &[Group],
+    new_groups: &mut Vec<Group>,
+) -> Vec<Clip> {
     // Ranges come from the clips as they are now; an incoming clip is never cut before its own
     // step, so these stay valid while the steps run.
     let mut seen: HashSet<&str> = HashSet::new();
@@ -834,21 +860,27 @@ pub(crate) fn overwrite_under(clips: Vec<Clip>, incoming: &[String]) -> Vec<Clip
     }
     // Step `i` protects the incoming clips `i..`; earlier incoming clips may be cut.
     let mut protected: HashSet<String> = ranges.iter().map(|r| r.3.clone()).collect();
+    let mut remap = Remap::default();
     let mut out = clips;
     for (track_id, from, to, id) in &ranges {
-        out = cut_except(out, track_id, *from, *to, &protected);
+        out = cut_except(out, track_id, *from, *to, &protected, &mut remap, groups);
         protected.remove(id);
     }
+    new_groups.extend(remap.new_groups);
     out
 }
 
-/// [`cut`] that leaves alone every clip whose id is in `keep`.
+/// Removes `[from, to)` from one track's clips, leaving alone every clip whose id is in `keep`.
+/// A clip that is split in two keeps its id, link and group on the left piece; the right piece
+/// is [`detach`]ed. A piece that is the only one left (a trimmed clip) keeps everything.
 fn cut_except(
     clips: Vec<Clip>,
     track_id: &str,
     from: Tick,
     to: Tick,
     keep: &HashSet<String>,
+    remap: &mut Remap,
+    groups: &[Group],
 ) -> Vec<Clip> {
     let mut out = Vec::with_capacity(clips.len());
     for c in clips {
@@ -867,14 +899,24 @@ fn cut_except(
         } else {
             None
         };
-        for (i, mut piece) in [left, right].into_iter().flatten().enumerate() {
-            if i > 0 {
-                piece.id = new_id();
+        let split = left.is_some() && right.is_some();
+        out.extend(left);
+        if let Some(mut piece) = right {
+            if split {
+                detach(&mut piece, remap, groups);
             }
             out.push(piece);
         }
     }
     out
+}
+
+/// Gives a split-off piece a new id and new link and group ids, shared through `remap` so that
+/// every piece cut from the same old link (or group) stays together and apart from the originals.
+fn detach(piece: &mut Clip, remap: &mut Remap, groups: &[Group]) {
+    piece.id = new_id();
+    piece.link_id = piece.link_id.take().map(|l| remap.link(&l));
+    piece.group_id = piece.group_id.take().map(|g| remap.group(groups, &g));
 }
 
 /// Maps old link and group ids to fresh ones, so copies and split halves share new ids.
@@ -894,20 +936,20 @@ impl Remap {
             .clone()
     }
 
-    /// The new group id for an old one, creating a copy of the group (same name and colour).
+    /// The new group id for an old one, creating a copy of the group (same name and colour). An
+    /// old id that names no group in `groups` is returned unchanged: there is nothing to copy.
     fn group(&mut self, groups: &[Group], old: &str) -> String {
         if let Some(id) = self.groups.get(old) {
             return id.clone();
         }
-        let (name, color) = match groups.iter().find(|g| g.id == old) {
-            Some(g) => (g.name.clone(), g.color.clone()),
-            None => ("Group".to_string(), None),
+        let Some(src) = groups.iter().find(|g| g.id == old) else {
+            return old.to_string();
         };
         let id = new_id();
         self.new_groups.push(Group {
             id: id.clone(),
-            name,
-            color,
+            name: src.name.clone(),
+            color: src.color.clone(),
         });
         self.groups.insert(old.to_string(), id.clone());
         id

@@ -13,7 +13,7 @@ use crate::model::{
     new_id, Canvas, Clip, ClipAudio, ClipKind, EnvPoint, FadeCurve, Marker, Project, Rgba,
     TextSpec, Track, TrackKind, Transform, Transition,
 };
-use crate::ops_basic::overwrite_under;
+use crate::ops_basic::overwrite_project;
 use crate::time::{Tick, MAX_PROJECT_TICKS};
 
 /// Most video tracks a project may hold.
@@ -129,8 +129,9 @@ pub fn patch_clips(p: &mut Project, ids: &[String], patch: &ClipPatch) -> EditRe
     Ok(())
 }
 
-/// Replaces an audio clip's volume envelope (points sorted, de-duplicated by time, clamped to the
-/// clip's length and -60..=12 dB, at most 64 points).
+/// Replaces an audio clip's volume envelope (points sorted, de-duplicated by time, clamped to
+/// -60..=12 dB, at most 64 points). Points before the start or at/after the end (`t >= dur`) are
+/// dropped, the same rule `clamp_fades` applies to a trimmed clip.
 pub fn set_envelope(p: &mut Project, clip_id: &str, points: Vec<EnvPoint>) -> EditResult<()> {
     let i = clip_index(p, clip_id)?;
     let Some(clip) = p.clips.get(i) else {
@@ -158,7 +159,7 @@ pub fn set_envelope(p: &mut Project, clip_id: &str, points: Vec<EnvPoint>) -> Ed
     sorted.sort_by_key(|pt| pt.t);
     let mut out: Vec<EnvPoint> = Vec::with_capacity(sorted.len());
     for pt in sorted {
-        if pt.t < Tick::ZERO || pt.t > dur {
+        if pt.t < Tick::ZERO || pt.t >= dur {
             continue;
         }
         let pt = EnvPoint {
@@ -421,7 +422,9 @@ pub fn rename_project(p: &mut Project, name: &str) -> EditResult<()> {
     Ok(())
 }
 
-/// Sets the editing modes (magnetic and snap).
+/// Stores the editing modes. `magnetic` is saved with the project, but no edit reads it: moves
+/// never close gaps, and gaps close only when a caller asks for a ripple (see `delete_clips` and
+/// `remove_range`).
 pub fn set_modes(p: &mut Project, magnetic: bool, snap: bool) -> EditResult<()> {
     p.modes.magnetic = magnetic;
     p.modes.snap = snap;
@@ -527,8 +530,8 @@ pub fn add_solid(
     insert_generated(p, track_id, at, dur, clip)
 }
 
-/// Detaches nothing; returns an audio clip's defaults for a media file (helper used by tests and
-/// `place_media`): an Audio clip for stream `stream` of `media_id` covering the given ranges.
+/// Builds an Audio clip for stream `stream` of `media_id` covering the given ranges, without adding
+/// it to the project. Test helper only: `place_media` builds its audio clips itself.
 pub fn audio_clip_for(
     p: &Project,
     media_id: &str,
@@ -593,6 +596,35 @@ pub fn audio_clip_for(
         },
         ..Clip::default()
     })
+}
+
+/// Clears stale `transition_in` values. A transition stays only while a clip on the same track
+/// ends at (within one tick of) the clip's start, and it is no longer than the clip itself.
+/// Otherwise (after a move, trim, delete or split of the neighbour) it is removed. Run by the
+/// command layer after every successful command, so the result belongs to that command.
+pub(crate) fn normalise_transitions(p: &mut Project) {
+    let spans: Vec<(String, String, i64)> = p
+        .clips
+        .iter()
+        .map(|c| {
+            (
+                c.id.clone(),
+                c.track_id.clone(),
+                c.start.0.saturating_add(c.dur.0),
+            )
+        })
+        .collect();
+    for c in p.clips.iter_mut() {
+        let Some(duration) = c.transition_in.as_ref().map(|t| t.duration) else {
+            continue;
+        };
+        let has_neighbour = spans.iter().any(|(id, track, end)| {
+            *id != c.id && *track == c.track_id && (end - c.start.0).abs() <= 1
+        });
+        if !has_neighbour || duration > c.dur {
+            c.transition_in = None;
+        }
+    }
 }
 
 /// Convenience used by tests: track by index among tracks of a kind.
@@ -928,8 +960,8 @@ fn insert_generated(
     clip.track_id = track_id.to_string();
     clip.start = at;
     clip.dur = dur;
-    // The generated clip overwrites whatever is under it (see `overwrite_under`).
+    // The generated clip overwrites whatever is under it (see `overwrite_project`).
     p.clips.push(clip);
-    p.clips = overwrite_under(std::mem::take(&mut p.clips), std::slice::from_ref(&id));
+    overwrite_project(p, std::slice::from_ref(&id));
     Ok(id)
 }

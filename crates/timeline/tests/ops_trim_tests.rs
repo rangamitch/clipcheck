@@ -939,10 +939,22 @@ fn join_appends_right_envelope_shifted_by_left_length() {
         db: -2.0,
     }];
     join_through_edit(&mut p, "L", "R").expect("join ok");
+    // Justification: the left clip has no points, so its audio stays at 0 dB; the old code held
+    // the right's -2 dB over the whole left part. The right's point moves to 4.5 s.
     let env = get(&p, "L").audio.envelope;
-    assert_eq!(env.len(), 1);
-    assert_eq!(env[0].t, ms(4500));
-    assert_eq!(env[0].db, -2.0);
+    assert_eq!(
+        env.first(),
+        Some(&EnvPoint {
+            t: Tick::ZERO,
+            db: 0.0
+        })
+    );
+    assert!(env.contains(&EnvPoint {
+        t: ms(4500),
+        db: -2.0
+    }));
+    let at_3s = env.iter().filter(|e| e.t <= s(3)).all(|e| e.db == 0.0);
+    assert!(at_3s, "left part must stay at 0 dB: {env:?}");
 }
 
 #[test]
@@ -1213,4 +1225,217 @@ fn work_area_rejected_value_keeps_previous_area() {
     );
     assert!(r.is_err());
     assert_eq!(p.work_area, Some(good));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Review fixes: reversed source, grouped ripple, envelope rebase, join properties, speed bounds
+// ---------------------------------------------------------------------------------------------
+
+/// Project whose media are 30 s long, so reversed clips can sit away from the start of the file.
+fn long_media_project() -> Project {
+    let mut p = project();
+    for m in p.media.iter_mut() {
+        m.duration = s(30);
+    }
+    p
+}
+
+#[test]
+fn reversed_end_trim_advances_src_in_by_removed_source() {
+    let mut p = long_media_project();
+    let mut r = video(&p, "r", "V2", s(0), s(10), s(10));
+    r.reverse = true;
+    p.clips.push(r);
+    trim_edge(&mut p, "r", Edge::End, s(8), false).expect("trim ok");
+    let r = get(&p, "r");
+    assert_eq!(r.dur, s(8));
+    assert_eq!(r.src_in, s(12));
+    assert_eq!(r.src_out(), s(20));
+}
+
+#[test]
+fn reversed_end_lengthen_moves_src_in_back() {
+    let mut p = long_media_project();
+    let mut r = video(&p, "r", "V2", s(0), s(10), s(10));
+    r.reverse = true;
+    p.clips.push(r);
+    trim_edge(&mut p, "r", Edge::End, s(12), false).expect("trim ok");
+    let r = get(&p, "r");
+    assert_eq!(r.dur, s(12));
+    assert_eq!(r.src_in, s(8));
+}
+
+#[test]
+fn roll_left_reversed_clip_moves_src_in_with_its_cut() {
+    let mut p = long_media_project();
+    let mut l = video(&p, "L", "V1", s(0), s(4), s(10));
+    l.reverse = true;
+    let r = video(&p, "R", "V1", s(4), s(3), s(2));
+    p.clips.push(l);
+    p.clips.push(r);
+    roll_edit(&mut p, "L", "R", s(3)).expect("roll ok");
+    let l = get(&p, "L");
+    assert_eq!(l.dur, s(3));
+    assert_eq!(l.src_in, s(11));
+    let r = get(&p, "R");
+    assert_eq!(r.start, s(3));
+    assert_eq!(r.dur, s(4));
+    assert_eq!(r.src_in, s(1));
+}
+
+#[test]
+fn slide_reversed_left_neighbour_moves_src_in_with_its_end() {
+    let mut p = long_media_project();
+    let mut l = video(&p, "L", "V1", s(0), s(4), s(10));
+    l.reverse = true;
+    let c = video(&p, "C", "V1", s(4), s(3), s(2));
+    p.clips.push(l);
+    p.clips.push(c);
+    slide(&mut p, "C", s(1)).expect("slide ok");
+    let l = get(&p, "L");
+    assert_eq!(l.dur, s(5));
+    assert_eq!(l.src_in, s(9));
+}
+
+#[test]
+fn ripple_end_trim_with_grouped_partner_on_same_track_keeps_partner_length() {
+    let mut p = project();
+    let a = grouped(video(&p, "a", "V1", s(0), s(5), s(0)), "g");
+    let b = grouped(video(&p, "b", "V1", s(10), s(5), s(2)), "g");
+    p.clips.push(a);
+    p.clips.push(b);
+    trim_edge(&mut p, "a", Edge::End, s(4), true).expect("ripple ok");
+    assert_eq!(get(&p, "a").dur, s(4));
+    let b = get(&p, "b");
+    assert_eq!(b.start, s(9));
+    assert_eq!(b.dur, s(5));
+}
+
+#[test]
+fn ripple_start_trim_with_grouped_partner_on_same_track_trims_partner_once() {
+    let mut p = project();
+    let a = grouped(video(&p, "a", "V1", s(0), s(5), s(0)), "g");
+    let b = grouped(video(&p, "b", "V1", s(10), s(5), s(2)), "g");
+    p.clips.push(a);
+    p.clips.push(b);
+    trim_edge(&mut p, "a", Edge::Start, s(1), true).expect("ripple ok");
+    let a = get(&p, "a");
+    assert_eq!(a.start, s(0));
+    assert_eq!(a.dur, s(4));
+    // b is first pulled left by the ripple (to 9 s), then trimmed by the same 1 s on its start.
+    let b = get(&p, "b");
+    assert_eq!(b.start, s(9));
+    assert_eq!(b.dur, s(4));
+    assert_eq!(b.src_in, s(3));
+}
+
+#[test]
+fn start_trim_rebases_envelope_points_with_the_source() {
+    let mut p = project();
+    let mut c = video(&p, "c", "V2", s(0), s(8), s(0));
+    c.audio.envelope = vec![EnvPoint { t: s(5), db: -4.0 }];
+    p.clips.push(c);
+    trim_edge(&mut p, "c", Edge::Start, s(2), false).expect("trim ok");
+    let c = get(&p, "c");
+    assert_eq!(c.start, s(2));
+    assert_eq!(c.dur, s(6));
+    assert!(
+        c.audio.envelope.contains(&EnvPoint { t: s(3), db: -4.0 }),
+        "envelope {:?}",
+        c.audio.envelope
+    );
+}
+
+#[test]
+fn roll_right_clip_rebases_its_envelope() {
+    let mut p = long_media_project();
+    let l = video(&p, "L", "V1", s(0), s(4), s(0));
+    let mut r = video(&p, "R", "V1", s(4), s(4), s(4));
+    r.audio.envelope = vec![EnvPoint { t: s(2), db: -6.0 }];
+    p.clips.push(l);
+    p.clips.push(r);
+    roll_edit(&mut p, "L", "R", s(5)).expect("roll ok");
+    let r = get(&p, "R");
+    assert_eq!(r.src_in, s(5));
+    assert!(
+        r.audio.envelope.contains(&EnvPoint { t: s(1), db: -6.0 }),
+        "envelope {:?}",
+        r.audio.envelope
+    );
+}
+
+#[test]
+fn join_with_different_gain_is_invalid_and_atomic() {
+    let mut p = join_project();
+    p.clip_mut("R").expect("R").audio.gain_db = -3.0;
+    let before = p.clone();
+    let r = join_through_edit(&mut p, "L", "R");
+    assert!(matches!(r, Err(EditError::Invalid(_))), "got {r:?}");
+    assert_eq!(p, before);
+}
+
+#[test]
+fn join_with_different_pan_mono_muted_or_enabled_is_invalid() {
+    let cases: [fn(&mut Clip); 4] = [
+        |c| c.audio.pan = 0.5,
+        |c| c.audio.mono = true,
+        |c| c.audio.muted = true,
+        |c| c.enabled = false,
+    ];
+    for tweak in cases {
+        let mut p = join_project();
+        tweak(p.clip_mut("R").expect("R"));
+        let r = join_through_edit(&mut p, "L", "R");
+        assert!(matches!(r, Err(EditError::Invalid(_))), "got {r:?}");
+    }
+}
+
+#[test]
+fn join_with_only_left_envelope_keeps_right_at_zero_db() {
+    let mut p = join_project();
+    p.clip_mut("L").expect("L").audio.envelope = vec![EnvPoint { t: s(1), db: -6.0 }];
+    join_through_edit(&mut p, "L", "R").expect("join ok");
+    let env = get(&p, "L").audio.envelope;
+    // The left's own point is kept; the seam at 4 s holds its level, and everything after the
+    // seam's first tick (the right clip's part) is at 0 dB.
+    assert!(env.contains(&EnvPoint { t: s(1), db: -6.0 }), "{env:?}");
+    let after_seam: Vec<f64> = env.iter().filter(|e| e.t > s(4)).map(|e| e.db).collect();
+    assert!(!after_seam.is_empty());
+    assert!(after_seam.iter().all(|db| *db == 0.0), "{env:?}");
+}
+
+#[test]
+fn set_speed_untrimmed_clip_to_three_and_point_seven_succeeds_within_media() {
+    for speed in [3.0, 0.7] {
+        let mut p = project();
+        let c = video(&p, "c", "V2", s(0), s(10), s(0));
+        p.clips.push(c);
+        set_speed(&mut p, "c", speed, false).expect("speed ok");
+        let c = get(&p, "c");
+        assert_eq!(c.speed, speed);
+        assert!(
+            c.src_out() <= s(10),
+            "speed {speed}: src_out {:?}",
+            c.src_out()
+        );
+    }
+}
+
+#[test]
+fn set_speed_on_image_clip_is_invalid_and_atomic() {
+    let mut p = project();
+    let c = Clip {
+        id: "img".to_string(),
+        track_id: tid(&p, "V2"),
+        kind: ClipKind::Image,
+        media_id: None,
+        start: s(0),
+        dur: s(4),
+        ..Clip::default()
+    };
+    p.clips.push(c);
+    let before = p.clone();
+    let r = set_speed(&mut p, "img", 2.0, false);
+    assert!(matches!(r, Err(EditError::Invalid(_))), "got {r:?}");
+    assert_eq!(p, before);
 }

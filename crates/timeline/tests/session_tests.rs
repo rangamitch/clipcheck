@@ -774,3 +774,57 @@ fn media_and_range_commands_round_trip_through_json() {
         delta_db: 1.5,
     });
 }
+
+#[test]
+fn moving_a_neighbour_away_clears_its_transition_and_undo_restores_it() {
+    use clipcheck_timeline::model::{Transition, TransitionKind};
+    let mut p = Project::new("transitions");
+    let track = nth_track(&p, TrackKind::Video, 0);
+    p.clips.push(clip(
+        "a",
+        &track,
+        ClipKind::Video,
+        Tick::ZERO,
+        Tick::from_secs(5),
+    ));
+    p.clips.push(clip(
+        "b",
+        &track,
+        ClipKind::Video,
+        Tick::from_secs(5),
+        Tick::from_secs(5),
+    ));
+    let mut s = Session::new(p);
+    s.apply(Command::PatchClips {
+        ids: vec!["b".to_string()],
+        patch: ClipPatch {
+            transition_in: Some(Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: Tick::from_ms(500),
+            })),
+            ..ClipPatch::default()
+        },
+    })
+    .expect("transition on b (touching a)");
+    assert!(s.project.clip("b").expect("b").transition_in.is_some());
+
+    s.apply(Command::MoveClips {
+        moves: vec![ClipMove {
+            clip_id: "b".to_string(),
+            new_start: Tick::from_secs(20),
+            new_track: None,
+        }],
+    })
+    .expect("move b away from a");
+    assert!(
+        s.project.clip("b").expect("b").transition_in.is_none(),
+        "a transition with no neighbour must be cleared"
+    );
+
+    s.undo().expect("undo the move");
+    assert_eq!(s.project.clip("b").expect("b").start, Tick::from_secs(5));
+    assert!(
+        s.project.clip("b").expect("b").transition_in.is_some(),
+        "undo restores the transition"
+    );
+}

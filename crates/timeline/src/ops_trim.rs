@@ -50,7 +50,14 @@ pub fn trim_edge(
     let ids = partner_ids(p, clip_id)?;
     for id in &ids {
         let c = get_clip(p, id)?;
-        let target = edge_time(&c, edge).saturating_add(delta);
+        // A ripple of an earlier clip may already have moved this partner's start (later clips on
+        // the same track shift), so a start-edge target is taken from the live project. An end-edge
+        // target stays absolute: the ripple moves the end by the same delta, so the partner keeps
+        // its length.
+        let target = match edge {
+            Edge::Start => get_clip(&np, id)?.start.saturating_add(delta),
+            Edge::End => edge_time(&c, edge).saturating_add(delta),
+        };
         trim_one(&mut np, id, edge, target, ripple)?;
     }
     settle(&mut np, &ids)?;
@@ -107,6 +114,12 @@ pub fn roll_edit(p: &mut Project, left_id: &str, right_id: &str, new_cut: Tick) 
     let mut np = p.clone();
     let mut nl = left.clone();
     nl.dur = left.dur.saturating_add(delta);
+    if left.reverse {
+        // Reversed: the timeline end is the source start, so the source range moves opposite to the cut.
+        nl.src_in = left
+            .src_in
+            .saturating_add(scale_tick(Tick::ZERO.saturating_sub(delta), left.speed));
+    }
     commit(&mut np, nl)?;
 
     let mut nr = right.clone();
@@ -115,6 +128,7 @@ pub fn roll_edit(p: &mut Project, left_id: &str, right_id: &str, new_cut: Tick) 
     if !right.reverse {
         nr.src_in = right.src_in.saturating_add(scale_tick(delta, right.speed));
     }
+    nr.audio.envelope = rebase_env(&right.audio.envelope, delta);
     commit(&mut np, nr)?;
 
     for (pid, target) in left_targets {
@@ -171,6 +185,10 @@ pub fn slide(p: &mut Project, clip_id: &str, delta: Tick) -> EditResult<()> {
     if let Some(lid) = left_nb.as_deref() {
         let mut l = get_clip(&np, lid)?;
         l.dur = l.dur.saturating_add(delta);
+        if l.reverse {
+            // Reversed neighbour: its end is the source start, so the source range moves opposite.
+            l.src_in = l.src_in.saturating_sub(scale_tick(delta, l.speed));
+        }
         commit(&mut np, l)?;
     }
     for id in &partners {
@@ -191,6 +209,7 @@ pub fn slide(p: &mut Project, clip_id: &str, delta: Tick) -> EditResult<()> {
         if !r.reverse {
             r.src_in = r.src_in.saturating_add(scale_tick(delta, r.speed));
         }
+        r.audio.envelope = rebase_env(&r.audio.envelope, delta);
         commit(&mut np, r)?;
     }
     settle(&mut np, &partners)?;
@@ -223,7 +242,12 @@ pub fn set_speed(p: &mut Project, clip_id: &str, speed: f64, ripple: bool) -> Ed
                 "a freeze clip cannot take a speed".to_string(),
             ));
         }
-        let new_dur = Clip::dur_for_src(c.src_len(), speed);
+        if !matches!(c.kind, ClipKind::Video | ClipKind::Audio) {
+            return Err(EditError::Invalid(
+                "speed does not apply to images, titles or solids".to_string(),
+            ));
+        }
+        let new_dur = fit_dur_to_media(&np, &c, speed, Clip::dur_for_src(c.src_len(), speed));
         if new_dur < fd {
             return Err(EditError::Invalid(
                 "speed would make the clip shorter than one frame".to_string(),
@@ -317,6 +341,18 @@ pub fn join_through_edit(p: &mut Project, left_id: &str, right_id: &str) -> Edit
             "join clips must both be reversed or both forward".to_string(),
         ));
     }
+    // Clip-wide audio settings apply to the whole joined clip, so a difference would change the
+    // audio of one side.
+    if (left.audio.gain_db - right.audio.gain_db).abs() > f64::EPSILON
+        || (left.audio.pan - right.audio.pan).abs() > f64::EPSILON
+        || left.audio.mono != right.audio.mono
+        || left.audio.muted != right.audio.muted
+        || left.enabled != right.enabled
+    {
+        return Err(EditError::Invalid(
+            "clips have different properties (gain, pan, mono, muted or enabled)".to_string(),
+        ));
+    }
     if end_of(&left) != right.start {
         return Err(EditError::Invalid("join clips must touch".to_string()));
     }
@@ -345,12 +381,7 @@ pub fn join_through_edit(p: &mut Project, left_id: &str, right_id: &str) -> Edit
         nl.src_in = right.src_in;
     }
     nl.audio.fade_out = right.audio.fade_out;
-    for e in &right.audio.envelope {
-        nl.audio.envelope.push(EnvPoint {
-            t: e.t.saturating_add(left.dur),
-            db: e.db,
-        });
-    }
+    nl.audio.envelope = join_envelope(&left, &right);
     if nl.group_id.is_none() {
         nl.group_id = right.group_id.clone();
     }
@@ -505,6 +536,120 @@ fn source_ok(p: &Project, c: &Clip) -> EditResult<()> {
     Ok(())
 }
 
+/// Volume at time `t` (linear between points, held at both ends). Points must be sorted.
+fn env_db_at(points: &[EnvPoint], t: Tick) -> f64 {
+    let mut prev: Option<EnvPoint> = None;
+    for pt in points {
+        if pt.t > t {
+            return match prev {
+                None => pt.db,
+                Some(a) => {
+                    let span = (pt.t.0 - a.t.0) as f64;
+                    if span <= 0.0 {
+                        a.db
+                    } else {
+                        let f = (t.0 - a.t.0) as f64 / span;
+                        a.db + (pt.db - a.db) * f
+                    }
+                }
+            };
+        }
+        prev = Some(*pt);
+    }
+    prev.map_or(0.0, |a| a.db)
+}
+
+/// Envelope points after the clip's start moved by `moved` on the timeline: each point keeps its
+/// place in the audio, so its clip-relative time shifts by `-moved`, and the curve is sampled at
+/// the new start.
+fn rebase_env(points: &[EnvPoint], moved: Tick) -> Vec<EnvPoint> {
+    if points.is_empty() || moved == Tick::ZERO {
+        return points.to_vec();
+    }
+    let mut out = vec![EnvPoint {
+        t: Tick::ZERO,
+        db: env_db_at(points, moved),
+    }];
+    for pt in points {
+        if pt.t > moved {
+            out.push(EnvPoint {
+                t: pt.t.saturating_sub(moved),
+                db: pt.db,
+            });
+        }
+    }
+    out
+}
+
+/// Envelope of a joined clip: the left's points, then the right's shifted by the left's length.
+/// A side without points is held at 0 dB, and a seam point on each side keeps that side's level
+/// (the right's first level starts one tick after the seam), so neither side changes.
+fn join_envelope(left: &Clip, right: &Clip) -> Vec<EnvPoint> {
+    let l = &left.audio.envelope;
+    let r = &right.audio.envelope;
+    if l.is_empty() && r.is_empty() {
+        return Vec::new();
+    }
+    let seam = left.dur;
+    let mut out = if l.is_empty() {
+        vec![EnvPoint {
+            t: Tick::ZERO,
+            db: 0.0,
+        }]
+    } else {
+        l.clone()
+    };
+    let left_end_db = if l.is_empty() {
+        0.0
+    } else {
+        env_db_at(l, seam)
+    };
+    out.push(EnvPoint {
+        t: seam,
+        db: left_end_db,
+    });
+    let right_start_db = if r.is_empty() {
+        0.0
+    } else {
+        env_db_at(r, Tick::ZERO)
+    };
+    out.push(EnvPoint {
+        t: seam.saturating_add(Tick(1)),
+        db: right_start_db,
+    });
+    for e in r {
+        if e.t > Tick::ZERO {
+            out.push(EnvPoint {
+                t: seam.saturating_add(e.t),
+                db: e.db,
+            });
+        }
+    }
+    out
+}
+
+/// Shortens a timeline length by whole ticks until the source range it implies at `speed` fits the
+/// media (rounding can overshoot the end by a few ticks). Unbounded or unknown media returns `dur`.
+fn fit_dur_to_media(p: &Project, c: &Clip, speed: f64, dur: Tick) -> Tick {
+    let Some(m) = c.media_id.as_deref().and_then(|mid| p.media_ref(mid)) else {
+        return dur;
+    };
+    if !matches!(c.kind, ClipKind::Video | ClipKind::Audio) || m.duration.0 <= 0 {
+        return dur;
+    }
+    let mut probe = c.clone();
+    probe.speed = speed;
+    let mut d = dur;
+    for _ in 0..8 {
+        probe.dur = d;
+        if src_out_of(&probe) <= m.duration {
+            break;
+        }
+        d = d.saturating_sub(Tick(1));
+    }
+    d
+}
+
 /// Keeps fades within the clip length (shrinking fade-out first) and drops envelope points at or
 /// after the end.
 fn clamp_fades(c: &mut Clip) {
@@ -588,9 +733,17 @@ fn trim_one(p: &mut Project, id: &str, edge: Edge, target: Tick, ripple: bool) -
             if !c.reverse {
                 nc.src_in = c.src_in.saturating_add(scale_tick(moved, c.speed));
             }
+            nc.audio.envelope = rebase_env(&c.audio.envelope, moved);
         }
         Edge::End => {
             nc.dur = target.saturating_sub(c.start);
+            if c.reverse {
+                // Reversed: the timeline end plays the earliest source, so shortening the end
+                // advances `src_in` by the removed source length (lengthening moves it back).
+                nc.src_in = c
+                    .src_in
+                    .saturating_add(scale_tick(c.dur.saturating_sub(nc.dur), c.speed));
+            }
         }
     }
     let change = nc.dur.saturating_sub(c.dur);

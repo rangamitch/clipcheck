@@ -31,12 +31,7 @@ pub fn paste_clips(
     }
     check_time(at, "paste position")?;
     for c in clips {
-        if c.start.0 < 0 || c.dur.0 <= 0 {
-            return Err(EditError::Invalid(format!(
-                "clip {} has a bad time range",
-                c.id
-            )));
-        }
+        check_clipboard_clip(p, c)?;
     }
     let earliest = clips.iter().map(|c| c.start).min().unwrap_or(Tick::ZERO);
 
@@ -397,6 +392,55 @@ fn check_time(t: Tick, what: &str) -> EditResult<()> {
     Ok(())
 }
 
+/// Refuses a clipboard clip whose values the editor could not have produced: a bad time range or
+/// source offset, a speed outside 0.1..=8 (video freeze frames may use 0), a `media_id` that names
+/// no media in the project, or a non-finite gain, pan, opacity, transform or envelope value. Clips
+/// with no `media_id` are accepted as they are (the project itself allows them).
+fn check_clipboard_clip(p: &Project, c: &Clip) -> EditResult<()> {
+    let bad = |what: &str| EditError::Invalid(format!("clip {} has {what}", c.id));
+    if c.start.0 < 0 || c.dur.0 <= 0 {
+        return Err(bad("a bad time range"));
+    }
+    if !(0..=MAX_TICK).contains(&c.src_in.0) {
+        return Err(bad("a bad source offset"));
+    }
+    if c.audio.fade_in.0 < 0 || c.audio.fade_out.0 < 0 {
+        return Err(bad("a negative fade"));
+    }
+    let freeze = c.kind == ClipKind::Video && c.speed == 0.0;
+    if !(freeze || (0.1..=8.0).contains(&c.speed)) {
+        return Err(bad("a speed outside 0.1..=8"));
+    }
+    if let Some(m) = c.media_id.as_deref() {
+        if p.media_ref(m).is_none() {
+            return Err(EditError::NotFound(format!(
+                "media {m} used by clip {}",
+                c.id
+            )));
+        }
+    }
+    let t = &c.transform;
+    let finite = [
+        c.opacity,
+        c.audio.gain_db,
+        c.audio.pan,
+        t.scale,
+        t.pos_x,
+        t.pos_y,
+        t.crop.left,
+        t.crop.top,
+        t.crop.right,
+        t.crop.bottom,
+    ]
+    .iter()
+    .all(|v| v.is_finite())
+        && c.audio.envelope.iter().all(|pt| pt.db.is_finite());
+    if !finite {
+        return Err(bad("a non-finite value"));
+    }
+    Ok(())
+}
+
 /// Track kind a clip belongs on.
 fn clip_track_kind(kind: ClipKind) -> TrackKind {
     if kind == ClipKind::Audio {
@@ -705,7 +749,7 @@ fn env_db_at(points: &[EnvPoint], t: Tick) -> f64 {
 
 /// Envelope points for the window `from..to` of a clip, re-based so the window starts at zero.
 /// Boundary points are interpolated. An empty envelope stays empty.
-fn slice_env(points: &[EnvPoint], from: Tick, to: Tick) -> Vec<EnvPoint> {
+pub(crate) fn slice_env(points: &[EnvPoint], from: Tick, to: Tick) -> Vec<EnvPoint> {
     if points.is_empty() || to <= from {
         return Vec::new();
     }

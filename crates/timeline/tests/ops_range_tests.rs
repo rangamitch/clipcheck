@@ -694,3 +694,74 @@ fn default_project_has_three_video_and_four_audio_tracks_unlocked() {
     assert_eq!(audio_tracks(&p).len(), 4);
     assert!(p.tracks.iter().all(|t| !t.locked));
 }
+
+#[test]
+fn paste_rejects_a_nan_or_out_of_range_speed_and_leaves_the_project_alone() {
+    let mut p = project();
+    let t = v1(&p);
+    let mut c = cb(&t, ClipKind::Video, s(0), s(2));
+    c.speed = f64::NAN;
+    assert!(paste_clips(
+        &mut p,
+        std::slice::from_ref(&c),
+        s(1),
+        None,
+        PlaceMode::Overwrite
+    )
+    .is_err());
+    c.speed = 20.0;
+    assert!(paste_clips(
+        &mut p,
+        std::slice::from_ref(&c),
+        s(1),
+        None,
+        PlaceMode::Overwrite
+    )
+    .is_err());
+    assert!(p.clips.is_empty());
+    // Speed 0 is the freeze-frame speed and is fine on a video clip.
+    c.speed = 0.0;
+    assert!(paste_clips(
+        &mut p,
+        std::slice::from_ref(&c),
+        s(1),
+        None,
+        PlaceMode::Overwrite
+    )
+    .is_ok());
+}
+
+#[test]
+fn paste_rejects_a_media_id_the_project_does_not_have() {
+    let mut p = project();
+    let t = v1(&p);
+    let mut c = cb(&t, ClipKind::Video, s(0), s(2));
+    c.media_id = Some("no-such-media".to_string());
+    let err = paste_clips(
+        &mut p,
+        std::slice::from_ref(&c),
+        s(1),
+        None,
+        PlaceMode::Overwrite,
+    )
+    .unwrap_err();
+    assert!(matches!(err, EditError::NotFound(_)), "{err:?}");
+    assert!(p.clips.is_empty());
+}
+
+#[test]
+fn paste_rejects_a_negative_source_offset() {
+    let mut p = project();
+    let t = v1(&p);
+    let mut c = cb(&t, ClipKind::Video, s(0), s(2));
+    c.src_in = Tick::from_ms(-1);
+    assert!(paste_clips(
+        &mut p,
+        std::slice::from_ref(&c),
+        s(1),
+        None,
+        PlaceMode::Overwrite
+    )
+    .is_err());
+    assert!(p.clips.is_empty());
+}
