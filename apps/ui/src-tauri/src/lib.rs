@@ -162,6 +162,7 @@ pub fn run() {
             editor::media::editor_waveform,
             editor::media::editor_thumbnails,
             editor::media::editor_media_url,
+            editor::media::editor_audio_stream_url,
             editor::media::editor_measure_clip_loudness,
             editor::export::editor_export_defaults,
             editor::export::editor_estimate_export,

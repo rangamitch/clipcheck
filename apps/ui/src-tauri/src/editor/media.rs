@@ -255,6 +255,37 @@ pub async fn editor_measure_clip_loudness(
         .map_err(|e| e.to_string())?
 }
 
+/// Playable URL for one audio stream (0-based, in audio-track order) of a media file of the open
+/// project. The webview's `<video>`/`<audio>` elements play only a file's default audio stream, so
+/// the stream is copied losslessly into its own single-track MP4 in the cache
+/// (`audio\<size>-<mtime_ms>-<stream>.m4a`, reused when present) and served through the import
+/// allowlist (`audio/mp4`). Only MP4/MOV/M4V files; images have no audio.
+#[tauri::command]
+pub async fn editor_audio_stream_url(
+    state: State<'_, EditorState>,
+    media_id: String,
+    stream: u32,
+) -> Result<String, String> {
+    let media = find_media(&state, &media_id)?;
+    if media.kind == MediaKind::Image {
+        return Err("images have no audio".to_string());
+    }
+    let index = usize::try_from(stream).unwrap_or(usize::MAX);
+    if index >= media.audio.len() {
+        return Err(format!("no audio stream {stream} in this media"));
+    }
+    let path = PathBuf::from(&media.path);
+    let out = tauri::async_runtime::spawn_blocking(move || extract_audio_stream(&path, stream))
+        .await
+        .map_err(|e| e.to_string())??;
+    mediaserver::register_extra_path(&out).ok_or_else(|| {
+        format!(
+            "{} cannot be served: it is not a media file or the media server is not running",
+            out.display()
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------------------------
 // Session access. Locks are held only while cloning what is needed.
 // ---------------------------------------------------------------------------------------------
@@ -863,6 +894,53 @@ fn media_url_for(media: &MediaRef) -> Result<String, String> {
             media.path
         )
     })
+}
+
+/// Copies audio stream `stream` (index among the audio tracks) of an MP4/MOV/M4V file into the
+/// audio cache with a lossless remux, and returns the cached file. A non-empty cached file is
+/// reused. Runs under `HeavyIo`, which serialises heavy jobs, so concurrent requests for the same
+/// stream wait for the first one and then find its output in the cache.
+fn extract_audio_stream(path: &Path, stream: u32) -> Result<PathBuf, String> {
+    if !matches!(ext_lower(path).as_str(), "mp4" | "m4v" | "mov") {
+        return Err("audio track extraction needs an MP4 file".to_string());
+    }
+    let meta = fs::metadata(path).map_err(|_| format!("file is missing: {}", path.display()))?;
+    let out =
+        cache_root()
+            .join("audio")
+            .join(format!("{}-{}-{stream}.m4a", meta.len(), mtime_ms(&meta)));
+    let cached = || fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false);
+    if cached() {
+        return Ok(out);
+    }
+    let _heavy = HeavyIo::enter();
+    // Another request may have written the file while this one waited for the lock.
+    if cached() {
+        return Ok(out);
+    }
+    let movie = clipcheck_mp4::reader::read_movie(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    // Track index in the movie's full track list (the remux selects by that index).
+    let track = movie
+        .tracks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.is_audio())
+        .nth(stream as usize)
+        .map(|(i, _)| i)
+        .ok_or_else(|| format!("no audio stream {stream} in this media"))?;
+    if let Some(dir) = out.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let opts = clipcheck_mp4::remux::RemuxOptions {
+        start_secs: 0.0,
+        end_secs: None,
+        tracks: clipcheck_mp4::remux::TrackSelect::Only(vec![track]),
+        faststart: true,
+    };
+    clipcheck_mp4::remux::concat_remux(&[path.to_path_buf()], &out, &opts)
+        .map_err(|e| format!("cannot extract audio stream {stream}: {e}"))?;
+    Ok(out)
 }
 
 /// Integrated loudness and peak of a clip's source range (stereo mix of the stream, at most ten

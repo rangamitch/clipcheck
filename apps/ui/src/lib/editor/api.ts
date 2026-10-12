@@ -150,6 +150,11 @@ export const editorApi = {
     return invoke<string>('editor_media_url', { mediaId });
   },
 
+  /** A playable URL for one audio stream (0-based audio index) of a media file: a lossless single-track copy. */
+  audioStreamUrl(mediaId: string, stream: number): Promise<string> {
+    return invoke<string>('editor_audio_stream_url', { mediaId, stream });
+  },
+
   /** Measures the loudness of an audio clip's used source range. */
   measureClipLoudness(clipId: string): Promise<LoudnessReport> {
     return invoke<LoudnessReport>('editor_measure_clip_loudness', { clipId });
