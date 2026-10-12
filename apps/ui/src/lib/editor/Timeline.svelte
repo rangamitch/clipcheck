@@ -66,7 +66,7 @@
     type MarqueeRect,
     type PointerLike,
   } from './timelineDrag';
-  import { clipEnd, secToTick, tickToSec } from './ticks';
+  import { clipEnd, formatTimecode, secToTick, tickToSec } from './ticks';
   import type { ApplyReply, Command, MediaRef, Project, Tick, Track, TrackKind } from './types';
 
   /** Width of the track header column, px. */
@@ -123,6 +123,10 @@
   let selectedGap = $state.raw<{ trackId: string; start: Tick; end: Tick } | null>(null);
   /** Hit under the idle pointer, kept only for edges and gaps (the things a press would act on). */
   let hover = $state.raw<HitResult | null>(null);
+  /** Pointer position over the timeline while the Cut tool is active, or null (drives the cut preview). */
+  let cutPos = $state.raw<{ x: number; y: number } | null>(null);
+  /** Shift state while the Cut tool is active: Shift turns cut snapping off. */
+  let shiftHeld = $state(false);
 
   // Plain (non-reactive) pointer bookkeeping for the active press.
   let pointerId = -1;
@@ -246,6 +250,76 @@
 
   const playX = $derived(tickToX($playhead, view));
   const playVisible = $derived(proj !== null && playX >= 0 && playX <= vpWidth);
+
+  /**
+   * Cut point for an x in the track area: the raw time, or the playhead / nearest clip boundary
+   * (any track, enabled or not) within SNAP_PX. The playhead is listed first, so it wins ties.
+   * Shift disables snapping. Used by both the cut preview and the click that cuts.
+   */
+  function cutSnap(current: Project, x: number, shift: boolean, play: Tick, v: View): {
+    tick: Tick;
+    x: number;
+    kind: 'playhead' | 'clip' | null;
+  } {
+    const raw = xToTick(x, v);
+    if (shift) return { tick: raw, x: tickToX(raw, v), kind: null };
+    const candidates: { tick: Tick; kind: 'playhead' | 'clip' }[] = [{ tick: play, kind: 'playhead' }];
+    for (const c of current.clips) {
+      candidates.push({ tick: c.start, kind: 'clip' }, { tick: clipEnd(c), kind: 'clip' });
+    }
+    let best: { tick: Tick; x: number; kind: 'playhead' | 'clip'; dist: number } | null = null;
+    for (const cand of candidates) {
+      const cx = tickToX(cand.tick, v);
+      const dist = Math.abs(cx - x);
+      if (dist > SNAP_PX) continue;
+      if (best === null || dist < best.dist) best = { tick: cand.tick, x: cx, kind: cand.kind, dist };
+    }
+    if (best === null) return { tick: raw, x: tickToX(raw, v), kind: null };
+    return { tick: best.tick, x: best.x, kind: best.kind };
+  }
+
+  /**
+   * Cut preview: shown only over a clip (the one a click would cut), at the snapped cut point.
+   * Null when the Cut tool is off or the pointer is not over a clip.
+   */
+  const cutPreview = $derived.by(
+    (): { x: number; snapped: boolean; kind: 'playhead' | 'clip' | null; label: string } | null => {
+      if ($tool !== 'razor' || cutPos === null || proj === null) return null;
+      const hit = hitTest(proj, rows, view, cutPos.x, cutPos.y);
+      if (hit.kind !== 'clip' || !hit.clipId) return null;
+      const cut = cutSnap(proj, cutPos.x, shiftHeld, $playhead, view);
+      return {
+        x: cut.x,
+        snapped: cut.kind !== null,
+        kind: cut.kind,
+        label: formatTimecode(cut.tick, proj.fps),
+      };
+    },
+  );
+
+  // Cut tool: Shift is tracked on the window (not only on pointer events) so the preview reacts to
+  // Shift without the mouse moving. Listeners exist only while the Cut tool is active.
+  $effect(() => {
+    if ($tool !== 'razor') {
+      cutPos = null;
+      shiftHeld = false;
+      return;
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      shiftHeld = e.shiftKey;
+    };
+    const onBlur = (): void => {
+      shiftHeld = false;
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKey);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keyup', onKey);
+      window.removeEventListener('blur', onBlur);
+    };
+  });
 
   // Keep the scroll offsets inside their limits after resize, zoom or edits.
   $effect(() => {
@@ -729,7 +803,9 @@
     }
     if ($tool === 'razor') {
       if (hit.kind === 'clip' && hit.clipId) {
-        void dispatch({ type: 'split_at', time: tickAt, ids: [hit.clipId] });
+        // Same snapped tick as the cut preview; Shift on this press disables snapping.
+        const cut = cutSnap(current, p.x, e.shiftKey, get(playhead), view);
+        void dispatch({ type: 'split_at', time: cut.tick, ids: [hit.clipId] });
       }
       return;
     }
@@ -825,7 +901,12 @@
   function onPointerMove(e: PointerEvent): void {
     const state = drag;
     if (state === null) {
-      updateHover(pointerLike(e));
+      const p = pointerLike(e);
+      updateHover(p);
+      if ($tool === 'razor') {
+        cutPos = { x: p.x, y: p.y };
+        shiftHeld = e.shiftKey;
+      }
       return;
     }
     if (e.pointerId !== pointerId) return;
@@ -1363,6 +1444,7 @@
     onlostpointercapture={onLostCapture}
     onpointerleave={() => {
       if (drag === null) hover = null;
+      cutPos = null;
     }}
     onkeydown={onViewportKey}
     onblur={() => {
@@ -1384,6 +1466,19 @@
 
       {#if playVisible}
         <div class="playhead" style:left="{playX}px" aria-hidden="true"></div>
+      {/if}
+
+      {#if cutPreview}
+        <div
+          class="cut-line"
+          class:snapped={cutPreview.snapped}
+          style:left="{cutPreview.x}px"
+          aria-hidden="true"
+        ></div>
+        {#if cutPreview.snapped}
+          <div class="cut-marker" class:playhead-snap={cutPreview.kind === 'playhead'} style:left="{cutPreview.x}px" aria-hidden="true"></div>
+        {/if}
+        <div class="cut-label" style:left="{cutPreview.x + 4}px" aria-hidden="true">{cutPreview.label}</div>
       {/if}
 
       {#if dropPreview}
@@ -1628,6 +1723,51 @@
     border-left: 6px solid transparent;
     border-right: 6px solid transparent;
     border-top: 9px solid var(--accent);
+  }
+
+  /* Cut preview (Cut tool): dashed yellow line over the track rows, solid when snapped. */
+  .cut-line {
+    position: absolute;
+    top: 28px;
+    bottom: 0;
+    width: 0;
+    border-left: 1px dashed #ffe066;
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  .cut-line.snapped {
+    border-left: 2px solid #ffe066;
+  }
+
+  .cut-marker {
+    position: absolute;
+    top: 22px;
+    width: 8px;
+    height: 8px;
+    margin-left: -4px;
+    background: #ffe066;
+    transform: rotate(45deg);
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  .cut-marker.playhead-snap {
+    background: #ffffff;
+  }
+
+  .cut-label {
+    position: absolute;
+    top: 30px;
+    padding: 1px 4px;
+    border-radius: 3px;
+    background: rgba(20, 20, 20, 0.85);
+    color: #ffe066;
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+    z-index: 2;
   }
 
   .drop-line {
