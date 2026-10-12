@@ -3,12 +3,25 @@
 //! One thread accepts connections. Each accepted connection gets its own
 //! thread. Every connection starts with a `hello` handshake, then serves
 //! requests until the client disconnects.
+//!
+//! Requests are split into three lanes so that a slow command cannot make later
+//! quick requests on the same connection time out:
+//!
+//! - **Inline** (the default): handled on the connection thread, in order, as
+//!   before. This covers status, control, config, subscribe and shutdown.
+//! - **Files**: recording and library commands. They run on one worker thread
+//!   per connection, in the order the client sent them, so a rename, favorite,
+//!   delete or register on the same recording keeps its order.
+//! - **Discovery**: device, app and encoder listings and the mic test. Each
+//!   runs on its own short-lived thread, since no ordering is needed.
+//!
+//! Lane workers reply out of order. The client matches replies by request id.
 
 use std::collections::VecDeque;
 use std::io;
 use std::process;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
@@ -64,7 +77,7 @@ pub fn serve(mut pipe: PipeServer, state: Arc<AppState>) {
             .name("ipc-client".to_owned())
             .spawn(move || {
                 let _slot = slot;
-                handle_connection(conn, &state);
+                handle_connection(conn, state);
             });
         if let Err(e) = spawned {
             // The closure was dropped, which released the slot and the connection.
@@ -101,7 +114,7 @@ type Writer = Mutex<PipeConn>;
 /// pushed event as soon as it is published, even while the client is idle.
 /// Dropping the subscription at teardown closes the event channel, which stops
 /// that thread.
-fn handle_connection(mut conn: PipeConn, state: &AppState) {
+fn handle_connection(mut conn: PipeConn, state: Arc<AppState>) {
     let writer: Arc<Writer> = match conn.try_clone() {
         Ok(clone) => Arc::new(Mutex::new(clone)),
         Err(e) => {
@@ -129,6 +142,8 @@ fn handle_connection(mut conn: PipeConn, state: &AppState) {
     let owner = NEXT_CONNECTION.fetch_add(1, Ordering::Relaxed);
     // Whether this client holds a hotkey suspension. Its disconnect ends the suspension.
     let mut suspending_hotkeys = false;
+    // Queue of the files lane. Created on first use; see `dispatch_lane`.
+    let mut files: Option<Sender<FileJob>> = None;
     loop {
         let frame: Value = match read_frame(&mut conn) {
             Ok(frame) => frame,
@@ -194,10 +209,24 @@ fn handle_connection(mut conn: PipeConn, state: &AppState) {
             continue;
         }
 
+        let lane = lane(&request.body);
+        if lane != Lane::Inline {
+            dispatch_lane(
+                lane,
+                request.id,
+                request.body,
+                &mut files,
+                &state,
+                &writer,
+                proto,
+            );
+            continue;
+        }
+
         let reply = replay_or_run(&mut replays, request.id, request.body, |body| {
             dispatch(
                 body,
-                state,
+                &state,
                 &subscription,
                 &mut subscriptions,
                 owner,
@@ -218,6 +247,9 @@ fn handle_connection(mut conn: PipeConn, state: &AppState) {
         }
     }
 
+    // Dropping the files sender lets that worker exit once its queued work is done.
+    // It is not joined, so a slow disk operation cannot hang the disconnect.
+    drop(files);
     // Unregistering closes the event channel, so the event thread exits after
     // its current write. Its clone of the connection is released then.
     discovery::meter_release(owner);
@@ -469,24 +501,6 @@ fn dispatch(
         },
         // The connection loop triggers the actual shutdown after this ack is written.
         Command::Shutdown { reason, mode } => shutdown_reply(state, reason.as_deref(), mode),
-        Command::ListAudioApps => discovery::audio_apps_reply(),
-        Command::ListAudioDevices => discovery::audio_devices_reply(),
-        Command::ListEncoders => match state.service.encoder_report() {
-            Ok(report) => discovery::encoders_reply_for(report.as_ref()),
-            Err(e) => service_error(e),
-        },
-        Command::ListRunningApps => {
-            let config = match state.service.config() {
-                Ok(view) => view.config,
-                Err(e) => return service_error(e),
-            };
-            let attached = state
-                .service
-                .status()
-                .ok()
-                .and_then(|status| status.game.map(|game| game.exe));
-            discovery::running_apps_reply(&config, attached.as_deref())
-        }
         Command::MicMeter { enable, device } => {
             match discovery::mic_meter(owner, enable, device, Arc::clone(&state.bus)) {
                 Ok(()) => Reply::Ok,
@@ -497,7 +511,60 @@ fn dispatch(
                 },
             }
         }
-        Command::MicTest { device } => discovery::mic_test_reply(device),
+        // Files and discovery lanes. Normally these never reach `dispatch`, because the
+        // connection loop routes them to a worker. Handling them here keeps `dispatch` total.
+        command @ (Command::RenameRecording { .. }
+        | Command::SetFavorite { .. }
+        | Command::DeleteRecording { .. }
+        | Command::RegisterEditedRecording { .. }
+        | Command::ListLibraries
+        | Command::ScanLibraries { .. }
+        | Command::ImportPlan { .. }
+        | Command::ImportStart { .. }
+        | Command::ImportCancel { .. }
+        | Command::ListGameNames
+        | Command::ListAudioApps
+        | Command::ListAudioDevices
+        | Command::ListEncoders
+        | Command::ListRunningApps
+        | Command::MicTest { .. }) => dispatch_off_loop(command, state),
+    }
+}
+
+/// Which worker runs a request. `Inline` requests stay on the connection thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Inline,
+    Files,
+    Discovery,
+}
+
+/// Chooses the lane for one command. Anything not listed is `Inline`, the safe default.
+fn lane(command: &Command) -> Lane {
+    match command {
+        Command::RenameRecording { .. }
+        | Command::SetFavorite { .. }
+        | Command::DeleteRecording { .. }
+        | Command::RegisterEditedRecording { .. }
+        | Command::ListLibraries
+        | Command::ScanLibraries { .. }
+        | Command::ImportPlan { .. }
+        | Command::ImportStart { .. }
+        | Command::ImportCancel { .. }
+        | Command::ListGameNames => Lane::Files,
+        Command::ListAudioApps
+        | Command::ListAudioDevices
+        | Command::ListEncoders
+        | Command::ListRunningApps
+        | Command::MicTest { .. } => Lane::Discovery,
+        _ => Lane::Inline,
+    }
+}
+
+/// Runs one command from the files or discovery lane. Each arm here is the only
+/// implementation of that command. Other variants are refused, not run.
+fn dispatch_off_loop(command: Command, state: &AppState) -> Reply {
+    match command {
         Command::RenameRecording { recording_id, name } => {
             recordings::rename(state, &recording_id, &name)
         }
@@ -524,7 +591,116 @@ fn dispatch(
         | Command::ImportStart { .. }
         | Command::ImportCancel { .. }
         | Command::ListGameNames) => state.service.library().handle(command),
+        Command::ListAudioApps => discovery::audio_apps_reply(),
+        Command::ListAudioDevices => discovery::audio_devices_reply(),
+        Command::ListEncoders => match state.service.encoder_report() {
+            Ok(report) => discovery::encoders_reply_for(report.as_ref()),
+            Err(e) => service_error(e),
+        },
+        Command::ListRunningApps => {
+            let config = match state.service.config() {
+                Ok(view) => view.config,
+                Err(e) => return service_error(e),
+            };
+            let attached = state
+                .service
+                .status()
+                .ok()
+                .and_then(|status| status.game.map(|game| game.exe));
+            discovery::running_apps_reply(&config, attached.as_deref())
+        }
+        Command::MicTest { device } => discovery::mic_test_reply(device),
+        _ => Reply::Error {
+            code: ErrorCode::Internal,
+            message: "command is not handled off the request loop".to_owned(),
+            retryable: false,
+        },
     }
+}
+
+/// A command queued for the files lane, with its request id for the reply.
+type FileJob = (Option<u64>, Command);
+
+/// Sends a command to its lane. The reply is written by the worker, or by this
+/// function when the worker cannot be started or has stopped.
+fn dispatch_lane(
+    lane: Lane,
+    id: Option<u64>,
+    command: Command,
+    files: &mut Option<Sender<FileJob>>,
+    state: &Arc<AppState>,
+    writer: &Arc<Writer>,
+    proto: u16,
+) {
+    match lane {
+        Lane::Files => {
+            if files.is_none() {
+                match spawn_file_worker(Arc::clone(state), Arc::clone(writer), proto) {
+                    Ok(tx) => *files = Some(tx),
+                    Err(e) => {
+                        worker_unavailable(writer, proto, id, &e);
+                        return;
+                    }
+                }
+            }
+            let queued = files
+                .as_ref()
+                .is_some_and(|tx| tx.send((id, command)).is_ok());
+            if !queued {
+                // The worker has stopped. Forget its sender so the next request starts a new one.
+                *files = None;
+                let e = io::Error::other("files worker stopped");
+                worker_unavailable(writer, proto, id, &e);
+            }
+        }
+        Lane::Discovery => {
+            let state = Arc::clone(state);
+            let worker_writer = Arc::clone(writer);
+            let spawned = thread::Builder::new()
+                .name("ipc-discovery".to_owned())
+                .spawn(move || {
+                    let reply = dispatch_off_loop(command, &state);
+                    let _ = send(&worker_writer, proto, id, reply);
+                });
+            if let Err(e) = spawned {
+                worker_unavailable(writer, proto, id, &e);
+            }
+        }
+        Lane::Inline => {}
+    }
+}
+
+/// Starts the files-lane worker for one connection. The worker runs queued commands
+/// in order and exits when every sender is dropped.
+fn spawn_file_worker(
+    state: Arc<AppState>,
+    writer: Arc<Writer>,
+    proto: u16,
+) -> io::Result<Sender<FileJob>> {
+    let (tx, rx) = mpsc::channel::<FileJob>();
+    thread::Builder::new()
+        .name("ipc-files".to_owned())
+        .spawn(move || {
+            while let Ok((id, command)) = rx.recv() {
+                let reply = dispatch_off_loop(command, &state);
+                // A failed write means the client is gone. Later replies will fail too.
+                let _ = send(&writer, proto, id, reply);
+            }
+        })?;
+    Ok(tx)
+}
+
+/// Answers a lane request that could not be started. The client gets a reply
+/// instead of waiting for one that never comes.
+fn worker_unavailable(writer: &Writer, proto: u16, id: Option<u64>, e: &io::Error) {
+    logging::warn(&format!("cannot start IPC worker thread: {e}"));
+    let _ = send_error(
+        writer,
+        proto,
+        id,
+        ErrorCode::WorkerUnavailable,
+        &format!("cannot start worker thread: {e}"),
+    );
 }
 
 /// Replies remembered per connection for retried requests.
@@ -850,5 +1026,77 @@ mod tests {
         // Id 1 fell out of the window and runs again.
         replay_or_run(&mut cache, Some(1), clip(), run);
         assert_eq!(runs.get(), REPLAY_WINDOW + 2);
+    }
+
+    #[test]
+    fn file_commands_map_to_the_files_lane() {
+        let commands = [
+            Command::RenameRecording {
+                recording_id: "r".into(),
+                name: "n".into(),
+            },
+            Command::SetFavorite {
+                recording_id: "r".into(),
+                favorite: true,
+            },
+            Command::DeleteRecording {
+                recording_id: "r".into(),
+            },
+            Command::RegisterEditedRecording {
+                source_recording_id: None,
+                path: "p".into(),
+                keep_source_time: false,
+            },
+            Command::ListLibraries,
+            Command::ScanLibraries { root_id: None },
+            Command::ImportPlan {
+                paths: Vec::new(),
+                game: None,
+            },
+            Command::ImportStart {
+                paths: Vec::new(),
+                game: None,
+            },
+            Command::ImportCancel { job_id: "j".into() },
+            Command::ListGameNames,
+        ];
+        for command in &commands {
+            assert_eq!(lane(command), Lane::Files, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_commands_map_to_the_discovery_lane() {
+        let commands = [
+            Command::ListAudioApps,
+            Command::ListAudioDevices,
+            Command::ListEncoders,
+            Command::ListRunningApps,
+            Command::MicTest { device: None },
+        ];
+        for command in &commands {
+            assert_eq!(lane(command), Lane::Discovery, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn quick_and_control_commands_stay_inline() {
+        let commands = [
+            Command::Ping,
+            Command::GetStatus,
+            clip(),
+            Command::PatchConfig {
+                patch: Value::Null,
+                dry_run: false,
+            },
+            Command::Subscribe { topics: Vec::new() },
+            Command::Shutdown {
+                reason: None,
+                mode: None,
+            },
+        ];
+        for command in &commands {
+            assert_eq!(lane(command), Lane::Inline, "{command:?}");
+        }
     }
 }

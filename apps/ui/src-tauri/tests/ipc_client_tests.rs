@@ -33,11 +33,11 @@ fn timeout_for_uses_long_timeout_only_for_config_writes() {
     let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(
         timeout_for(&json!({"type": "get_status"})),
-        Duration::from_secs(5)
+        Duration::from_secs(15)
     );
     assert_eq!(
         timeout_for(&json!({"type": "ping"})),
-        Duration::from_secs(5)
+        Duration::from_secs(15)
     );
     assert_eq!(
         timeout_for(&json!({"type": "patch_config", "data": {}})),
@@ -47,7 +47,7 @@ fn timeout_for_uses_long_timeout_only_for_config_writes() {
         timeout_for(&json!({"type": "reload_config"})),
         Duration::from_secs(30)
     );
-    assert_eq!(timeout_for(&json!({})), Duration::from_secs(5));
+    assert_eq!(timeout_for(&json!({})), Duration::from_secs(15));
 }
 
 #[test]
