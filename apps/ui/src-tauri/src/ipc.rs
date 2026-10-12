@@ -33,9 +33,11 @@ use crate::daemon::resolve_pipe_name;
 const CLIENT_NAME: &str = "clipcheck-ui";
 /// Time allowed for one connect attempt before backing off.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-/// Default request timeout.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-/// Timeout for requests that write configuration.
+/// Default request timeout. The daemon serves one connection serially, so a request can
+/// queue behind slow disk, ffprobe or SQLite work; 5 s was too tight for that.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Timeout for requests that write configuration, run the mic test, or do library and
+/// recording file operations (ffprobe, thumbnails, Recycle Bin, scans, imports).
 const LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Time to wait for the shutdown ack before the UI exits anyway.
 const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -87,10 +89,23 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 /// Returns the request timeout for a command JSON body: 30 s for configuration writes,
-/// 5 s otherwise.
+/// the mic test, and library/recording file operations; 15 s otherwise.
 pub fn timeout_for(command: &Value) -> Duration {
     match command.get("type").and_then(Value::as_str) {
-        Some("patch_config") | Some("reload_config") | Some("mic_test") => LONG_REQUEST_TIMEOUT,
+        Some("patch_config")
+        | Some("reload_config")
+        | Some("mic_test")
+        | Some("register_edited_recording")
+        | Some("rename_recording")
+        | Some("delete_recording")
+        | Some("set_favorite")
+        | Some("scan_libraries")
+        | Some("import_plan")
+        | Some("import_start")
+        | Some("import_cancel")
+        | Some("list_libraries")
+        | Some("list_game_names")
+        | Some("clip_now") => LONG_REQUEST_TIMEOUT,
         _ => REQUEST_TIMEOUT,
     }
 }
@@ -625,6 +640,39 @@ mod tests {
             timeout_for(&json!({"type":"mic_test","data":{"device":null}})),
             LONG_REQUEST_TIMEOUT
         );
+    }
+
+    #[test]
+    fn library_and_recording_commands_use_long_timeout() {
+        for ty in [
+            "register_edited_recording",
+            "rename_recording",
+            "delete_recording",
+            "set_favorite",
+            "scan_libraries",
+            "import_plan",
+            "import_start",
+            "import_cancel",
+            "list_libraries",
+            "list_game_names",
+            "clip_now",
+        ] {
+            assert_eq!(
+                timeout_for(&json!({ "type": ty })),
+                LONG_REQUEST_TIMEOUT,
+                "{ty} should use the long timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn status_and_ping_use_default_timeout() {
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(
+            timeout_for(&json!({"type": "get_status"})),
+            REQUEST_TIMEOUT
+        );
+        assert_eq!(timeout_for(&json!({"type": "ping"})), REQUEST_TIMEOUT);
     }
 
     #[test]
