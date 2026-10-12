@@ -2,8 +2,8 @@
   import { invoke } from '@tauri-apps/api/core';
   import { tick, untrack } from 'svelte';
   import { formatBytes } from '../format';
-  import { editorApi } from './api';
-  import { playhead, selection, snapshot, toast } from './store';
+  import { editorApi, type EncoderInfo } from './api';
+  import { playhead, snapshot, toast } from './store';
   import { formatDuration, secToTick } from './ticks';
   import {
     defaultExportSettings,
@@ -13,7 +13,6 @@
     type ExportDefaults,
     type ExportKind,
     type ExportSettings,
-    type Preset,
     type QualityMode,
     type Rate,
     type VideoCodec,
@@ -31,7 +30,7 @@
   /** Delay after the last change before the estimate runs, ms. */
   const ESTIMATE_DEBOUNCE_MS = 300;
   const NAME_TEMPLATE_DEFAULT = defaultExportSettings().name_template;
-  /** Audio-only export is not available in the engine yet, so the tab and its presets stay hidden. */
+  /** Audio-only export is not available in the engine yet, so the tab stays hidden. */
   const KIND_TABS: { id: ExportKind['kind']; label: string }[] = [
     { id: 'video', label: 'Video' },
     { id: 'still', label: 'Still frame (PNG/JPG)' },
@@ -41,16 +40,15 @@
     { value: 44100, label: '44.1 kHz' },
     { value: 48000, label: '48 kHz' },
   ];
-  const FPS_CHOICES = [24, 30, 60];
-  /** Resolution choices by long side; the short side follows the canvas orientation and aspect. */
+  /** Resolution choices: the canvas is fitted inside this bounding box, keeping its aspect. */
   const RES_CHOICES = [
-    { id: '2160', label: '4K (2160p)', long: 3840 },
-    { id: '1440', label: '1440p', long: 2560 },
-    { id: '1080', label: '1080p', long: 1920 },
-    { id: '720', label: '720p', long: 1280 },
-    { id: '480', label: '480p', long: 854 },
-    { id: '360', label: '360p', long: 640 },
+    { id: '720', label: '720p', boxW: 1280, boxH: 720 },
+    { id: '1080', label: '1080p', boxW: 1920, boxH: 1080 },
+    { id: '1440', label: '1440p', boxW: 2560, boxH: 1440 },
+    { id: '2160', label: '4K', boxW: 3840, boxH: 2160 },
   ];
+  const DEFAULT_RES = '1080';
+  const FPS_CHOICES = [30, 60];
   const SIZE_MIN = 128;
   const SIZE_MAX = 8192;
   const MBPS_MIN = 0.1;
@@ -74,12 +72,10 @@
   let loadError = $state('');
   let defaults = $state.raw<ExportDefaults | null>(null);
   let settings = $state.raw<ExportSettings | null>(null);
-  /** User presets only; built-in presets come from `defaults`. */
-  let userPresets = $state.raw<Preset[]>([]);
   /** False while the name follows the template; true once the user types a name. */
   let nameEdited = $state(false);
-  /** Resolution dropdown value: 'canvas', a RES_CHOICES id, or 'custom'. */
-  let resChoice = $state('canvas');
+  /** Selected resolution: a RES_CHOICES id, or 'custom' once width/height were typed by hand. */
+  let resChoice = $state(DEFAULT_RES);
   let lockAspect = $state(true);
   /** Width / height ratio kept while the aspect lock is on. */
   let aspect = $state(16 / 9);
@@ -90,50 +86,38 @@
   let cbrText = $state(String(DEFAULT_MBPS));
   let targetText = $state(String(DEFAULT_TARGET_MB));
   let stillQualityText = $state(String(DEFAULT_STILL_QUALITY));
-  let presetSaving = $state(false);
-  let presetLabel = $state('');
-  let presetSaveError = $state('');
-  /** Id of an existing user preset that the next save would replace; null when none is pending. */
-  let replaceId = $state<string | null>(null);
+  let advancedOpen = $state(false);
+  /** Real encoders for the selected codec; null while loading. */
+  let encoderList = $state.raw<EncoderInfo[] | null>(null);
   let estimate = $state.raw<EstimateReply | null>(null);
   let estimateError = $state('');
   let estimating = $state(false);
   let smart = $state.raw<SmartInfo | null>(null);
   let busy = $state(false);
-  /** Error text for the footer (export, still frame, folder picker, preset delete). */
+  /** Error text for the footer (export, still frame, folder picker). */
   let errorText = $state('');
   /** Path of the last saved still frame. */
   let stillPath = $state('');
   let dialogEl = $state<HTMLDivElement | undefined>(undefined);
-  let presetSelect = $state<HTMLSelectElement | undefined>(undefined);
   /** Element that had focus before the dialog opened, restored when it closes. */
   let returnFocus: HTMLElement | null = null;
   let loadSeq = 0;
   let estimateSeq = 0;
+  let encoderSeq = 0;
 
   const canvas = $derived($snapshot?.project.canvas ?? null);
-  const selectedIds = $derived($selection);
-  const hasWorkArea = $derived(Boolean($snapshot?.project.work_area));
-  /** Presets that export video or stills; audio-only presets are hidden until the engine supports them. */
-  function videoPresets(list: Preset[]): Preset[] {
-    return list.filter((p) => p.settings.kind.kind !== 'audio_only');
-  }
-  const builtinPresets = $derived(videoPresets((defaults?.presets ?? []).filter((p) => p.builtin)));
-  const shownUserPresets = $derived(videoPresets(userPresets));
-  const allPresets = $derived([...builtinPresets, ...shownUserPresets]);
-  /** The preset id the settings came from, or 'custom' once a field was edited by hand. */
-  const presetId = $derived(
-    settings && allPresets.some((p) => p.id === settings?.preset) ? settings.preset : 'custom',
-  );
-  const selectedPreset = $derived(allPresets.find((p) => p.id === presetId) ?? null);
   const kindId = $derived(settings?.kind.kind ?? 'video');
   const still = $derived(stillOf(settings));
-  const rangeKind = $derived(settings?.range.kind ?? 'entire');
   const qMode = $derived(settings?.quality.mode ?? 'quality');
   const folder = $derived(settings?.dir ?? defaults?.dir ?? '');
   const stem = $derived(estimate ? fileStem(estimate.outPath) : '');
   const nameShown = $derived(nameEdited && settings ? settings.name_template : stem);
   const av1Available = $derived((defaults?.encoders ?? []).some((e) => /av1/i.test(e)));
+  /** Codec key the backend encoder listing understands; null for codecs it does not list. */
+  const codecKey = $derived.by((): 'h264' | 'hevc' | null => {
+    const c = settings?.codec;
+    return c === 'h264' || c === 'hevc' ? c : null;
+  });
   const audioTrackCount = $derived.by(() => {
     const project = $snapshot?.project;
     if (!project) return 0;
@@ -147,13 +131,6 @@
   const nameError = $derived(
     estimate && nameShown.trim() === '' ? 'Enter a file name.' : null,
   );
-  const rangeError = $derived.by((): string | null => {
-    if (!settings) return null;
-    const range = settings.range;
-    if (range.kind === 'work_area' && !hasWorkArea) return 'There is no work area to export.';
-    if (range.kind === 'selected_clips' && range.ids.length === 0) return 'Select clips to export.';
-    return null;
-  });
   const isVideo = $derived(kindId === 'video');
   const widthError = $derived(isVideo ? sizeError(widthText) : null);
   const heightError = $derived(isVideo ? sizeError(heightText) : null);
@@ -173,7 +150,6 @@
   const blockers = $derived([
     ...(estimate?.problems ?? []),
     nameError,
-    rangeError,
     widthError,
     heightError,
     qualityError,
@@ -198,16 +174,17 @@
     return smart.reason ?? 'Not eligible for lossless export.';
   });
 
-  const fpsOptions = $derived.by(() => {
-    const opts: { value: string; label: string }[] = [
-      { value: 'project', label: canvas ? `Project (${fpsLabel(canvas.fps)} fps)` : 'Project' },
-    ];
-    for (const n of FPS_CHOICES) opts.push({ value: `${n}/1`, label: String(n) });
-    const current = settings?.fps ?? null;
-    if (current && !opts.some((o) => o.value === fpsKey(current))) {
-      opts.push({ value: fpsKey(current), label: fpsLabel(current) });
-    }
-    return opts;
+  /** Frame rate in whole fps when it is exactly 30 or 60, else null (nothing highlighted). */
+  const fpsChosen = $derived.by((): number | null => {
+    const r = settings?.fps ?? null;
+    if (!r || r.den === 0) return null;
+    const v = r.num / r.den;
+    return FPS_CHOICES.includes(v) ? v : null;
+  });
+  const sizeLabel = $derived.by((): string => {
+    if (!settings) return '';
+    const base = `${settings.width} x ${settings.height} (${aspectLabel(settings.width, settings.height)})`;
+    return resChoice === 'custom' ? `Custom: ${base}` : base;
   });
   const codecOptions = $derived.by(() => {
     const opts: { value: VideoCodec; label: string }[] = [
@@ -218,10 +195,19 @@
     return opts;
   });
   const encoderOptions = $derived.by(() => {
-    const names = defaults?.encoders ?? [];
+    const opts: { value: string; label: string }[] = [
+      { value: 'auto', label: 'Auto (best available)' },
+    ];
+    const list: EncoderInfo[] = encoderList ?? [{ name: 'software', hardware: false }];
+    for (const e of list) {
+      if (e.name === 'auto') continue;
+      opts.push({ value: e.name, label: encoderLabel(e) });
+    }
     const current = settings?.encoder ?? 'auto';
-    const all = names.includes(current) ? names : [...names, current];
-    return all.map((v) => ({ value: v, label: encoderLabel(v) }));
+    if (!opts.some((o) => o.value === current)) {
+      opts.push({ value: current, label: encoderLabel({ name: current, hardware: false }) });
+    }
+    return opts;
   });
   const loudnessOptions = $derived.by(() => {
     const opts = [
@@ -262,6 +248,19 @@
     return Math.max(2, 2 * Math.round(v / 2));
   }
 
+  function gcd(a: number, b: number): number {
+    return b === 0 ? a : gcd(b, a % b);
+  }
+
+  /** "16:9" for common ratios, a decimal ratio otherwise. */
+  function aspectLabel(w: number, h: number): string {
+    if (!Number.isInteger(w) || !Number.isInteger(h) || w <= 0 || h <= 0) return '-';
+    const g = gcd(w, h);
+    const a = w / g;
+    const b = h / g;
+    return a <= 32 && b <= 32 ? `${a}:${b}` : `${(w / h).toFixed(2)}:1`;
+  }
+
   function intError(text: string, lo: number, hi: number, message: string): string | null {
     const n = parseNum(text);
     return n !== null && Number.isInteger(n) && n >= lo && n <= hi ? null : message;
@@ -299,24 +298,9 @@
     return String(Math.round(kbps / 100) / 10);
   }
 
-  function fpsKey(r: Rate | null): string {
-    return r === null ? 'project' : `${r.num}/${r.den}`;
-  }
-
-  function parseFpsKey(v: string): Rate | null {
-    if (v === 'project') return null;
-    const parts = v.split('/');
-    return { num: Number(parts[0]), den: Number(parts[1] ?? 1) };
-  }
-
-  function fpsLabel(r: Rate): string {
-    return (r.num / r.den).toFixed(3).replace(/\.?0+$/, '');
-  }
-
-  function encoderLabel(v: string): string {
-    if (v === 'auto') return 'Auto (hardware first)';
-    if (v === 'software') return 'Software (CPU)';
-    return v;
+  function encoderLabel(e: EncoderInfo): string {
+    if (e.name === 'software') return 'Software (CPU)';
+    return `${e.name} (${e.hardware ? 'GPU' : 'CPU'})`;
   }
 
   function fileStem(path: string): string {
@@ -330,23 +314,22 @@
     return { format: s.kind.format, quality: s.kind.quality };
   }
 
-  /** Size of a resolution choice for the canvas, or null for 'custom'. */
+  /**
+   * Fits the canvas inside a bounding box, keeping its aspect (scaled up or down to fill the box),
+   * with both sides even. Null when there is no usable canvas.
+   */
   function sizeForChoice(id: string): { width: number; height: number } | null {
     const c = canvas;
-    if (!c || c.width <= 0 || c.height <= 0) return null;
-    if (id === 'canvas') return { width: c.width, height: c.height };
     const choice = RES_CHOICES.find((r) => r.id === id);
-    if (!choice) return null;
-    if (c.width >= c.height) {
-      return { width: choice.long, height: evenRound((choice.long * c.height) / c.width) };
-    }
-    return { width: evenRound((choice.long * c.width) / c.height), height: choice.long };
+    if (!c || !choice || c.width <= 0 || c.height <= 0) return null;
+    const scale = Math.min(choice.boxW / c.width, choice.boxH / c.height);
+    return { width: evenRound(c.width * scale), height: evenRound(c.height * scale) };
   }
 
   function resChoiceFor(s: ExportSettings): string {
-    for (const id of ['canvas', ...RES_CHOICES.map((r) => r.id)]) {
-      const size = sizeForChoice(id);
-      if (size && size.width === s.width && size.height === s.height) return id;
+    for (const r of RES_CHOICES) {
+      const size = sizeForChoice(r.id);
+      if (size && size.width === s.width && size.height === s.height) return r.id;
     }
     return 'custom';
   }
@@ -365,7 +348,7 @@
     return { eligible: r.eligible === true, reason, notes };
   }
 
-  /** Applies an edit made by hand: the settings no longer match a preset. */
+  /** Applies an edit made by hand. */
   function editSettings(next: Partial<ExportSettings>): void {
     if (!settings) return;
     settings = { ...settings, ...next, preset: 'custom' };
@@ -403,8 +386,6 @@
     estimateError = '';
     smart = null;
     stillPath = '';
-    presetSaving = false;
-    presetSaveError = '';
     try {
       const [d, prefs] = await Promise.all([
         editorApi.exportDefaults(),
@@ -418,21 +399,37 @@
       if (start.dir === null && prefs && prefs.lastExportDir !== '') {
         start.dir = prefs.lastExportDir;
       }
+      // Always export the whole timeline, with a fresh (re-encoding) job.
+      start.range = { kind: 'entire' };
+      start.lossless = false;
+      // Frame rate is 30 or 60; anything else (project rate, 24, ...) starts at 30.
+      const r = start.fps;
+      if (!r || r.den === 0 || !FPS_CHOICES.includes(r.num / r.den)) {
+        start.fps = { num: 30, den: 1 };
+      }
       defaults = d;
-      userPresets = d.presets.filter((p) => !p.builtin);
       nameEdited = false;
       bitrateText = String(DEFAULT_MBPS);
       cbrText = String(DEFAULT_MBPS);
       targetText = String(DEFAULT_TARGET_MB);
       stillQualityText = String(DEFAULT_STILL_QUALITY);
+      qualitySlider = DEFAULT_QUALITY;
+      // A restored size that is not one of the four choices starts at 1080p.
+      if (resChoiceFor(start) === 'custom') {
+        const size = sizeForChoice(DEFAULT_RES);
+        if (size) {
+          start.width = size.width;
+          start.height = size.height;
+        }
+      }
       const c = canvas;
-      aspect = c && c.height > 0 ? c.width / c.height : 16 / 9;
+      aspect = c && c.height > 0 ? c.width / c.height : start.height > 0 ? start.width / start.height : 16 / 9;
       lockAspect = true;
       settings = start;
       syncFromSettings(start);
       loading = false;
       await tick();
-      presetSelect?.focus();
+      dialogEl?.querySelector<HTMLElement>('.seg button')?.focus();
     } catch (e) {
       if (seq === loadSeq) loadError = String(e);
     } finally {
@@ -473,6 +470,27 @@
     return () => clearTimeout(timer);
   });
 
+  // Real encoder names for the selected codec; reloads when the codec changes.
+  $effect(() => {
+    const key = codecKey;
+    if (!open || loading) return;
+    const seq = ++encoderSeq;
+    if (key === null) {
+      encoderList = [{ name: 'software', hardware: false }];
+      return;
+    }
+    encoderList = null;
+    editorApi
+      .listEncoders(key)
+      .then((list) => {
+        if (seq !== encoderSeq) return;
+        encoderList = list.length > 0 ? list : [{ name: 'software', hardware: false }];
+      })
+      .catch(() => {
+        if (seq === encoderSeq) encoderList = [{ name: 'software', hardware: false }];
+      });
+  });
+
   // Open: load the defaults and remember what had focus. Close: give focus back.
   $effect(() => {
     if (open) {
@@ -511,7 +529,7 @@
   function trapFocus(event: KeyboardEvent, root: HTMLElement): void {
     const items = Array.from(
       root.querySelectorAll<HTMLElement>(
-        'button:not(:disabled), input:not(:disabled), select:not(:disabled), details > summary',
+        'button:not(:disabled), input:not(:disabled), select:not(:disabled)',
       ),
     );
     const first = items[0];
@@ -525,105 +543,6 @@
     } else if (!event.shiftKey && (active === last || !inside)) {
       event.preventDefault();
       first.focus();
-    }
-  }
-
-  function applyPreset(id: string): void {
-    if (!settings) return;
-    if (id === 'custom') {
-      settings = { ...settings, preset: 'custom' };
-      return;
-    }
-    const p = allPresets.find((x) => x.id === id);
-    const c = canvas;
-    if (!p || !c) return;
-    // Name, location, range and encoder stay as the user chose them; the preset supplies the rest.
-    const size = p.fixed_size
-      ? fitBox(c.width, c.height, p.settings.width, p.settings.height)
-      : { width: c.width, height: c.height };
-    const next: ExportSettings = {
-      ...p.settings,
-      preset: p.id,
-      name_template: settings.name_template,
-      dir: settings.dir,
-      range: settings.range,
-      encoder: settings.encoder,
-      kind: p.settings.kind,
-      lossless: false,
-      width: size.width,
-      height: size.height,
-    };
-    settings = next;
-    aspect = next.height > 0 ? next.width / next.height : aspect;
-    syncFromSettings(next);
-  }
-
-  /**
-   * Fits a canvas inside a bounding box, keeping its aspect. Mirrors the backend `fit_into_box`:
-   * never scaled up, sides rounded to the nearest pixel then down to even, at least SIZE_MIN.
-   */
-  function fitBox(cw: number, ch: number, bw: number, bh: number): { width: number; height: number } {
-    if (cw <= 0 || ch <= 0) return { width: bw, height: bh };
-    const scale = Math.min(1, bw / cw, bh / ch);
-    const even = (v: number): number => Math.max(SIZE_MIN, 2 * Math.floor(Math.round(v) / 2));
-    return { width: even(cw * scale), height: even(ch * scale) };
-  }
-
-  function presetSlug(label: string): string {
-    return label
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '_')
-      .replace(/^_+|_+$/g, '');
-  }
-
-  async function savePresetNow(): Promise<void> {
-    const current = settings;
-    if (!current) return;
-    const label = presetLabel.trim();
-    if (label === '') {
-      presetSaveError = 'Enter a name for the preset.';
-      return;
-    }
-    // A name with no Latin letters or digits gets a timestamp id.
-    let id = presetSlug(label);
-    if (id === '') id = `user_${Date.now()}`;
-    else if (id === 'custom' || builtinPresets.some((p) => p.id === id)) id = `user_${id}`;
-    // Saving over a user preset needs an inline confirmation first (the second click repeats the save).
-    if (userPresets.some((p) => !p.builtin && p.id === id) && replaceId !== id) {
-      replaceId = id;
-      presetSaveError = '';
-      return;
-    }
-    replaceId = null;
-    presetSaveError = '';
-    try {
-      const saved = await editorApi.savePreset({
-        id,
-        label,
-        settings: { ...current, preset: id, dir: null, range: { kind: 'entire' } },
-        fixed_size: true,
-        max_mb: null,
-        builtin: false,
-      });
-      userPresets = saved;
-      if (settings) settings = { ...settings, preset: id };
-      presetSaving = false;
-      presetLabel = '';
-      replaceId = null;
-    } catch (e) {
-      presetSaveError = String(e);
-    }
-  }
-
-  async function deleteSelectedPreset(): Promise<void> {
-    const p = selectedPreset;
-    if (!p || p.builtin) return;
-    errorText = '';
-    try {
-      userPresets = await editorApi.deletePreset(p.id);
-      if (settings) settings = { ...settings, preset: 'custom' };
-    } catch (e) {
-      errorText = String(e);
     }
   }
 
@@ -669,37 +588,18 @@
     void rememberFolder('');
   }
 
-  function setRange(kind: 'entire' | 'work_area' | 'selected'): void {
-    if (!settings) return;
-    const range: ExportSettings['range'] =
-      kind === 'entire'
-        ? { kind: 'entire' }
-        : kind === 'work_area'
-          ? { kind: 'work_area' }
-          : { kind: 'selected_clips', ids: [...selectedIds] };
-    settings = { ...settings, range };
-  }
-
-  // While "Selected clips" is the range, follow the timeline selection as it changes.
-  $effect(() => {
-    const ids = selectedIds;
-    const s = untrack(() => settings);
-    if (!s || s.range.kind !== 'selected_clips') return;
-    const same =
-      s.range.ids.length === ids.length && s.range.ids.every((id, i) => id === ids[i]);
-    if (same) return;
-    untrack(() => {
-      settings = { ...s, range: { kind: 'selected_clips', ids: [...ids] } };
-    });
-  });
-
   function onResChoice(id: string): void {
-    resChoice = id;
-    const size = id === 'custom' ? null : sizeForChoice(id);
+    const size = sizeForChoice(id);
     if (!size) return;
+    resChoice = id;
     widthText = String(size.width);
     heightText = String(size.height);
+    aspect = size.width / size.height;
     editSettings({ width: size.width, height: size.height });
+  }
+
+  function onFpsChoice(n: number): void {
+    editSettings({ fps: { num: n, den: 1 } as Rate });
   }
 
   function onWidthInput(text: string): void {
@@ -845,7 +745,7 @@
     if (target === null) return;
     busy = true;
     try {
-      await editorApi.exportStart({ ...target, lossless });
+      await editorApi.exportStart({ ...target, range: { kind: 'entire' }, lossless });
       toast.set('Export started');
       onclose();
     } catch (e) {
@@ -916,7 +816,7 @@
       {#if loading}
         <p class="status" role="status">Loading export settings...</p>
       {:else if loadError}
-        <p class="field-error" role="alert">Could not load export settings. {loadError}</p>
+        <p class="field-error pad" role="alert">Could not load export settings. {loadError}</p>
       {:else if settings}
         <div class="body">
           <div class="kind-tabs" role="group" aria-label="What to export">
@@ -932,472 +832,427 @@
             {/each}
           </div>
 
-          <div class="row">
-            <label class="lbl" for="exp-preset">Preset</label>
-            <select
-              id="exp-preset"
-              class="grow"
-              bind:this={presetSelect}
-              value={presetId}
-              onchange={(e) => applyPreset(inputValue(e))}
-            >
-              <option value="custom">Custom</option>
-              <optgroup label="Built-in">
-                {#each builtinPresets as p (p.id)}
-                  <option value={p.id}>{p.label}</option>
-                {/each}
-              </optgroup>
-              {#if shownUserPresets.length > 0}
-                <optgroup label="Your presets">
-                  {#each shownUserPresets as p (p.id)}
-                    <option value={p.id}>{p.label}</option>
-                  {/each}
-                </optgroup>
-              {/if}
-            </select>
-            <button
-              type="button"
-              class="secondary"
-              aria-expanded={presetSaving}
-              onclick={() => (presetSaving = !presetSaving)}
-            >
-              Save as preset...
-            </button>
-            {#if selectedPreset && !selectedPreset.builtin}
-              <button type="button" class="secondary" onclick={() => void deleteSelectedPreset()}>
-                Delete preset
-              </button>
-            {/if}
-          </div>
-
-          {#if presetSaving}
-            <div class="row">
-              <label class="lbl" for="exp-preset-name">Preset name</label>
-              <input
-                id="exp-preset-name"
-                type="text"
-                class="grow"
-                maxlength="60"
-                value={presetLabel}
-                aria-describedby={presetSaveError ? 'exp-preset-err' : undefined}
-                oninput={(e) => {
-                  presetLabel = inputValue(e);
-                  replaceId = null;
-                }}
-              />
-              <button type="button" class="primary" onclick={() => void savePresetNow()}>
-                Save
-              </button>
-            </div>
-            {#if replaceId}
-              <div class="row">
-                <span class="field-error">
-                  Replace preset {userPresets.find((p) => p.id === replaceId)?.label ?? replaceId}?
-                </span>
-                <button type="button" class="primary" onclick={() => void savePresetNow()}>
-                  Replace
-                </button>
-                <button type="button" class="secondary" onclick={() => (replaceId = null)}>
-                  Keep existing
-                </button>
-              </div>
-            {/if}
-            {#if presetSaveError}
-              <p id="exp-preset-err" class="field-error">{presetSaveError}</p>
-            {/if}
-          {/if}
-
-          <div class="row">
-            <label class="lbl" for="exp-name">Name</label>
-            <input
-              id="exp-name"
-              type="text"
-              class="grow"
-              value={nameShown}
-              aria-invalid={nameError !== null}
-              aria-describedby={nameError ? 'exp-name-err' : undefined}
-              oninput={(e) => onNameInput(inputValue(e))}
-            />
-          </div>
-          {#if nameError}
-            <p id="exp-name-err" class="field-error">{nameError}</p>
-          {/if}
-          <details class="advanced">
-            <summary>Advanced: file name template</summary>
-            <div class="row">
-              <label class="lbl" for="exp-template">Template</label>
-              <input
-                id="exp-template"
-                type="text"
-                class="grow mono"
-                value={settings.name_template}
-                oninput={(e) => onTemplateInput(inputValue(e))}
-              />
-            </div>
-            <p class="hint">
-              Tokens: {'{project}'} {'{date}'} {'{time}'} {'{yyyy-MM-dd HH-mm-ss}'} {'{res}'}
-              {'{preset}'} {'{n}'}. Default: {NAME_TEMPLATE_DEFAULT}
-            </p>
-          </details>
-
-          <div class="row">
-            <span class="lbl">Location</span>
-            <span class="folder" title={folder}>{folder}</span>
-            <button type="button" class="secondary" onclick={() => void changeFolder()}>
-              Change...
-            </button>
-            {#if settings.dir !== null}
-              <button type="button" class="link" onclick={resetFolder}>Reset to default</button>
-            {/if}
-          </div>
-
-          <fieldset class="row radios">
-            <legend class="lbl">Range</legend>
-            <label>
-              <input
-                type="radio"
-                name="exp-range"
-                checked={rangeKind === 'entire'}
-                onchange={() => setRange('entire')}
-              />
-              Entire timeline
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="exp-range"
-                checked={rangeKind === 'work_area'}
-                disabled={!hasWorkArea}
-                onchange={() => setRange('work_area')}
-              />
-              Work area
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="exp-range"
-                checked={rangeKind === 'selected_clips'}
-                disabled={selectedIds.length === 0}
-                onchange={() => setRange('selected')}
-              />
-              Selected clips
-            </label>
-          </fieldset>
-          {#if rangeError}
-            <p class="field-error">{rangeError}</p>
-          {/if}
-
           {#if isVideo}
             <h3 class="section">Video</h3>
-            <div class="row">
-              <label class="lbl" for="exp-res">Resolution</label>
-              <select id="exp-res" value={resChoice} onchange={(e) => onResChoice(inputValue(e))}>
-                <option value="canvas">Match canvas</option>
-                {#each RES_CHOICES as r (r.id)}
-                  <option value={r.id}>{r.label}</option>
-                {/each}
-                <option value="custom">Custom</option>
-              </select>
-              <label for="exp-w">W</label>
-              <input
-                id="exp-w"
-                class="num"
-                type="number"
-                inputmode="numeric"
-                min={SIZE_MIN}
-                max={SIZE_MAX}
-                step="2"
-                value={widthText}
-                aria-invalid={widthError !== null}
-                aria-describedby={widthError ? 'exp-w-err' : undefined}
-                oninput={(e) => onWidthInput(inputValue(e))}
-              />
-              <label for="exp-h">H</label>
-              <input
-                id="exp-h"
-                class="num"
-                type="number"
-                inputmode="numeric"
-                min={SIZE_MIN}
-                max={SIZE_MAX}
-                step="2"
-                value={heightText}
-                aria-invalid={heightError !== null}
-                aria-describedby={heightError ? 'exp-h-err' : undefined}
-                oninput={(e) => onHeightInput(inputValue(e))}
-              />
-              <label class="check">
-                <input
-                  type="checkbox"
-                  checked={lockAspect}
-                  onchange={(e) => onLockChange(inputChecked(e))}
-                />
-                Lock aspect
-              </label>
-              {#if canvas}
-                <span class="muted">Canvas: {canvas.width} x {canvas.height} ({canvas.aspect_preset})</span>
-              {/if}
+            <div class="field">
+              <span class="lbl" id="exp-res-lbl">Resolution</span>
+              <div class="ctl">
+                <div class="seg" role="group" aria-labelledby="exp-res-lbl">
+                  {#each RES_CHOICES as r (r.id)}
+                    <button
+                      type="button"
+                      aria-pressed={resChoice === r.id}
+                      onclick={() => onResChoice(r.id)}
+                    >
+                      {r.label}
+                    </button>
+                  {/each}
+                </div>
+                <span class="muted size-note">{sizeLabel}</span>
+              </div>
             </div>
-            {#if widthError}
-              <p id="exp-w-err" class="field-error">Width: {widthError}</p>
-            {/if}
-            {#if heightError}
-              <p id="exp-h-err" class="field-error">Height: {heightError}</p>
-            {/if}
-
-            <div class="row">
-              <label class="lbl" for="exp-fps">Frame rate</label>
-              <select
-                id="exp-fps"
-                value={fpsKey(settings.fps)}
-                onchange={(e) => editSettings({ fps: parseFpsKey(inputValue(e)) })}
-              >
-                {#each fpsOptions as o (o.value)}
-                  <option value={o.value}>{o.label}</option>
-                {/each}
-              </select>
-              <label class="lbl-inline" for="exp-codec">Codec</label>
-              <select
-                id="exp-codec"
-                value={settings.codec}
-                onchange={(e) => {
-                  const picked = codecOptions.find((o) => o.value === inputValue(e));
-                  if (picked) editSettings({ codec: picked.value });
-                }}
-              >
-                {#each codecOptions as o (o.value)}
-                  <option value={o.value}>{o.label}</option>
-                {/each}
-              </select>
+            <div class="field">
+              <span class="lbl" id="exp-fps-lbl">Frame rate</span>
+              <div class="ctl">
+                <div class="seg" role="group" aria-labelledby="exp-fps-lbl">
+                  {#each FPS_CHOICES as n (n)}
+                    <button
+                      type="button"
+                      aria-pressed={fpsChosen === n}
+                      onclick={() => onFpsChoice(n)}
+                    >
+                      {n} fps
+                    </button>
+                  {/each}
+                </div>
+              </div>
             </div>
-            <div class="row">
+            <div class="field">
               <label class="lbl" for="exp-encoder">Encoder</label>
-              <select
-                id="exp-encoder"
+              <div class="ctl">
+                <select
+                  id="exp-encoder"
+                  class="grow"
+                  value={settings.encoder}
+                  onchange={(e) => editSettings({ encoder: inputValue(e) })}
+                >
+                  {#each encoderOptions as o (o.value)}
+                    <option value={o.value}>{o.label}</option>
+                  {/each}
+                </select>
+              </div>
+            </div>
+          {/if}
+
+          <h3 class="section">Output</h3>
+          <div class="field">
+            <label class="lbl" for="exp-name">Name</label>
+            <div class="ctl">
+              <input
+                id="exp-name"
+                type="text"
                 class="grow"
-                value={settings.encoder}
-                onchange={(e) => editSettings({ encoder: inputValue(e) })}
-              >
-                {#each encoderOptions as o (o.value)}
-                  <option value={o.value}>{o.label}</option>
-                {/each}
-              </select>
+                value={nameShown}
+                aria-invalid={nameError !== null}
+                aria-describedby={nameError ? 'exp-name-err' : undefined}
+                oninput={(e) => onNameInput(inputValue(e))}
+              />
             </div>
-
-            <fieldset class="quality">
-              <legend class="lbl">Quality</legend>
-              <div class="q-row">
-                <label>
-                  <input
-                    type="radio"
-                    name="exp-quality"
-                    checked={qMode === 'quality'}
-                    onchange={() => setQualityMode('quality')}
-                  />
-                  Quality
-                </label>
-                <input
-                  type="range"
-                  min="1"
-                  max="100"
-                  step="1"
-                  value={qualitySlider}
-                  disabled={qMode !== 'quality'}
-                  aria-label="Quality slider, 1 to 100"
-                  oninput={(e) => onQualitySlider(inputValue(e))}
-                />
-                <output class="q-value">{qualitySlider}</output>
-              </div>
-              <div class="q-row">
-                <label>
-                  <input
-                    type="radio"
-                    name="exp-quality"
-                    checked={qMode === 'bitrate'}
-                    onchange={() => setQualityMode('bitrate')}
-                  />
-                  Bitrate
-                </label>
-                <input
-                  id="exp-bitrate"
-                  class="num"
-                  type="number"
-                  inputmode="decimal"
-                  min={MBPS_MIN}
-                  max={MBPS_MAX}
-                  step="0.1"
-                  value={bitrateText}
-                  disabled={qMode !== 'bitrate'}
-                  aria-label="Average bitrate in Mbps"
-                  aria-invalid={qMode === 'bitrate' && qualityError !== null}
-                  oninput={(e) => onBitrateInput(inputValue(e))}
-                />
-                <span class="muted">Mbps</span>
-              </div>
-              <div class="q-row">
-                <label>
-                  <input
-                    type="radio"
-                    name="exp-quality"
-                    checked={qMode === 'cbr'}
-                    onchange={() => setQualityMode('cbr')}
-                  />
-                  Constant bitrate
-                </label>
-                <input
-                  id="exp-cbr"
-                  class="num"
-                  type="number"
-                  inputmode="decimal"
-                  min={MBPS_MIN}
-                  max={MBPS_MAX}
-                  step="0.1"
-                  value={cbrText}
-                  disabled={qMode !== 'cbr'}
-                  aria-label="Constant bitrate in Mbps"
-                  aria-invalid={qMode === 'cbr' && qualityError !== null}
-                  oninput={(e) => onCbrInput(inputValue(e))}
-                />
-                <span class="muted">Mbps</span>
-              </div>
-              <div class="q-row">
-                <label>
-                  <input
-                    type="radio"
-                    name="exp-quality"
-                    checked={qMode === 'target_size'}
-                    onchange={() => setQualityMode('target_size')}
-                  />
-                  Target size
-                </label>
-                <input
-                  id="exp-target"
-                  class="num"
-                  type="number"
-                  inputmode="decimal"
-                  min={TARGET_MB_MIN}
-                  max={TARGET_MB_MAX}
-                  step="1"
-                  value={targetText}
-                  disabled={qMode !== 'target_size'}
-                  aria-label="Target file size in MB"
-                  aria-invalid={qMode === 'target_size' && qualityError !== null}
-                  oninput={(e) => onTargetInput(inputValue(e))}
-                />
-                <span class="muted">MB</span>
-              </div>
-              {#if qualityError}
-                <p class="field-error">{qualityError}</p>
+          </div>
+          {#if nameError}
+            <p id="exp-name-err" class="field-error indent">{nameError}</p>
+          {/if}
+          <div class="field">
+            <span class="lbl">Location</span>
+            <div class="ctl">
+              <span class="folder" title={folder}>{folder}</span>
+              <button type="button" class="secondary" onclick={() => void changeFolder()}>
+                Change...
+              </button>
+              {#if settings.dir !== null}
+                <button type="button" class="link" onclick={resetFolder}>Reset</button>
               {/if}
-            </fieldset>
-          {/if}
-
-          {#if kindId !== 'still'}
-            <h3 class="section">Audio</h3>
-            <fieldset class="row radios">
-              <legend class="lbl">Tracks</legend>
-              <label>
-                <input
-                  type="radio"
-                  name="exp-layout"
-                  checked={settings.audio.layout === 'mix'}
-                  onchange={() => patchAudio({ layout: 'mix' })}
-                />
-                Mix to stereo
-              </label>
-              <label>
-                <input
-                  type="radio"
-                  name="exp-layout"
-                  checked={settings.audio.layout === 'separate'}
-                  onchange={() => patchAudio({ layout: 'separate' })}
-                />
-                Keep {audioTrackCount} separate {audioTrackCount === 1 ? 'track' : 'tracks'}
-              </label>
-            </fieldset>
-            <div class="row">
-              <label class="lbl" for="exp-abr">Bitrate</label>
-              <select
-                id="exp-abr"
-                value={String(settings.audio.bitrate_kbps)}
-                onchange={(e) => patchAudio({ bitrate_kbps: Number(inputValue(e)) })}
-              >
-                {#each AUDIO_BITRATES as b (b)}
-                  <option value={String(b)}>{b} kbps</option>
-                {/each}
-              </select>
-              <label class="lbl-inline" for="exp-rate">Sample rate</label>
-              <select
-                id="exp-rate"
-                value={String(settings.audio.sample_rate)}
-                onchange={(e) => patchAudio({ sample_rate: Number(inputValue(e)) })}
-              >
-                {#each SAMPLE_RATES as r (r.value)}
-                  <option value={String(r.value)}>{r.label}</option>
-                {/each}
-              </select>
             </div>
-            <div class="row">
-              <label class="lbl" for="exp-loudness">Loudness</label>
-              <select
-                id="exp-loudness"
-                value={settings.audio.loudness.mode === 'off'
-                  ? 'off'
-                  : String(settings.audio.loudness.target)}
-                onchange={(e) => {
-                  const v = inputValue(e);
-                  patchAudio({
-                    loudness: v === 'off' ? { mode: 'off' } : { mode: 'lufs', target: Number(v) },
-                  });
-                }}
-              >
-                {#each loudnessOptions as o (o.value)}
-                  <option value={o.value}>{o.label}</option>
-                {/each}
-              </select>
-              <label class="check">
-                <input
-                  type="checkbox"
-                  checked={settings.audio.limiter}
-                  onchange={(e) => patchAudio({ limiter: inputChecked(e) })}
-                />
-                Peak limiter
-              </label>
-            </div>
-          {/if}
+          </div>
 
           {#if still}
             <h3 class="section">Still frame</h3>
             <p class="hint">Saves the frame under the playhead at {formatDuration($playhead)}.</p>
-            <div class="row">
+            <div class="field">
               <label class="lbl" for="exp-still-format">Format</label>
-              <select
-                id="exp-still-format"
-                value={still.format}
-                onchange={(e) => patchStill({ format: inputValue(e) })}
-              >
-                <option value="png">PNG</option>
-                <option value="jpg">JPG</option>
-              </select>
-              {#if still.format === 'jpg'}
-                <label class="lbl-inline" for="exp-still-quality">JPG quality</label>
-                <input
-                  id="exp-still-quality"
-                  class="num"
-                  type="number"
-                  inputmode="numeric"
-                  min="1"
-                  max="100"
-                  step="1"
-                  value={stillQualityText}
-                  aria-invalid={stillQualityError !== null}
-                  oninput={(e) => onStillQuality(inputValue(e))}
-                />
-              {/if}
+              <div class="ctl">
+                <select
+                  id="exp-still-format"
+                  value={still.format}
+                  onchange={(e) => patchStill({ format: inputValue(e) })}
+                >
+                  <option value="png">PNG</option>
+                  <option value="jpg">JPG</option>
+                </select>
+                {#if still.format === 'jpg'}
+                  <label class="lbl-inline" for="exp-still-quality">JPG quality</label>
+                  <input
+                    id="exp-still-quality"
+                    class="num"
+                    type="number"
+                    inputmode="numeric"
+                    min="1"
+                    max="100"
+                    step="1"
+                    value={stillQualityText}
+                    aria-invalid={stillQualityError !== null}
+                    oninput={(e) => onStillQuality(inputValue(e))}
+                  />
+                {/if}
+              </div>
             </div>
             {#if stillQualityError}
-              <p class="field-error">{stillQualityError}</p>
+              <p class="field-error indent">{stillQualityError}</p>
             {/if}
+          {/if}
+
+          <button
+            type="button"
+            class="adv-toggle"
+            aria-expanded={advancedOpen}
+            aria-controls="exp-advanced"
+            onclick={() => (advancedOpen = !advancedOpen)}
+          >
+            <svg
+              class="chev"
+              class:open={advancedOpen}
+              viewBox="0 0 16 16"
+              width="12"
+              height="12"
+              aria-hidden="true"
+            >
+              <path d="M5 3l5 5-5 5" stroke="currentColor" stroke-width="1.8" fill="none" />
+            </svg>
+            Advanced
+          </button>
+
+          {#if advancedOpen}
+            <div id="exp-advanced" class="advanced">
+              {#if isVideo}
+                <h3 class="section first">Video</h3>
+                <div class="field">
+                  <label class="lbl" for="exp-codec">Codec</label>
+                  <div class="ctl">
+                    <select
+                      id="exp-codec"
+                      value={settings.codec}
+                      onchange={(e) => {
+                        const picked = codecOptions.find((o) => o.value === inputValue(e));
+                        if (picked) editSettings({ codec: picked.value });
+                      }}
+                    >
+                      {#each codecOptions as o (o.value)}
+                        <option value={o.value}>{o.label}</option>
+                      {/each}
+                    </select>
+                  </div>
+                </div>
+
+                <fieldset class="quality">
+                  <legend class="lbl">Quality</legend>
+                  <div class="q-row">
+                    <label>
+                      <input
+                        type="radio"
+                        name="exp-quality"
+                        checked={qMode === 'quality'}
+                        onchange={() => setQualityMode('quality')}
+                      />
+                      Quality
+                    </label>
+                    <input
+                      type="range"
+                      min="1"
+                      max="100"
+                      step="1"
+                      value={qualitySlider}
+                      disabled={qMode !== 'quality'}
+                      aria-label="Quality slider, 1 to 100"
+                      oninput={(e) => onQualitySlider(inputValue(e))}
+                    />
+                    <output class="q-value">{qualitySlider}</output>
+                  </div>
+                  <div class="q-row">
+                    <label>
+                      <input
+                        type="radio"
+                        name="exp-quality"
+                        checked={qMode === 'bitrate'}
+                        onchange={() => setQualityMode('bitrate')}
+                      />
+                      Bitrate
+                    </label>
+                    <input
+                      id="exp-bitrate"
+                      class="num"
+                      type="number"
+                      inputmode="decimal"
+                      min={MBPS_MIN}
+                      max={MBPS_MAX}
+                      step="0.1"
+                      value={bitrateText}
+                      disabled={qMode !== 'bitrate'}
+                      aria-label="Average bitrate in Mbps"
+                      aria-invalid={qMode === 'bitrate' && qualityError !== null}
+                      oninput={(e) => onBitrateInput(inputValue(e))}
+                    />
+                    <span class="muted">Mbps</span>
+                  </div>
+                  <div class="q-row">
+                    <label>
+                      <input
+                        type="radio"
+                        name="exp-quality"
+                        checked={qMode === 'cbr'}
+                        onchange={() => setQualityMode('cbr')}
+                      />
+                      Constant bitrate
+                    </label>
+                    <input
+                      id="exp-cbr"
+                      class="num"
+                      type="number"
+                      inputmode="decimal"
+                      min={MBPS_MIN}
+                      max={MBPS_MAX}
+                      step="0.1"
+                      value={cbrText}
+                      disabled={qMode !== 'cbr'}
+                      aria-label="Constant bitrate in Mbps"
+                      aria-invalid={qMode === 'cbr' && qualityError !== null}
+                      oninput={(e) => onCbrInput(inputValue(e))}
+                    />
+                    <span class="muted">Mbps</span>
+                  </div>
+                  <div class="q-row">
+                    <label>
+                      <input
+                        type="radio"
+                        name="exp-quality"
+                        checked={qMode === 'target_size'}
+                        onchange={() => setQualityMode('target_size')}
+                      />
+                      Target size
+                    </label>
+                    <input
+                      id="exp-target"
+                      class="num"
+                      type="number"
+                      inputmode="decimal"
+                      min={TARGET_MB_MIN}
+                      max={TARGET_MB_MAX}
+                      step="1"
+                      value={targetText}
+                      disabled={qMode !== 'target_size'}
+                      aria-label="Target file size in MB"
+                      aria-invalid={qMode === 'target_size' && qualityError !== null}
+                      oninput={(e) => onTargetInput(inputValue(e))}
+                    />
+                    <span class="muted">MB</span>
+                  </div>
+                  {#if qualityError}
+                    <p class="field-error">{qualityError}</p>
+                  {/if}
+                </fieldset>
+
+                <div class="field">
+                  <span class="lbl">Custom size</span>
+                  <div class="ctl">
+                    <label class="lbl-inline" for="exp-w">W</label>
+                    <input
+                      id="exp-w"
+                      class="num"
+                      type="number"
+                      inputmode="numeric"
+                      min={SIZE_MIN}
+                      max={SIZE_MAX}
+                      step="2"
+                      value={widthText}
+                      aria-invalid={widthError !== null}
+                      aria-describedby={widthError ? 'exp-w-err' : undefined}
+                      oninput={(e) => onWidthInput(inputValue(e))}
+                    />
+                    <label class="lbl-inline" for="exp-h">H</label>
+                    <input
+                      id="exp-h"
+                      class="num"
+                      type="number"
+                      inputmode="numeric"
+                      min={SIZE_MIN}
+                      max={SIZE_MAX}
+                      step="2"
+                      value={heightText}
+                      aria-invalid={heightError !== null}
+                      aria-describedby={heightError ? 'exp-h-err' : undefined}
+                      oninput={(e) => onHeightInput(inputValue(e))}
+                    />
+                    <label class="check">
+                      <input
+                        type="checkbox"
+                        checked={lockAspect}
+                        onchange={(e) => onLockChange(inputChecked(e))}
+                      />
+                      Lock aspect
+                    </label>
+                  </div>
+                </div>
+                {#if canvas}
+                  <p class="hint indent">
+                    Canvas: {canvas.width} x {canvas.height} ({canvas.aspect_preset})
+                  </p>
+                {/if}
+                {#if widthError}
+                  <p id="exp-w-err" class="field-error indent">Width: {widthError}</p>
+                {/if}
+                {#if heightError}
+                  <p id="exp-h-err" class="field-error indent">Height: {heightError}</p>
+                {/if}
+              {/if}
+
+              {#if kindId !== 'still'}
+                <h3 class="section">Audio</h3>
+                <fieldset class="field radios">
+                  <legend class="lbl">Tracks</legend>
+                  <div class="ctl">
+                    <label class="check">
+                      <input
+                        type="radio"
+                        name="exp-layout"
+                        checked={settings.audio.layout === 'mix'}
+                        onchange={() => patchAudio({ layout: 'mix' })}
+                      />
+                      Mix to stereo
+                    </label>
+                    <label class="check">
+                      <input
+                        type="radio"
+                        name="exp-layout"
+                        checked={settings.audio.layout === 'separate'}
+                        onchange={() => patchAudio({ layout: 'separate' })}
+                      />
+                      Keep {audioTrackCount} separate {audioTrackCount === 1 ? 'track' : 'tracks'}
+                    </label>
+                  </div>
+                </fieldset>
+                <div class="field">
+                  <label class="lbl" for="exp-abr">Bitrate</label>
+                  <div class="ctl">
+                    <select
+                      id="exp-abr"
+                      value={String(settings.audio.bitrate_kbps)}
+                      onchange={(e) => patchAudio({ bitrate_kbps: Number(inputValue(e)) })}
+                    >
+                      {#each AUDIO_BITRATES as b (b)}
+                        <option value={String(b)}>{b} kbps</option>
+                      {/each}
+                    </select>
+                    <label class="lbl-inline" for="exp-rate">Sample rate</label>
+                    <select
+                      id="exp-rate"
+                      value={String(settings.audio.sample_rate)}
+                      onchange={(e) => patchAudio({ sample_rate: Number(inputValue(e)) })}
+                    >
+                      {#each SAMPLE_RATES as r (r.value)}
+                        <option value={String(r.value)}>{r.label}</option>
+                      {/each}
+                    </select>
+                  </div>
+                </div>
+                <div class="field">
+                  <label class="lbl" for="exp-loudness">Loudness</label>
+                  <div class="ctl">
+                    <select
+                      id="exp-loudness"
+                      value={settings.audio.loudness.mode === 'off'
+                        ? 'off'
+                        : String(settings.audio.loudness.target)}
+                      onchange={(e) => {
+                        const v = inputValue(e);
+                        patchAudio({
+                          loudness:
+                            v === 'off' ? { mode: 'off' } : { mode: 'lufs', target: Number(v) },
+                        });
+                      }}
+                    >
+                      {#each loudnessOptions as o (o.value)}
+                        <option value={o.value}>{o.label}</option>
+                      {/each}
+                    </select>
+                    <label class="check">
+                      <input
+                        type="checkbox"
+                        checked={settings.audio.limiter}
+                        onchange={(e) => patchAudio({ limiter: inputChecked(e) })}
+                      />
+                      Peak limiter
+                    </label>
+                  </div>
+                </div>
+              {/if}
+
+              <h3 class="section">File name</h3>
+              <div class="field">
+                <label class="lbl" for="exp-template">Template</label>
+                <div class="ctl">
+                  <input
+                    id="exp-template"
+                    type="text"
+                    class="grow mono"
+                    value={settings.name_template}
+                    oninput={(e) => onTemplateInput(inputValue(e))}
+                  />
+                </div>
+              </div>
+              <p class="hint indent">
+                Tokens: {'{project}'} {'{date}'} {'{time}'} {'{yyyy-MM-dd HH-mm-ss}'} {'{res}'}
+                {'{preset}'} {'{n}'}. Default: {NAME_TEMPLATE_DEFAULT}
+              </p>
+            </div>
           {/if}
         </div>
 
@@ -1412,7 +1267,7 @@
                     ? ' (default folder)'
                     : ''}</span
                 >
-                {#if estimating}<span class="muted">Updating...</span>{/if}
+                {#if estimating}<span>Updating...</span>{/if}
               </p>
               <p class="path" title={estimate.outPath}>Saves to {estimate.outPath}</p>
             {:else if estimateError}
@@ -1447,7 +1302,7 @@
           </div>
 
           <div class="actions">
-            <button type="button" class="secondary" disabled={busy} onclick={close}>Cancel</button>
+            <button type="button" class="ghost" disabled={busy} onclick={close}>Cancel</button>
             {#if isVideo}
               <div class="lossless">
                 <button
@@ -1505,8 +1360,8 @@
   .dialog {
     --warn: #e7b730;
     width: 100%;
-    max-width: 680px;
-    max-height: 90vh;
+    max-width: 620px;
+    max-height: 92vh;
     display: flex;
     flex-direction: column;
     box-sizing: border-box;
@@ -1521,7 +1376,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 14px 20px 10px;
+    padding: 14px 20px 12px;
     border-bottom: 1px solid var(--border);
   }
 
@@ -1534,11 +1389,12 @@
   .body {
     flex: 1 1 auto;
     overflow-y: auto;
-    padding: 12px 20px;
+    padding: 16px 20px;
     min-height: 0;
   }
 
-  .status {
+  .status,
+  .pad {
     margin: 0;
     padding: 24px 20px;
     color: var(--text-dim);
@@ -1548,7 +1404,7 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
-    margin-bottom: 12px;
+    margin-bottom: 4px;
   }
 
   .tab {
@@ -1562,19 +1418,43 @@
     border-color: var(--accent);
   }
 
-  .row {
+  .section {
+    margin: 20px 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+
+  .section.first {
+    margin-top: 8px;
+  }
+
+  /* One labelled row: muted label on the left, controls on the right. */
+  .field {
+    display: grid;
+    grid-template-columns: 104px minmax(0, 1fr);
+    align-items: center;
+    column-gap: 12px;
+    margin: 0 0 10px;
+    padding: 0;
+    border: 0;
+    min-width: 0;
+  }
+
+  .ctl {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
-    margin: 0 0 10px;
-    border: 0;
-    padding: 0;
     min-width: 0;
   }
 
   .lbl {
-    min-width: 84px;
+    padding: 0;
     font-size: 13px;
     color: var(--text-dim);
   }
@@ -1584,26 +1464,84 @@
     color: var(--text-dim);
   }
 
-  .section {
-    margin: 16px 0 8px;
-    padding-bottom: 4px;
-    border-bottom: 1px solid var(--border);
-    font-size: 12px;
-    font-weight: 600;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+  .indent {
+    margin-left: 116px;
+  }
+
+  .seg {
+    display: inline-flex;
+    gap: 4px;
+    padding: 3px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface-2);
+  }
+
+  .seg button {
+    min-width: 64px;
+    height: 28px;
+    padding: 0 14px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
     color: var(--text-dim);
+    font-weight: 500;
+  }
+
+  .seg button:hover:not([aria-pressed='true']) {
+    color: var(--text);
+  }
+
+  .seg button[aria-pressed='true'] {
+    background: var(--accent);
+    color: #fff;
+  }
+
+  .size-note {
+    white-space: nowrap;
+  }
+
+  .adv-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 20px;
+    padding: 0 4px;
+    height: 36px;
+    border: 0;
+    background: none;
+    color: var(--text-dim);
+    font-weight: 600;
+  }
+
+  .adv-toggle:hover {
+    color: var(--text);
+  }
+
+  .chev {
+    transition: transform 0.12s;
+  }
+
+  .chev.open {
+    transform: rotate(90deg);
+  }
+
+  .advanced {
+    padding: 0 0 4px;
   }
 
   .radios legend {
     float: left;
-    width: 100%;
+    width: 104px;
     padding: 0;
   }
 
-  .radios label,
-  .quality label,
-  .check {
+  .radios .ctl {
+    gap: 8px 16px;
+  }
+
+  .check,
+  .quality label {
     display: inline-flex;
     align-items: center;
     gap: 6px;
@@ -1611,7 +1549,7 @@
   }
 
   .quality {
-    margin: 0 0 10px;
+    margin: 0 0 12px;
     padding: 0;
     border: 0;
   }
@@ -1625,7 +1563,7 @@
     flex-wrap: wrap;
     align-items: center;
     gap: 8px;
-    margin-bottom: 6px;
+    min-height: 36px;
   }
 
   .q-row > label {
@@ -1645,11 +1583,15 @@
   input[type='text'],
   input[type='number'],
   select {
-    padding: 6px 8px;
+    box-sizing: border-box;
+    height: 36px;
+    padding: 0 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius);
     background: var(--surface-2);
     color: var(--text);
+    font: inherit;
+    font-size: 13px;
   }
 
   input[type='number'].num {
@@ -1676,32 +1618,22 @@
     border-color: var(--danger);
   }
 
-  .advanced {
-    margin: -4px 0 10px 92px;
-    font-size: 12px;
-    color: var(--text-dim);
-  }
-
-  .advanced summary {
-    cursor: pointer;
-    margin-bottom: 6px;
-  }
-
   .hint {
-    margin: 4px 0 0;
+    margin: 0 0 10px;
     font-size: 12px;
     color: var(--text-dim);
     line-height: 1.5;
   }
 
   .folder {
-    flex: 1 1 200px;
+    flex: 1 1 140px;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 13px;
+    font-size: 12px;
     font-family: ui-monospace, Consolas, monospace;
+    color: var(--text-dim);
   }
 
   .muted {
@@ -1743,21 +1675,22 @@
   }
 
   .summary {
-    flex: 1 1 260px;
+    flex: 1 1 220px;
     min-width: 0;
   }
 
   .stats {
     display: flex;
     flex-wrap: wrap;
-    gap: 4px 14px;
+    gap: 2px 14px;
     margin: 0 0 4px;
-    font-size: 13px;
+    font-size: 12px;
+    color: var(--text-dim);
   }
 
   .path {
-    margin: 0 0 8px;
-    font-size: 12px;
+    margin: 0 0 6px;
+    font-size: 11px;
     color: var(--text-dim);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -1775,7 +1708,7 @@
     display: flex;
     flex-wrap: wrap;
     justify-content: flex-end;
-    align-items: flex-end;
+    align-items: flex-start;
     gap: 8px;
   }
 
@@ -1788,12 +1721,14 @@
 
   .lossless-note {
     margin: 0;
-    max-width: 260px;
+    max-width: 240px;
     text-align: right;
   }
 
   button {
-    padding: 8px 14px;
+    box-sizing: border-box;
+    height: 36px;
+    padding: 0 14px;
     border-radius: var(--radius);
     font: inherit;
     font-size: 13px;
@@ -1807,8 +1742,7 @@
 
   button:focus-visible,
   input:focus-visible,
-  select:focus-visible,
-  summary:focus-visible {
+  select:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
@@ -1823,10 +1757,22 @@
     border-color: var(--text-dim);
   }
 
+  .ghost {
+    background: transparent;
+    color: var(--text-dim);
+    border: 1px solid transparent;
+  }
+
+  .ghost:hover:not(:disabled) {
+    color: var(--text);
+    border-color: var(--border);
+  }
+
   .primary {
     background: var(--accent);
     color: #fff;
     border: 1px solid var(--accent);
+    font-weight: 600;
   }
 
   .primary:hover:not(:disabled) {
@@ -1834,6 +1780,7 @@
   }
 
   .link {
+    height: auto;
     padding: 4px 2px;
     background: none;
     border: 0;
@@ -1861,15 +1808,26 @@
 
   @media (max-width: 520px) {
     .dialog {
-      max-height: 94vh;
+      max-height: 96vh;
     }
 
-    .advanced {
+    .field {
+      grid-template-columns: minmax(0, 1fr);
+      row-gap: 4px;
+    }
+
+    .indent {
       margin-left: 0;
     }
 
-    .lbl {
-      min-width: 100%;
+    .radios legend {
+      float: none;
+      width: auto;
+    }
+
+    .seg button {
+      min-width: 52px;
+      padding: 0 10px;
     }
   }
 </style>
