@@ -485,6 +485,10 @@ Critical path: E1 → E3 and E1 → E4/E5; E2 → E3 (audio) and E5 (waveforms).
 
 ---
 
+## 10b. Known limitations (as built)
+
+- **Preview playback is laggy** (about 10 fps reported on a 1280x720 60 fps recording with several audio lanes). Not fixed; see DESIGN.md D77 for what was tried, the `previewStats` readout, the `MULTI_STREAM_AUDIO` bisect switch and the suggested next steps (proxy files or a native preview path). Export speed is a separate path and is not affected.
+
 ## 11. Risks
 
 | Risk | Mitigation |
