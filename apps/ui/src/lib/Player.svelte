@@ -622,8 +622,10 @@
    */
   function openInEditor() {
     const range = trimmed ? { startMs: selection.startMs, endMs: selection.endMs } : undefined;
+    // Read the id before closing: the close unmounts this component and its props go undefined.
+    const recordingId = id;
     closePlayer();
-    editInEditor(id, range);
+    editInEditor(recordingId, range);
   }
 
   function resetTrim() {

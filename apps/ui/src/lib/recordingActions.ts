@@ -73,7 +73,7 @@ export async function pickFolder(initial?: string): Promise<string | null> {
  * is the player trim selection; omit it to place the full recording.
  */
 export function editInEditor(id: string, range?: { startMs: number; endMs: number }): void {
-  openEditor({ projectId: null, recordingIds: [id], ...(range ? { range } : {}) });
+  openEditor({ projectId: null, recordingIds: id ? [id] : [], ...(range ? { range } : {}) });
 }
 
 /** Sets or clears the favourite flag of a recording. Throws on failure. */

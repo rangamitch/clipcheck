@@ -516,6 +516,44 @@ fn arr<const N: usize>(b: &[u8], at: usize) -> Option<[u8; N]> {
 // Waveforms.
 // ---------------------------------------------------------------------------------------------
 
+/// Serialises the disk-heavy background jobs (waveform decodes read a whole recording, thumbnails
+/// seek through one) so several of them never hammer the disk together, and drops the thread to
+/// background I/O and CPU priority while one runs so the rest of the system stays responsive.
+static HEAVY_IO: Mutex<()> = Mutex::new(());
+
+/// Holds the heavy-job lock and the background priority mode until dropped.
+struct HeavyIo {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl HeavyIo {
+    fn enter() -> HeavyIo {
+        let lock = HEAVY_IO.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(windows)]
+        // SAFETY: plain Win32 calls on the current thread; failure just keeps normal priority.
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN,
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        }
+        HeavyIo { _lock: lock }
+    }
+}
+
+impl Drop for HeavyIo {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        // SAFETY: as in `enter`; the pooled thread returns to normal priority for its next job.
+        unsafe {
+            use windows::Win32::System::Threading::{
+                GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_END,
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END);
+        }
+    }
+}
+
 /// Decodes the peaks of one audio stream, writes them to the cache file and returns them.
 fn compute_peaks(
     path: &Path,
@@ -523,6 +561,11 @@ fn compute_peaks(
     stream: u32,
     buckets: usize,
 ) -> Result<Vec<f32>, String> {
+    let _heavy = HeavyIo::enter();
+    // Another job may have produced the file while this one waited for its turn.
+    if let Some(done) = read_peaks(cache_file, buckets) {
+        return Ok(done);
+    }
     let (peaks, _secs) =
         clipcheck_mfdec::audio::decode_peaks(path, stream, buckets).map_err(|e| e.to_string())?;
     let _ = write_peaks(cache_file, &peaks);
@@ -658,9 +701,11 @@ fn thumbnails_blocking(
         // One failing time (for example one past the end) leaves an empty slot; the rest still come.
         let disk = dir.join(disk_name(&media.path, meta.len(), mtime, ms, height));
         let cached = fs::metadata(&disk).map(|m| m.len() > 0).unwrap_or(false);
-        if !cached
-            && clipcheck_mfdec::thumbnail_jpeg(path, ms as f64 / 1000.0, width, &disk).is_err()
-        {
+        let failed = !cached && {
+            let _heavy = HeavyIo::enter();
+            clipcheck_mfdec::thumbnail_jpeg(path, ms as f64 / 1000.0, width, &disk).is_err()
+        };
+        if failed {
             let _ = fs::remove_file(&disk);
             out.push(String::new());
             continue;

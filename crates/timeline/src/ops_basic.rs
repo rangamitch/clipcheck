@@ -303,6 +303,21 @@ pub fn place_media(
         PlaceMode::Append => {}
     }
 
+    // Name each audio lane after what it carries (the stream title, such as "Game" or "Mic").
+    let labels: Vec<String> = (0..slots.len())
+        .map(|i| stream_label(&media, i, slots.len()))
+        .collect();
+    for (tid, label) in slots.iter().zip(&labels) {
+        if label.is_empty() || w.clips.iter().any(|c| &c.track_id == tid) {
+            continue;
+        }
+        if let Some(t) = w.tracks.iter_mut().find(|t| &t.id == tid) {
+            if is_default_audio_name(&t.name) {
+                t.name = label.clone();
+            }
+        }
+    }
+
     let link = new_id();
     let mut created: Vec<Clip> = Vec::new();
     if let Some(vt) = &video_id {
@@ -330,7 +345,10 @@ pub fn place_media(
             track_id: tid.clone(),
             kind: ClipKind::Audio,
             media_id: Some(media.id.clone()),
-            name: media.name.clone(),
+            name: match labels.get(i) {
+                Some(l) if !l.is_empty() => format!("{} - {}", media.name, l),
+                _ => media.name.clone(),
+            },
             start,
             dur: length,
             src_in,
@@ -350,6 +368,28 @@ pub fn place_media(
     check_project(&w)?;
     *p = w;
     Ok(ids)
+}
+
+/// Label of audio stream `i` of a media file: its title, else "Audio N" when the file has several.
+fn stream_label(media: &MediaRef, i: usize, count: usize) -> String {
+    let title = media
+        .audio
+        .get(i)
+        .map(|a| a.title.trim().to_string())
+        .unwrap_or_default();
+    if !title.is_empty() {
+        title
+    } else if count > 1 {
+        format!("Audio {}", i + 1)
+    } else {
+        String::new()
+    }
+}
+
+/// True for the names the editor gives new audio lanes ("A1", "A2", ...).
+fn is_default_audio_name(name: &str) -> bool {
+    let rest = name.strip_prefix('A').unwrap_or("");
+    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Moves clips (and their group/link partners, which keep their relative offsets). In magnetic
