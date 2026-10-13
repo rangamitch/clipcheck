@@ -2,9 +2,9 @@ import type { GainPoint } from './scheduler';
 import { panGains } from './scheduler';
 
 // Web Audio graph for the program monitor. One AudioContext, one MediaElementAudioSourceNode per
-// media element, and one chain per timeline audio source:
+// hidden audio element, and one chain per timeline audio source:
 //
-//   media element source -> clip gain (2 ch) -> [mono stage] -> splitter -> L/R gains -> merger
+//   audio element source -> clip gain (2 ch) -> [mono stage] -> splitter -> L/R gains -> merger
 //     -> track gain -> track meter -> master gain -> master meter -> destination
 //
 // The mono stage (used when ClipAudio.mono is set) averages L and R and writes the same value to
@@ -15,11 +15,11 @@ import { panGains } from './scheduler';
 // the mixer conventions in ../../player/mixer.ts: a 10 ms time constant for static changes, and
 // disconnect helpers that swallow errors from nodes that are already gone.
 //
-// Streams: an HTMLMediaElement of a video file plays only its default stream (index 0) in WebView2.
-// Every other stream is played by its own hidden audio element (an extracted single-stream file).
-// The engine attaches each such element under the key `<mediaId>#<stream>` (the `mediaId` argument of
-// `attach` and `setSourceParams` is just a source key). A media element source that no chain uses is
-// connected to nothing and is therefore silent, so the picture-only video of an unplaced Mix never plays.
+// Streams: only hidden audio elements are attached here, never the picture <video> elements (routing a
+// video element through Web Audio stalled its frame delivery). Every stream, the default one (0, the
+// original file) included, is played by its own audio element, attached under the key
+// `<mediaId>#<stream>` (the `mediaId` argument of `attach` and `setSourceParams` is just a source
+// key). A media element source that no chain uses is connected to nothing and is therefore silent.
 //
 // CORS: media is served from another origin (clip protocol). The element must request CORS
 // (crossOrigin 'anonymous') before its load starts, or the source node outputs silence. The
@@ -169,7 +169,7 @@ export class AudioGraph {
   }
 
   /**
-   * Creates (or reuses) the source node for `video` and makes it the source for `mediaId`.
+   * Creates (or reuses) the source node for the audio element `video` and makes it the source for `mediaId` (a source key).
    * Each element gets exactly one source node, since createMediaElementSource may run once per
    * element. Chains that already use `mediaId` are reconnected to the new node.
    */

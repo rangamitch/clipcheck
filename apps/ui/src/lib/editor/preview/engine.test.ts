@@ -1,5 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { playingSeekDue, shouldRetryMediaError } from './engine';
+import { playingSeekDue, shouldRetryMediaError, streamKey } from './engine';
+
+describe('streamKey', () => {
+  it('keys the default stream as <mediaId>#0 (audio element pool and audio graph source key)', () => {
+    expect(streamKey('m1', 0)).toBe('m1#0');
+  });
+
+  it('keys extra streams by index and never collides with a bare media id', () => {
+    expect(streamKey('m1', 2)).toBe('m1#2');
+    expect(streamKey('m1', 0)).not.toBe('m1');
+    expect(streamKey('m1', 1)).not.toBe(streamKey('m1', 0));
+  });
+});
 
 describe('playingSeekDue', () => {
   it('resync seeks a video element that is off by 0.1 s (below the free-running threshold)', () => {

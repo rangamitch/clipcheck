@@ -14,6 +14,7 @@ import {
   sourceTimeFor,
   transitionProgress,
   upcoming,
+  upcomingStreams,
 } from './scheduler';
 import type { AudioSource, PlanSegment, RenderPlan, Tick, Transition, VideoLayer } from '../types';
 import { defaultCanvas, defaultClipAudio, defaultTransform } from '../types';
@@ -217,17 +218,15 @@ describe('sourceTimeFor', () => {
 
 describe('upcoming', () => {
   const p = mainPlan();
-  it('lists media that starts within the horizon and is not active now', () => {
-    expect(upcoming(p, 0, 1.5 * S)).toEqual([
-      { mediaId: 'm2', startsAt: S, srcTime: 5 * S },
-      { mediaId: 'm3', startsAt: S, srcTime: 0 },
-    ]);
+  // Audio sources (every stream, default included) have their own elements: see upcomingStreams.
+  it('lists video media that starts within the horizon and is not shown now', () => {
+    expect(upcoming(p, 0, 1.5 * S)).toEqual([{ mediaId: 'm2', startsAt: S, srcTime: 5 * S }]);
   });
   it('excludes a segment that starts after the horizon', () => {
     expect(upcoming(p, 0, 0.5 * S)).toEqual([]);
   });
   it('includes a segment that starts exactly at the horizon limit', () => {
-    expect(upcoming(p, 0, S).map((u) => u.mediaId)).toEqual(['m2', 'm3']);
+    expect(upcoming(p, 0, S).map((u) => u.mediaId)).toEqual(['m2']);
   });
   it('does not list media already active at the time', () => {
     expect(upcoming(p, 0, 10 * S).some((u) => u.mediaId === 'm1')).toBe(false);
@@ -252,13 +251,14 @@ describe('upcoming', () => {
     );
     expect(upcoming(repeated, 0, 10 * S)).toEqual([{ mediaId: 'm9', startsAt: S, srcTime: 0 }]);
   });
-  it('merges audio and video of the same media, keeping the earliest', () => {
-    const merged = plan(
+  it('ignores audio sources (they play from audio elements, not video elements)', () => {
+    // Previously a default-stream audio source was merged into the video-element list.
+    const mixed = plan(
       [seg(0, S), seg(S, 2 * S, [], [alayer('a', 'm3', { src_time: 7 * S })]), seg(2 * S, 3 * S, [vlayer('v', 'm3')])],
       0,
       3 * S,
     );
-    expect(upcoming(merged, 0, 10 * S)).toEqual([{ mediaId: 'm3', startsAt: S, srcTime: 7 * S }]);
+    expect(upcoming(mixed, 0, 10 * S)).toEqual([{ mediaId: 'm3', startsAt: 2 * S, srcTime: 0 }]);
   });
   it('sorts results by start time', () => {
     const sorted = plan(
@@ -268,6 +268,39 @@ describe('upcoming', () => {
     );
     const starts = upcoming(sorted, 0, 10 * S).map((u) => u.startsAt);
     expect(starts).toEqual([...starts].sort((a, b) => a - b));
+  });
+});
+
+describe('upcomingStreams', () => {
+  it('includes the default stream 0, keyed by media and stream', () => {
+    const p = plan([seg(0, S), seg(S, 2 * S, [], [alayer('a', 'm3', { src_time: 7 * S })])], 0, 2 * S);
+    expect(upcomingStreams(p, 0, 2 * S)).toEqual([{ mediaId: 'm3', stream: 0, startsAt: S, srcTime: 7 * S }]);
+  });
+  it('lists streams of one media separately, keeping the earliest of each', () => {
+    const p = plan(
+      [
+        seg(0, S),
+        seg(S, 2 * S, [], [alayer('a', 'm', { source_track: 0 }), alayer('b', 'm', { source_track: 2, src_time: 3 * S })]),
+        seg(2 * S, 3 * S, [], [alayer('c', 'm', { source_track: 0, src_time: 9 * S })]),
+      ],
+      0,
+      3 * S,
+    );
+    expect(upcomingStreams(p, 0, 10 * S).map((u) => [u.mediaId, u.stream, u.startsAt])).toEqual([
+      ['m', 0, S],
+      ['m', 2, S],
+    ]);
+  });
+  it('excludes a stream already active at the time, and anything past the horizon', () => {
+    const p = plan(
+      [seg(0, S, [], [alayer('a', 'm', { source_track: 0 })]), seg(S, 3 * S, [], [alayer('b', 'm', { source_track: 0 })])],
+      0,
+      3 * S,
+    );
+    expect(upcomingStreams(p, 0, 10 * S)).toEqual([]);
+    expect(upcomingStreams(p, 0, 0)).toEqual([]);
+    const later = plan([seg(0, S), seg(2 * S, 3 * S, [], [alayer('a', 'x')])], 0, 3 * S);
+    expect(upcomingStreams(later, 0, S)).toEqual([]);
   });
 });
 

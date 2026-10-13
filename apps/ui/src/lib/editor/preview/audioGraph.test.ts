@@ -273,6 +273,22 @@ describe('construction', () => {
 
 // ---------------------------------------------------------------------------------------------
 describe('attach', () => {
+  it('routes the default stream (key m1#0) and an extra stream (m1#1) of one media separately', () => {
+    // The engine keys every audio element `<mediaId>#<stream>`, stream 0 included.
+    const graph = new AudioGraph();
+    graph.attach('m1#0', el());
+    graph.attach('m1#1', el());
+    graph.setSourceParams('c0', 'm1#0', 0, ramp({ offsetSec: 0, gain: 1 }), 0, false, 0);
+    graph.setSourceParams('c1', 'm1#1', 0, ramp({ offsetSec: 0, gain: 1 }), 0, false, 0);
+    expect(ctx().created.sources.length).toBe(2);
+    const gains = ctx().created.gains;
+    const clip0 = at(gains, 1);
+    const clip1 = at(gains, 2 + CHAIN_GAINS); // +1: the track bus gain made by the first chain
+    expect(at(ctx().created.sources, 0).connectsTo(clip0)).toBe(true);
+    expect(at(ctx().created.sources, 0).connectsTo(clip1)).toBe(false);
+    expect(at(ctx().created.sources, 1).connectsTo(clip1)).toBe(true);
+  });
+
   it('creates one source node for a media element', () => {
     const graph = new AudioGraph();
     graph.attach('m1', el());

@@ -1,11 +1,12 @@
-// Program monitor engine. Plays a RenderPlan in the webview: a clock drives a pool of <video>
-// elements (one per media id) for pictures and sound, a Web Audio graph (audioGraph.ts) applies
-// the plan's gain curves, and compose.ts paints each frame onto the attached canvas.
+// Program monitor engine. Plays a RenderPlan in the webview: a clock drives a pool of muted <video>
+// elements (one per media id, picture only) and a pool of hidden <audio> elements (one per
+// (media, stream), all the sound). A Web Audio graph (audioGraph.ts) applies the plan's gain curves
+// to the audio elements, and compose.ts paints each frame onto the attached canvas.
 //
 // Timing model: the clock (clock.ts) is the single source of timeline time. Every frame, each
 // needed element is checked against the source time that the scheduler derives for it. A playing
-// audio-stream element whose drift exceeds 0.1 s (back to nominal below 0.04 s) is nudged by 3 % of its
-// rate; video elements free-run. A playing element whose drift exceeds 0.5 s (audio streams 0.25 s) is
+// audio element whose drift exceeds 0.1 s (back to nominal below 0.04 s) is nudged by 3 % of its
+// rate; video elements free-run on the system clock. A playing element whose drift exceeds 0.5 s (audio 0.25 s) is
 // re-seeked, with the measured cost of its last seek added as lead. A segment change, a seek or a rate
 // change forces one exact re-seek of each element that is off by more than 0.02 s. Free-running
 // re-seeks back off up to 2 s apart.
@@ -19,10 +20,12 @@
 // - One element per media id: when two timeline sources of the same media need different source
 //   times in one segment, the first (video layer, then audio source) wins and the other source
 //   plays the wrong part. Linked audio and video of one clip always agree.
-// - The default audio stream (source_track 0) plays from the pooled <video> element. Every other
-//   stream plays from its own hidden <audio> element whose source is an extracted single-stream
-//   file (editorApi.audioStreamUrl), pooled to MAX_AUDIO_ELEMENTS. A video element is audible only
-//   while a track-0 source of its media is active, so an unplaced Mix never plays under the editor.
+// - The pooled <video> element is picture only: always muted and never routed through Web Audio
+//   (routing it stalled its frame delivery to about 2 fps). All sound, including the default stream
+//   (source_track 0) and audio-only media, plays from hidden <audio> elements keyed
+//   `<mediaId>#<stream>` and pooled to MAX_AUDIO_ELEMENTS. Stream 0 uses the original media URL;
+//   every other stream uses an extracted single-stream file (editorApi.audioStreamUrl). So an
+//   unplaced Mix never plays under the editor.
 // - Painting skips ticks where nothing changed (no new video frame, same segment, no transition).
 // - More than MAX_ELEMENTS media needed at once exceed the pool cap rather than stop playback.
 // - While the window is hidden the picture stops (rAF); the clock keeps running on a 100 ms timer
@@ -110,7 +113,7 @@ export interface PreviewEngineOptions {
 }
 
 /*
- * Bisecting switches (multiAudio: hidden <audio> elements of the non-default streams; direct: direct-video
+ * Bisecting switches (multiAudio: hidden <audio> elements of the non-default streams, off = only stream 0 plays; direct: direct-video
  * mode, where the playing <video> element itself is shown) live in the engine's DebugFlags.
  */
 /** Quiet time after the last seek of a paused playhead before the exact frame is seeked (ms). */
@@ -187,7 +190,7 @@ const QUALITY_SCALE: Record<PreviewQuality, number> = { full: 1, half: 0.5, quar
 
 const SILENT_LEVELS: { master: number; tracks: number[] } = { master: -120, tracks: [] };
 
-/** Seek and drift state shared by video and audio-stream elements. */
+/** Seek and drift state shared by video and audio elements. */
 interface PlayEntry {
   el: HTMLMediaElement;
   /** True once the playable URL has been assigned to `el`. */
@@ -225,7 +228,7 @@ interface ElementEntry extends PlayEntry {
   frameSeq: number;
 }
 
-/** One pooled hidden audio element playing one extracted stream of a media. */
+/** One pooled hidden audio element playing one audio stream of a media (stream 0: the original file). */
 interface AudioEntry extends PlayEntry {
   key: string;
   mediaId: string;
@@ -240,7 +243,7 @@ interface StreamNeed extends MediaNeed {
 }
 
 /** Key of a (media, stream) pair: audio element pool key and audio graph source key. */
-function streamKey(mediaId: string, stream: number): string {
+export function streamKey(mediaId: string, stream: number): string {
   return `${mediaId}#${stream}`;
 }
 
@@ -661,7 +664,7 @@ class Engine implements PreviewEngine {
     if (this.clock.isRunning()) return;
     this.redrawNow();
     const plan = this.plan;
-    if (!plan || !this.flags.multiAudio) return;
+    if (!plan) return;
     const seg = segmentAt(plan, this.clock.now());
     if (!seg) return;
     this.collectNeeds(seg, this.clock.now());
@@ -812,10 +815,7 @@ class Engine implements PreviewEngine {
 
   /** Disposes every pooled element and the URL state; elements are recreated lazily on next use. */
   private resetPool(): void {
-    for (const [mediaId, entry] of this.elements) {
-      this.disposeEntry(entry);
-      this.audio.detach(mediaId);
-    }
+    for (const entry of this.elements.values()) this.disposeEntry(entry);
     this.elements.clear();
     for (const [key, entry] of this.audioEls) {
       this.disposeEntry(entry);
@@ -1405,9 +1405,10 @@ class Engine implements PreviewEngine {
     const el = document.createElement('video');
     el.preload = 'metadata';
     el.playsInline = true;
-    // Native audio (webAudio off) starts muted; syncAudio unmutes the elements a segment sounds.
-    el.muted = !this.flags.webAudio;
-    el.volume = 1;
+    // Picture only: all sound comes from the hidden audio elements. Routing a <video> through Web
+    // Audio stalls its frame delivery, so it is muted and never attached to the audio graph.
+    el.muted = true;
+    el.volume = 0;
     // Export resamples, so pitch follows speed in the preview too.
     el.preservesPitch = false;
     // Media comes from another origin. Web Audio needs CORS or the source is silent.
@@ -1453,13 +1454,6 @@ class Engine implements PreviewEngine {
     el.onloadedmetadata = () => this.checkDecodable(mediaId, el);
     el.onerror = () => this.onMediaError(mediaId, el);
     this.elements.set(mediaId, entry);
-
-    try {
-      if (this.flags.webAudio) this.audio.attach(mediaId, el);
-    } catch (err) {
-      this.failMedia(mediaId, err);
-      return null;
-    }
 
     void this.urlFor(mediaId).then((url) => {
       if (url === null || this.destroyed) return;
@@ -1516,7 +1510,6 @@ class Engine implements PreviewEngine {
     }
     if (victim === null) return;
     this.disposeEntry(victim);
-    this.audio.detach(victim.mediaId);
     this.elements.delete(victim.mediaId);
   }
 
@@ -1546,14 +1539,13 @@ class Engine implements PreviewEngine {
     entry.hasSrc = false;
   }
 
-  /** Drops the element, its audio source and its image of a media id. Keeps failure state. */
+  /** Drops the video element and the image of a media id (audio elements stay). Keeps failure state. */
   private releaseMedia(mediaId: string): void {
     const entry = this.elements.get(mediaId);
     if (entry) {
       this.disposeEntry(entry);
       this.elements.delete(mediaId);
     }
-    this.audio.detach(mediaId);
     const img = this.images.get(mediaId);
     if (img) {
       disposeImage(img);
@@ -1561,7 +1553,7 @@ class Engine implements PreviewEngine {
     }
   }
 
-  /** Forgets everything known about a media id, so it is resolved and decoded again. */
+  /** Forgets everything known about a media id (video and audio elements, URLs), so it is resolved and decoded again. */
   private dropMedia(mediaId: string): void {
     this.failed.delete(mediaId);
     this.urls.delete(mediaId);
@@ -1684,10 +1676,9 @@ class Engine implements PreviewEngine {
   // ---- positioning ------------------------------------------------------------------------
 
   /**
-   * Fills `this.needs` (media played from a pooled video element) and `this.streamNeeds` (audio
-   * streams played from their own element) for the segment at `t`. A video layer wins over a
-   * default-stream audio source of the same media. Sources with `source_track` 0 use the video
-   * element; every other track uses an extracted-stream audio element.
+   * Fills `this.needs` (media shown from a pooled video element) and `this.streamNeeds` (every audio
+   * stream, default included, played from its own audio element keyed `<mediaId>#<stream>`) for the
+   * segment at `t`. Without the multiAudio flag only stream 0 is needed.
    */
   private collectNeeds(seg: PlanSegment, t: Tick): void {
     const needs = this.needs;
@@ -1704,15 +1695,7 @@ class Engine implements PreviewEngine {
       });
     }
     for (const src of seg.audio) {
-      if (src.source_track === 0) {
-        if (needs.has(src.media_id)) continue;
-        needs.set(src.media_id, {
-          src: sourceTimeFor(src, seg.start, t),
-          speed: src.speed,
-          reverse: src.reverse,
-        });
-        continue;
-      }
+      if (src.source_track !== 0 && !this.flags.multiAudio) continue;
       const key = streamKey(src.media_id, src.source_track);
       if (streams.has(key)) continue;
       streams.set(key, {
@@ -1791,13 +1774,13 @@ class Engine implements PreviewEngine {
     this.keepAudioKeys.clear();
     for (const key of streams.keys()) this.keepAudioKeys.add(key);
     for (const [key, entry] of this.audioEls) {
-      if (streams.has(key) && playing && this.flags.multiAudio) continue;
+      if (streams.has(key) && playing) continue;
       if (!entry.el.paused) entry.el.pause();
     }
-    // Paused (scrubbing, stepping) the stream elements are not touched: they are silent anyway and
+    // Paused (scrubbing, stepping) the audio elements are not touched: they are silent anyway and
     // seeking them on every playhead move only costs decoder and disk time. Playing, they are
     // positioned at 10 Hz, not on every animation frame.
-    if (!playing || !this.flags.multiAudio) return;
+    if (!playing) return;
     if (now - this.lastStreamSyncMs < STREAM_SYNC_MS && this.segStart === seg.start) return;
     this.lastStreamSyncMs = now;
     for (const need of streams.values()) {
@@ -1820,8 +1803,9 @@ class Engine implements PreviewEngine {
   }
 
   /**
-   * Keeps one element on its source time. `audioOnly` elements never step frames: frozen,
-   * reversed and reverse-shuttled sources are simply paused (silent).
+   * Keeps one element on its source time. `audioOnly` (audio) elements never step frames: frozen,
+   * reversed and reverse-shuttled sources are simply paused (silent). Video elements are never
+   * nudged; they free-run and are only re-seeked on drift.
    */
   private positionElement(entry: PlayEntry, need: MediaNeed, playing: boolean, now: number, audioOnly: boolean): void {
     if (!entry.hasSrc) return;
@@ -1878,8 +1862,8 @@ class Engine implements PreviewEngine {
       entry.nudging = false;
       if (el.playbackRate !== nominal) el.playbackRate = nominal;
     } else if (audioOnly && abs > (entry.nudging ? DRIFT_NUDGE_OFF_S : DRIFT_NUDGE_S)) {
-      // Only the extracted audio streams are nudged. The picture element free-runs: its own clock is
-      // the audio renderer, and rate changes on it re-sync the pipeline and drop frames.
+      // Only the audio elements are nudged. The picture element free-runs: rate changes on it
+      // re-sync the pipeline and drop frames.
       // Hysteresis: once nudging, keep the corrected rate until the drift is almost gone.
       entry.nudging = true;
       const factor = drift > 0 ? 1 - NUDGE_FACTOR : 1 + NUDGE_FACTOR;
@@ -1932,8 +1916,13 @@ class Engine implements PreviewEngine {
 
   // ---- audio streams ----------------------------------------------------------------------
 
-  /** Resolves the extracted-stream URL of (media, stream) once. Never rejects; failure marks the stream. */
+  /**
+   * Resolves the URL of (media, stream) once. Stream 0 plays the original media file (same URL as the
+   * video element, no extraction); every other stream is an extracted single-stream file. Never
+   * rejects; an extraction failure marks the stream.
+   */
   private streamUrlFor(mediaId: string, stream: number): Promise<string | null> {
+    if (stream === 0) return this.urlFor(mediaId);
     const key = streamKey(mediaId, stream);
     let p = this.streamUrls.get(key);
     if (!p) {
@@ -1979,6 +1968,7 @@ class Engine implements PreviewEngine {
 
     const el = document.createElement('audio');
     el.preload = 'auto';
+    // Native audio (webAudio off) starts muted; syncNativeAudio unmutes the elements a segment sounds.
     el.muted = !this.flags.webAudio;
     el.volume = 1;
     el.preservesPitch = false;
@@ -2065,8 +2055,8 @@ class Engine implements PreviewEngine {
     for (const src of seg.audio) {
       if (seen.has(src.clip_id)) continue;
       seen.add(src.clip_id);
-      // Track 0 plays from the media's video element, every other track from its stream element.
-      const sourceKey = src.source_track === 0 ? src.media_id : streamKey(src.media_id, src.source_track);
+      // Every stream, track 0 included, plays from its own audio element.
+      const sourceKey = streamKey(src.media_id, src.source_track);
       const ramp: GainPoint[] = gainRamp(src, t, t + secToTick(RAMP_SPAN_S), RAMP_STEP_S).map((p) => ({
         offsetSec: p.offsetSec / mag,
         gain: p.gain,
@@ -2089,8 +2079,8 @@ class Engine implements PreviewEngine {
   }
 
   /**
-   * Diagnostic mode without Web Audio: the elements play their own audio. Only the on/off state of a
-   * source applies (an element is muted unless a source of it has gain now); pan, gain curves,
+   * Diagnostic mode without Web Audio: the audio elements play natively. Only the on/off state of a
+   * source applies (an audio element is muted unless a source of it has gain now); pan, gain curves,
    * mono and track buses do not.
    */
   private syncNativeAudio(seg: PlanSegment, t: Tick): void {
@@ -2098,11 +2088,7 @@ class Engine implements PreviewEngine {
     for (const src of seg.audio) {
       const first = gainRamp(src, t, t + secToTick(RAMP_STEP_S), RAMP_STEP_S)[0];
       if (first === undefined || !(first.gain > 0)) continue;
-      live.add(src.source_track === 0 ? src.media_id : streamKey(src.media_id, src.source_track));
-    }
-    for (const entry of this.elements.values()) {
-      const muted = !live.has(entry.mediaId);
-      if (entry.el.muted !== muted) entry.el.muted = muted;
+      live.add(streamKey(src.media_id, src.source_track));
     }
     for (const entry of this.audioEls.values()) {
       const muted = !live.has(entry.key);
@@ -2141,6 +2127,7 @@ class Engine implements PreviewEngine {
       }
     }
     for (const item of upcomingStreams(plan, t, secToTick(PREFETCH_HORIZON_S))) {
+      if (item.stream !== 0 && !this.flags.multiAudio) continue;
       const key = streamKey(item.mediaId, item.stream);
       if (this.keepAudioKeys.has(key)) continue;
       if (this.prefetchedStreams.get(key) === item.startsAt) continue;
