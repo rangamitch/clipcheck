@@ -539,14 +539,29 @@ impl AudioSlot {
     }
 }
 
-/// Deletes files in the remuxed audio-stream directory that were last written more than seven
-/// days ago. Runs once per process, before the directory is first used. Best effort: every error
-/// is ignored.
+/// Version marker in the remuxed audio-stream file names. Bump it when the remux output changes so
+/// files written by an older build are never reused and are pruned as stale.
+const AUDIO_STREAM_CACHE_VERSION: &str = "v2";
+
+/// True for a file name in the audio-stream cache that an older build wrote: any `.m4a` that is
+/// neither a current file (`-v2.m4a`) nor a current in-progress file (`-v2.part.m4a`).
+fn is_stale_audio_cache_name(name: &str) -> bool {
+    let current = format!("-{AUDIO_STREAM_CACHE_VERSION}.m4a");
+    let current_part = format!("-{AUDIO_STREAM_CACHE_VERSION}.part.m4a");
+    name.ends_with(".m4a") && !name.ends_with(&current) && !name.ends_with(&current_part)
+}
+
+/// Deletes files in the remuxed audio-stream directory that this build does not use: old-format
+/// `.m4a` files (see `is_stale_audio_cache_name`), `.part` files last written more than an hour
+/// ago, and current files last written more than seven days ago. Runs once per process, before
+/// the directory is first used. Best effort: every error is ignored.
 fn prune_audio_stream_dir(dir: &Path) {
     const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+    const MAX_PART_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let current_suffix = format!("-{AUDIO_STREAM_CACHE_VERSION}.m4a");
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else {
@@ -555,11 +570,21 @@ fn prune_audio_stream_dir(dir: &Path) {
         if !meta.is_file() {
             continue;
         }
+        let name = entry.file_name().to_string_lossy().into_owned();
         let age = meta
             .modified()
             .ok()
             .and_then(|t| now.duration_since(t).ok());
-        if age.is_some_and(|a| a > MAX_AGE) {
+        let doomed = if is_stale_audio_cache_name(&name) {
+            true
+        } else if name.ends_with(".part") || name.ends_with(".part.m4a") {
+            age.is_some_and(|a| a > MAX_PART_AGE)
+        } else if name.ends_with(&current_suffix) {
+            age.is_some_and(|a| a > MAX_AGE)
+        } else {
+            false
+        };
+        if doomed {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -610,7 +635,7 @@ fn isolate_audio_stream(path: &Path, stream: u32) -> (PathBuf, u32) {
     static PRUNED: std::sync::Once = std::sync::Once::new();
     PRUNED.call_once(|| prune_audio_stream_dir(&dir));
     let out = dir.join(format!(
-        "{:016x}-{}-{mtime}-{stream}.m4a",
+        "{:016x}-{}-{mtime}-{stream}-{AUDIO_STREAM_CACHE_VERSION}.m4a",
         h.finish(),
         meta.len()
     ));
@@ -754,6 +779,44 @@ impl AudioProvider for MfAudioProvider {
                 Ok(false)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod audio_cache_tests {
+    use super::{is_stale_audio_cache_name, prune_audio_stream_dir};
+
+    #[test]
+    fn old_format_names_are_stale() {
+        assert!(is_stale_audio_cache_name("x-1-2-3.m4a"));
+        assert!(is_stale_audio_cache_name("abc-1-2-3-5.part.m4a"));
+    }
+
+    #[test]
+    fn current_and_non_cache_names_are_not_stale() {
+        assert!(!is_stale_audio_cache_name("abc-1-2-3-v2.m4a"));
+        assert!(!is_stale_audio_cache_name("abc-1-2-3-v2.part.m4a"));
+        assert!(!is_stale_audio_cache_name("notes.txt"));
+        assert!(!is_stale_audio_cache_name("a.m4a.keep"));
+        assert!(!is_stale_audio_cache_name("a.part"));
+    }
+
+    #[test]
+    fn prune_removes_old_format_files_and_keeps_fresh_current_ones() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("clipcheck-prune-test-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["x-1-2-3.m4a", "y-v2.m4a", "z-v2.part.m4a", "notes.txt"] {
+            std::fs::write(dir.join(name), b"data").unwrap();
+        }
+        prune_audio_stream_dir(&dir);
+        assert!(!dir.join("x-1-2-3.m4a").exists());
+        assert!(dir.join("y-v2.m4a").exists());
+        assert!(dir.join("z-v2.part.m4a").exists());
+        assert!(dir.join("notes.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

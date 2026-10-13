@@ -1008,14 +1008,62 @@ fn decode_source_locked(path: &Path, stream: u32) -> (PathBuf, u32) {
     (path.to_path_buf(), stream)
 }
 
+/// Version marker in the audio cache file names. Bump it when the remux output changes so files
+/// written by an older build are never reused and are pruned as stale.
+const AUDIO_CACHE_VERSION: &str = "v2";
+
+/// True for a file name in the audio cache that an older build wrote: any `.m4a` that is neither a
+/// current file (`-v2.m4a`) nor a current in-progress file (`-v2.part.m4a`).
+fn is_stale_audio_cache_name(name: &str) -> bool {
+    let current = format!("-{AUDIO_CACHE_VERSION}.m4a");
+    let current_part = format!("-{AUDIO_CACHE_VERSION}.part.m4a");
+    name.ends_with(".m4a") && !name.ends_with(&current) && !name.ends_with(&current_part)
+}
+
+/// Deletes old-format `.m4a` files from the audio cache directory, and `.part` files last written
+/// more than an hour ago. Only files directly inside `dir` are considered. Best effort: every
+/// error is ignored.
+fn prune_audio_cache_dir(dir: &Path) {
+    const MAX_PART_AGE: std::time::Duration = std::time::Duration::from_secs(3600);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let doomed = if is_stale_audio_cache_name(&name) {
+            true
+        } else if name.ends_with(".part") || name.ends_with(".part.m4a") {
+            meta.modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|a| a > MAX_PART_AGE)
+        } else {
+            false
+        };
+        if doomed {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// `extract_audio_stream` for callers already holding the `HeavyIo` lock (it is not reentrant).
 fn extract_audio_stream_locked(path: &Path, stream: u32) -> Result<PathBuf, String> {
     if !matches!(ext_lower(path).as_str(), "mp4" | "m4v" | "mov") {
         return Err("audio track extraction needs an MP4 file".to_string());
     }
     let meta = fs::metadata(path).map_err(|_| format!("file is missing: {}", path.display()))?;
-    let out = cache_root().join("audio").join(format!(
-        "{}-{}-{stream}-{}.m4a",
+    let audio_dir = cache_root().join("audio");
+    static PRUNED: std::sync::Once = std::sync::Once::new();
+    PRUNED.call_once(|| prune_audio_cache_dir(&audio_dir));
+    let out = audio_dir.join(format!(
+        "{}-{}-{stream}-{}-{AUDIO_CACHE_VERSION}.m4a",
         meta.len(),
         mtime_ms(&meta),
         source_tag(path)
@@ -1163,6 +1211,25 @@ fn tick_from_secs(secs: f64) -> Tick {
 /// Milliseconds to ticks; negative values give zero.
 fn tick_from_ms(ms: i64) -> Tick {
     Tick::from_ms(ms.max(0))
+}
+
+#[cfg(test)]
+mod audio_cache_tests {
+    use super::is_stale_audio_cache_name;
+
+    #[test]
+    fn old_format_names_are_stale() {
+        assert!(is_stale_audio_cache_name("1024-5-0-abcd.m4a"));
+        assert!(is_stale_audio_cache_name("1024-5-0-1-abcd.part.m4a"));
+    }
+
+    #[test]
+    fn current_and_non_cache_names_are_not_stale() {
+        assert!(!is_stale_audio_cache_name("1024-5-0-abcd-v2.m4a"));
+        assert!(!is_stale_audio_cache_name("1024-5-0-abcd-v2.part.m4a"));
+        assert!(!is_stale_audio_cache_name("notes.txt"));
+        assert!(!is_stale_audio_cache_name("a.m4a.keep"));
+    }
 }
 
 #[cfg(test)]
