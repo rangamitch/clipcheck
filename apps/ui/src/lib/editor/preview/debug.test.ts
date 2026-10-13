@@ -6,7 +6,6 @@ import {
   formatDiagLine,
   loadDebugFlags,
   ratePerSec,
-  saveDebugFlags,
 } from './debug';
 
 function memory(initial?: string): { store: Storage; data: Map<string, string> } {
@@ -15,6 +14,7 @@ function memory(initial?: string): { store: Storage; data: Map<string, string> }
   const store = {
     getItem: (k: string) => data.get(k) ?? null,
     setItem: (k: string, v: string) => void data.set(k, v),
+    removeItem: (k: string) => void data.delete(k),
   } as unknown as Storage;
   return { store, data };
 }
@@ -26,6 +26,9 @@ const throwing = {
   setItem: () => {
     throw new Error('blocked');
   },
+  removeItem: () => {
+    throw new Error('blocked');
+  },
 } as unknown as Storage;
 
 describe('debug flags', () => {
@@ -34,31 +37,26 @@ describe('debug flags', () => {
     expect(loadDebugFlags(memory().store)).toEqual(defaultDebugFlags());
   });
 
-  it('round-trips through storage', () => {
-    const m = memory();
-    const flags = { multiAudio: false, webAudio: true, direct: false };
-    expect(saveDebugFlags(flags, m.store)).toBe(true);
-    expect(loadDebugFlags(m.store)).toEqual(flags);
+  it('ignores saved values: defaults are returned even when storage holds flags', () => {
+    expect(loadDebugFlags(memory('{"webAudio":false}').store)).toEqual(defaultDebugFlags());
+    expect(loadDebugFlags(memory('{"multiAudio":false,"webAudio":false,"direct":false}').store)).toEqual(
+      defaultDebugFlags(),
+    );
   });
 
-  it('survives storage that throws', () => {
+  it('removes the stale key on load', () => {
+    const m = memory('{"webAudio":false}');
+    loadDebugFlags(m.store);
+    expect(m.data.has(DEBUG_STORAGE_KEY)).toBe(false);
+  });
+
+  it('is safe when storage throws', () => {
     expect(loadDebugFlags(throwing)).toEqual(defaultDebugFlags());
-    expect(saveDebugFlags(defaultDebugFlags(), throwing)).toBe(false);
   });
 
-  it('ignores malformed or partial data', () => {
+  it('returns defaults for malformed data and missing storage', () => {
     expect(loadDebugFlags(memory('not json').store)).toEqual(defaultDebugFlags());
-    expect(loadDebugFlags(memory('42').store)).toEqual(defaultDebugFlags());
-    expect(loadDebugFlags(memory('{"webAudio":false,"direct":"no"}').store)).toEqual({
-      multiAudio: true,
-      webAudio: false,
-      direct: true,
-    });
-  });
-
-  it('handles missing storage', () => {
     expect(loadDebugFlags(null)).toEqual(defaultDebugFlags());
-    expect(saveDebugFlags(defaultDebugFlags(), null)).toBe(false);
   });
 });
 

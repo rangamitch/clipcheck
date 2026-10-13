@@ -15,42 +15,25 @@ export interface DebugFlags {
   direct: boolean;
 }
 
+/** Storage key of the flags before they became session-only. Removed on load (see loadDebugFlags). */
 export const DEBUG_STORAGE_KEY = 'cc-editor-debug';
 
 export function defaultDebugFlags(): DebugFlags {
   return { multiAudio: true, webAudio: true, direct: true };
 }
 
-/** Reads the saved flags. Missing, malformed or unavailable storage yields the defaults. */
-export function loadDebugFlags(storage?: Pick<Storage, 'getItem'> | null): DebugFlags {
-  const flags = defaultDebugFlags();
+/**
+ * Returns the defaults, always. Flags are session-only: a value saved by an earlier build is never
+ * read (it could leave Web Audio switched off), and the stale key is removed. Storage errors are ignored.
+ */
+export function loadDebugFlags(storage?: Pick<Storage, 'removeItem'> | null): DebugFlags {
   try {
     const store = storage === undefined ? globalThis.localStorage : storage;
-    if (!store) return flags;
-    const raw = store.getItem(DEBUG_STORAGE_KEY);
-    if (!raw) return flags;
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== 'object' || parsed === null) return flags;
-    const rec = parsed as Record<string, unknown>;
-    for (const key of Object.keys(flags) as (keyof DebugFlags)[]) {
-      if (typeof rec[key] === 'boolean') flags[key] = rec[key] as boolean;
-    }
+    store?.removeItem(DEBUG_STORAGE_KEY);
   } catch {
-    // Storage may throw (private mode, blocked): use the defaults.
+    // Storage may throw (private mode, blocked): nothing to remove.
   }
-  return flags;
-}
-
-/** Saves the flags. Returns false when the storage is unavailable. */
-export function saveDebugFlags(flags: DebugFlags, storage?: Pick<Storage, 'setItem'> | null): boolean {
-  try {
-    const store = storage === undefined ? globalThis.localStorage : storage;
-    if (!store) return false;
-    store.setItem(DEBUG_STORAGE_KEY, JSON.stringify(flags));
-    return true;
-  } catch {
-    return false;
-  }
+  return defaultDebugFlags();
 }
 
 /** Per-second rate from a cumulative counter delta over `spanMs`. Never negative, 0 for no span. */

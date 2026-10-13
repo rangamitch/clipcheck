@@ -3,7 +3,7 @@
   import { get } from 'svelte/store';
   import { editorApi } from './api';
   import { createPreviewEngine, type PreviewEngine } from './preview/engine';
-  import { formatDiagLine, loadDebugFlags, saveDebugFlags, type DebugFlags } from './preview/debug';
+  import { formatDiagLine, loadDebugFlags, type DebugFlags } from './preview/debug';
   import { hitLayerAt, projectToCanvasRect } from './preview/compose';
   import { loopInOut, runAction, shuttleRate, type ActionContext } from './actions';
   import { ACTIONS } from './shortcuts';
@@ -513,6 +513,14 @@
 
   // Diagnostic switches (temporary investigation aid, see preview/debug.ts).
   let debugFlags = $state<DebugFlags>(loadDebugFlags());
+  /** Hidden by default. Ctrl+Alt+D toggles it (session only, not persisted). */
+  let showDiagnostics = $state(false);
+  function onWindowKeydown(e: KeyboardEvent): void {
+    if (!e.ctrlKey || !e.altKey || e.shiftKey || e.metaKey) return;
+    if (e.key.toLowerCase() !== 'd') return;
+    e.preventDefault();
+    showDiagnostics = !showDiagnostics;
+  }
   const DEBUG_CHIPS: { key: keyof DebugFlags; label: string; tip: string }[] = [
     {
       key: 'multiAudio',
@@ -533,7 +541,6 @@
   function toggleDebug(key: keyof DebugFlags): void {
     const next = { ...debugFlags, [key]: !debugFlags[key] };
     debugFlags = next;
-    saveDebugFlags(next);
     // The engine pauses to rebuild its pool: keep the transport state in line.
     playing.set(false);
     engine?.setDebugFlags?.(next);
@@ -690,6 +697,7 @@
 </script>
 
 <svelte:document onfullscreenchange={onFullscreenChange} />
+<svelte:window onkeydown={onWindowKeydown} />
 
 <section class="program-monitor" aria-label="Program monitor">
   <!-- Focusable region with its own key handling (arrow nudges), by design. -->
@@ -714,7 +722,7 @@
     >
       <canvas bind:this={canvasEl} class="picture" aria-label="Program picture"></canvas>
       <div class="direct-host" bind:this={directHostEl} aria-hidden="true"></div>
-      {#if $playing || $previewStats.ctxState !== undefined}
+      {#if showDiagnostics && ($playing || $previewStats.ctxState !== undefined)}
         <div class="perf-stats">
           {#if $playing}<div aria-hidden="true">paint {$previewStats.paintFps} fps  video {$previewStats.videoFps} fps  dropped {$previewStats.dropped}{$previewStats.direct ? '  direct' : ''}</div>{/if}
           <div class="diag-line">
