@@ -637,11 +637,10 @@
     const current = proj;
 
     if (!wasArmed) {
-      // A plain click: a marquee clears the selection (unless Shift or Ctrl adds to it) and seeks;
-      // a multi-selection collapses.
+      // A plain click: a marquee clears the selection (unless Shift or Ctrl adds to it); a
+      // multi-selection collapses. Blank track space never moves the playhead: only the ruler does.
       if (state.kind === 'marquee' && current) {
         if (!state.additive) selection.set([]);
-        seek(xToTick(state.originX, view));
       } else if (state.kind === 'move' && collapseTo !== null) {
         selectClips([collapseTo], 'replace');
       }
