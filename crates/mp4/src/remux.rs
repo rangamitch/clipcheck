@@ -1084,9 +1084,16 @@ mod tests {
             input_bytes
         );
         let out_audio = dir.path().join("audio.m4a");
-        let rep = concat_remux(&segs, &out_audio, &opts(0.0, None, TrackSelect::Only(vec![1])))
-            .unwrap();
-        assert!(rep.bytes < input_bytes, "audio-only output is not smaller than the inputs");
+        let rep = concat_remux(
+            &segs,
+            &out_audio,
+            &opts(0.0, None, TrackSelect::Only(vec![1])),
+        )
+        .unwrap();
+        assert!(
+            rep.bytes < input_bytes,
+            "audio-only output is not smaller than the inputs"
+        );
     }
 
     #[test]
