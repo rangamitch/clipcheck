@@ -620,12 +620,13 @@ fn assign_chunks(tracks: &mut [OutTrack]) -> Vec<(usize, usize)> {
                 desc,
                 start: time,
             });
+            // One entry per chunk: the writer emits a whole chunk per entry.
+            order.push((t, tr.chunks.len().saturating_sub(1)));
         }
         let ci = tr.chunks.len().saturating_sub(1);
         if let Some(ch) = tr.chunks.get_mut(ci) {
             ch.count += 1;
         }
-        order.push((t, ci));
         ptr[t] += 1;
         last = Some(t);
     }
@@ -1062,6 +1063,30 @@ mod tests {
         assert_eq!(rep.actual_start_secs, 0.0);
         assert_eq!(rep.bytes, std::fs::metadata(&out).unwrap().len());
         assert!(!dir.path().join("out.mp4.part").exists());
+    }
+
+    /// Regression: every chunk was written once per sample it holds, so the output of a real
+    /// recording came out ~24x larger than the samples it contains.
+    #[test]
+    fn remux_writes_each_sample_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let segs = make_segments(&dir.path().join("src"), 3, true);
+        let input_bytes: u64 = segs
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        let out = dir.path().join("out.mp4");
+        let rep = concat_remux(&segs, &out, &RemuxOptions::default()).unwrap();
+        assert!(
+            rep.bytes <= input_bytes,
+            "output {} bytes exceeds the {} bytes of input",
+            rep.bytes,
+            input_bytes
+        );
+        let out_audio = dir.path().join("audio.m4a");
+        let rep = concat_remux(&segs, &out_audio, &opts(0.0, None, TrackSelect::Only(vec![1])))
+            .unwrap();
+        assert!(rep.bytes < input_bytes, "audio-only output is not smaller than the inputs");
     }
 
     #[test]
