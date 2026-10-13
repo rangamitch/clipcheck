@@ -796,6 +796,41 @@ describe('cut tool snapping and preview', () => {
     expect(off).toBeNull();
   });
 
+  it('over a clip end edge zone the preview snaps to that existing boundary', () => {
+    const { proj, rows, play } = cutProj(0);
+    const row = rows[0]!;
+    // The end edge is at x 500; the pointer is 4 px inside the edge zone (EDGE_HIT_PX = 10).
+    const edge = cutPreviewFor(proj, rows, CUT_VIEW, 504, row.top + 5, false, play, 8);
+    expect(edge).not.toBeNull();
+    expect(edge!.tick).toBe(5 * S);
+    expect(edge!.x).toBeCloseTo(500, 6);
+    expect(edge!.snapped).toBe(true);
+    expect(edge!.kind).toBe('clip');
+    expect(edge!.label).toBe(cutPreviewLabel(5 * S, proj));
+  });
+
+  it('over a clip start edge zone the preview snaps to that existing boundary', () => {
+    const { proj, rows, play } = cutProj(0);
+    const row = rows[0]!;
+    const edge = cutPreviewFor(proj, rows, CUT_VIEW, 4, row.top + 5, false, play, 8);
+    expect(edge).not.toBeNull();
+    expect(edge!.tick).toBe(0);
+    expect(edge!.x).toBeCloseTo(0, 6);
+    expect(edge!.snapped).toBe(true);
+    expect(edge!.kind).toBe('clip');
+  });
+
+  it('Shift over an edge zone keeps the preview at the raw pointer position, unsnapped', () => {
+    const { proj, rows, play } = cutProj(0);
+    const row = rows[0]!;
+    const edge = cutPreviewFor(proj, rows, CUT_VIEW, 504, row.top + 5, true, play, 8);
+    expect(edge).not.toBeNull();
+    expect(edge!.tick).toBe(xToTick(504, CUT_VIEW));
+    expect(edge!.x).toBeCloseTo(504, 6);
+    expect(edge!.snapped).toBe(false);
+    expect(edge!.kind).toBeNull();
+  });
+
   it('labels a cut point as HH:MM:SS:FF at the canvas frame rate', () => {
     const { proj } = cutProj(0);
     expect(cutPreviewLabel(Math.round(1.5 * S), proj)).toBe('00:00:01:15');

@@ -615,8 +615,11 @@ export function cutPreviewLabel(tick: Tick, project: Project): string {
 }
 
 /**
- * Cut-tool preview for a pointer at (x, y): shown only over a clip (the one a click would cut),
- * at the snapped cut point. Null when the pointer is not over a clip.
+ * Cut-tool preview for a pointer at (x, y). Over a clip body, shown at the snapped cut point (the
+ * one a click would cut). Over a clip's start or end edge zone, shown as snapped to that existing
+ * boundary (a cut there already exists, so the line marks it; a click does nothing). Under Shift the
+ * edge preview stays at the pointer's raw position, unsnapped. Null over empty space, ruler, tracks
+ * and gaps away from a clip edge.
  */
 export function cutPreviewFor(
   project: Project,
@@ -629,6 +632,16 @@ export function cutPreviewFor(
   snapPx: number,
 ): CutPreview | null {
   const hit = hitTest(project, rows, view, x, y);
+  if ((hit.kind === 'edge-start' || hit.kind === 'edge-end') && hit.clipId) {
+    if (shift) {
+      const raw = cutSnapPoint(project, x, true, playhead, view, snapPx);
+      return { ...raw, snapped: false, label: cutPreviewLabel(raw.tick, project) };
+    }
+    const clip = project.clips.find((c) => c.id === hit.clipId);
+    if (!clip) return null;
+    const tick = hit.kind === 'edge-start' ? clip.start : clipEnd(clip);
+    return { tick, x: tickToX(tick, view), kind: 'clip', snapped: true, label: cutPreviewLabel(tick, project) };
+  }
   if (hit.kind !== 'clip' || !hit.clipId) return null;
   const cut = cutSnapPoint(project, x, shift, playhead, view, snapPx);
   return { ...cut, snapped: cut.kind !== null, label: cutPreviewLabel(cut.tick, project) };

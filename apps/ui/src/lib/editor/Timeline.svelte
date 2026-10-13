@@ -847,7 +847,11 @@
       if (hit.kind === 'clip' && hit.clipId) {
         // Same snapped tick as the cut preview; Shift on this press disables snapping.
         const cut = cutSnapPoint(current, p.x, e.shiftKey, get(playhead), view, SNAP_PX);
-        void dispatch({ type: 'split_at', time: cut.tick, ids: [hit.clipId] });
+        // A cut at the clip's own start or end would be zero-length (the backend rejects it): no-op.
+        const target = current.clips.find((c) => c.id === hit.clipId);
+        if (target && cut.tick > target.start && cut.tick < clipEnd(target)) {
+          void dispatch({ type: 'split_at', time: cut.tick, ids: [hit.clipId] });
+        }
       }
       return;
     }
