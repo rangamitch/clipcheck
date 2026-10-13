@@ -67,6 +67,8 @@ export interface PreviewStats {
   paintFps: number;
   videoFps: number;
   dropped: number;
+  /** True while the monitor shows the playing <video> element directly (no canvas copy). */
+  direct?: boolean;
 }
 export const previewStats = writable<PreviewStats>({ paintFps: 0, videoFps: 0, dropped: 0 });
 /** Active tool. */

@@ -142,6 +142,8 @@
   let stageEl = $state<HTMLDivElement | undefined>(undefined);
   let frameEl = $state<HTMLDivElement | undefined>(undefined);
   let canvasEl = $state<HTMLCanvasElement | undefined>(undefined);
+  /** Visible container over the canvas for the engine's pooled video elements (direct-video mode). */
+  let directHostEl = $state<HTMLDivElement | undefined>(undefined);
   /** Engine created on mount. Raw so the class instance is not proxied. */
   let engine = $state.raw<PreviewEngine | null>(null);
 
@@ -514,6 +516,8 @@
     if (el === undefined) return;
     const e = createPreviewEngine({ mediaUrl: (id) => editorApi.mediaUrl(id) });
     e.attach(el);
+    // Before any element exists (setProject runs later): elements are created inside the host.
+    e.attachHost(directHostEl ?? null);
     const unsubs = [
       e.onTime((t) => {
         lastEngineTick = t;
@@ -566,6 +570,7 @@
       if (overrideClipId !== null) e.setTransformOverride(overrideClipId, null);
       overrideClipId = null;
       engine = null;
+      e.attachHost(null);
       e.destroy();
     };
   });
@@ -678,9 +683,10 @@
       onpointercancel={endDrag}
     >
       <canvas bind:this={canvasEl} class="picture" aria-label="Program picture"></canvas>
+      <div class="direct-host" bind:this={directHostEl} aria-hidden="true"></div>
       {#if $playing}
         <div class="perf-stats" aria-hidden="true">
-          paint {$previewStats.paintFps} fps  video {$previewStats.videoFps} fps  dropped {$previewStats.dropped}
+          paint {$previewStats.paintFps} fps  video {$previewStats.videoFps} fps  dropped {$previewStats.dropped}{$previewStats.direct ? '  direct' : ''}
         </div>
       {/if}
 
@@ -918,6 +924,14 @@
     width: 100%;
     height: 100%;
     background: #000;
+  }
+
+  .direct-host {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    pointer-events: none;
+    background: transparent;
   }
 
   .guides {

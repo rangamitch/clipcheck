@@ -34,7 +34,8 @@ import { createClock } from './clock';
 import { AudioGraph } from './audioGraph';
 import { gainRamp, segmentAt, sourceTimeFor, upcoming, upcomingStreams, type GainPoint } from './scheduler';
 import { editorApi } from '../api';
-import { composeFrame, type SourceFrames } from './compose';
+import { composeFrame, directLayout, type SourceFrames } from './compose';
+import { shouldEnterDirect, shouldLeaveDirect, type DirectState } from './direct';
 import { previewStats } from '../store';
 
 /** Preview resolution as a fraction of the project canvas. */
@@ -80,6 +81,13 @@ export interface PreviewEngine {
    */
   setTransformOverride(clipId: string, transform: Transform | null): void;
   /**
+   * Gives the engine the visible container (inside the monitor, over the canvas) for its pooled
+   * <video> elements, or null to go back to the hidden body host. Call it BEFORE setProject so every
+   * element is created inside it: only paused elements are moved later, because moving a playing
+   * element in the DOM pauses it (those stay where they are until recreated).
+   */
+  attachHost(host: HTMLElement | null): void;
+  /**
    * Marks the start (true) or end (false) of a playhead drag. While scrubbing, playback is held
    * (resumed at the end when it was running), only the picture follows (fast keyframe seeks), and
    * the exact frame is shown when scrubbing stops.
@@ -100,6 +108,12 @@ export interface PreviewEngineOptions {
  * streams (the lanes using streams 1..6 are then silent).
  */
 const MULTI_STREAM_AUDIO = true;
+/**
+ * Kill switch for direct-video mode: when a segment is one plain video layer, the playing <video>
+ * element itself is shown (visible, unoccluded) instead of being copied to the canvas, because
+ * Chromium starves frame delivery of a hidden element. False always paints through the canvas.
+ */
+const DIRECT_VIDEO = true;
 /** Quiet time after the last seek of a paused playhead before the exact frame is seeked (ms). */
 const SCRUB_SETTLE_MS = 120;
 /** Minimum gap between positioning passes of the audio-stream elements while playing (ms). */
@@ -316,11 +330,28 @@ function mediaHost(): HTMLElement | null {
   return host;
 }
 
-/** Attaches a media element to the host and sizes it 1x1 (never 0x0). */
-function hostElement(el: HTMLMediaElement): void {
+/** Style of a pooled element inside the visible direct host: on top, in the viewport, almost invisible. */
+const IDLE_HOST_STYLE =
+  'position:absolute;left:0;top:0;width:2px;height:2px;opacity:0.01;pointer-events:none;object-fit:contain;';
+
+/** Style of the element shown directly: it fills the host, which has the project background. */
+function directStyle(fit: 'contain' | 'cover' | 'fill'): string {
+  return `position:absolute;inset:0;width:100%;height:100%;opacity:1;pointer-events:none;object-fit:${fit};background:transparent;`;
+}
+
+/**
+ * Attaches a media element to `host` (the visible direct host) or, without one, to the hidden body
+ * host, and sizes it (never 0x0). Moves the element, so it must not be playing.
+ */
+function hostElement(el: HTMLMediaElement, host: HTMLElement | null): void {
   try {
-    el.style.cssText = 'width:1px;height:1px;';
-    mediaHost()?.appendChild(el);
+    if (host) {
+      el.style.cssText = IDLE_HOST_STYLE;
+      host.appendChild(el);
+    } else {
+      el.style.cssText = 'width:1px;height:1px;';
+      mediaHost()?.appendChild(el);
+    }
   } catch {
     // Playback still works detached, only slower.
   }
@@ -401,6 +432,13 @@ class Engine implements PreviewEngine {
   private readonly streamNeeds = new Map<string, StreamNeed>();
   /** Paint skipping: true when something other than a video frame changed since the last paint. */
   private paintDirty = true;
+  /** Visible container for the pooled video elements (attachHost), or null for the hidden body host. */
+  private hostEl: HTMLElement | null = null;
+  /** The element currently shown directly (restyled in place), or null. */
+  private directEntry: ElementEntry | null = null;
+  /** Segment for which `directArmFrames` was recorded (null: re-arm on next evaluation). */
+  private directArmSeg: PlanSegment | null = null;
+  private directArmFrames = 0;
   private lastPaintSeg: PlanSegment | null = null;
   private lastPaintFrames = -1;
   private lastResumeMs = 0;
@@ -482,6 +520,7 @@ class Engine implements PreviewEngine {
 
   attach(canvas: HTMLCanvasElement): void {
     if (this.destroyed) return;
+    this.leaveDirect(true);
     this.canvas = canvas;
     const ctx = canvas.getContext('2d', { alpha: false }) as CanvasRenderingContext2D | null;
     if (!ctx) {
@@ -496,6 +535,8 @@ class Engine implements PreviewEngine {
 
   setProject(project: Project, plan: RenderPlan): void {
     if (this.destroyed) return;
+    this.leaveDirect(true);
+    this.directArmSeg = null;
     this.project = project;
     this.plan = plan;
     this.syncMediaKeys(project);
@@ -518,6 +559,8 @@ class Engine implements PreviewEngine {
     const plan = this.plan;
     if (!plan) return;
     const target = clampTo(plan, t);
+    this.directArmSeg = null;
+    this.leaveDirect(true);
     this.setClockPosition(target);
     this.prefetched.clear();
     this.prefetchedStreams.clear();
@@ -620,6 +663,8 @@ class Engine implements PreviewEngine {
     if (this.destroyed) return;
     const plan = this.plan;
     if (!plan) return;
+    this.directArmSeg = null;
+    this.leaveDirect(true);
     this.rate = signedRate(rate);
     this.resumeAudio();
     if (this.clock.isRunning()) {
@@ -678,6 +723,7 @@ class Engine implements PreviewEngine {
 
   setQuality(q: PreviewQuality): void {
     if (this.destroyed) return;
+    this.leaveDirect(true);
     this.quality = q;
     this.applyCanvasSize();
     this.scheduleRedraw();
@@ -722,7 +768,19 @@ class Engine implements PreviewEngine {
     if (this.destroyed) return;
     if (transform === null) this.overrides.delete(clipId);
     else this.overrides.set(clipId, transform);
+    this.leaveDirect(true);
     this.scheduleRedraw();
+  }
+
+  attachHost(host: HTMLElement | null): void {
+    if (this.destroyed || host === this.hostEl) return;
+    this.leaveDirect(true);
+    this.hostEl = host;
+    // A playing element stays where it is (moving it would pause it); it moves when recreated.
+    for (const entry of this.elements.values()) {
+      if (!entry.el.paused) continue;
+      hostElement(entry.el, host);
+    }
   }
 
   destroy(): void {
@@ -768,6 +826,8 @@ class Engine implements PreviewEngine {
     this.errorCbs.clear();
     this.endedCbs.clear();
     this.droppedCbs.clear();
+    this.directEntry = null;
+    this.hostEl = null;
     this.canvas = null;
     this.ctx2d = null;
     this.project = null;
@@ -809,6 +869,7 @@ class Engine implements PreviewEngine {
   /** Stops the clock, the frame loop, the elements and the audio. Returns the stop tick. */
   private stopPlayback(): Tick {
     const t = this.clock.stop();
+    this.leaveDirect(true);
     if (this.rafId !== null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
@@ -888,7 +949,15 @@ class Engine implements PreviewEngine {
         }
       }
       if (paint) {
-        if (seg && !this.needsPaint(seg, now)) {
+        let skip = false;
+        if (this.directEntry !== null) {
+          if (seg && this.directStillAllowed(seg, t)) skip = true;
+          else this.leaveDirect(true);
+        }
+        if (skip) {
+          // The element itself is on screen: nothing to copy to the canvas.
+          this.countFrame(false, now);
+        } else if (seg && !this.needsPaint(seg, now)) {
           this.countFrame(false, now);
         } else {
           this.frameMissed = false;
@@ -898,6 +967,7 @@ class Engine implements PreviewEngine {
           this.lastPaintSeg = seg;
           this.lastPaintFrames = this.frameTotal();
           this.statsPaints++;
+          if (seg) this.maybeEnterDirect(seg, t);
           // Keep painting every tick until all sources have a frame.
           if (this.frameMissed) this.paintDirty = true;
           this.countFrame(this.frameMissed || performance.now() - started > DROP_STEP_MS, now);
@@ -1028,6 +1098,119 @@ class Engine implements PreviewEngine {
     if (canvas.height !== h) canvas.height = h;
   }
 
+  // ---- direct-video mode ---------------------------------------------------------------------
+
+  /**
+   * The only layer of `seg` and its pooled element when composeFrame would draw it as a plain fit,
+   * fill or stretch of the whole source (see directLayout), else null. Requires the visible host.
+   */
+  private directCandidate(seg: PlanSegment, t: Tick): { entry: ElementEntry; fit: 'contain' | 'cover' | 'fill' } | null {
+    const project = this.project;
+    if (!DIRECT_VIDEO || !this.hostEl || !project || !this.hasFrameCallback) return null;
+    if (seg.video.length !== 1) return null;
+    const layer = seg.video[0];
+    if (!layer || layer.kind !== 'video' || layer.media_id === null) return null;
+    if (layer.reverse || !(layer.speed > 0)) return null;
+    const entry = this.elements.get(layer.media_id);
+    if (!entry || !entry.hasSrc || entry.el.parentElement !== this.hostEl) return null;
+    const lay = directLayout(layer, project.canvas.width, project.canvas.height, entry.el.videoWidth, entry.el.videoHeight, {
+      t,
+      blurBackground: project.canvas.blur_background,
+      failed: this.failed.has(layer.media_id),
+    });
+    return lay ? { entry, fit: lay.fit } : null;
+  }
+
+  private directState(entry: ElementEntry | null, eligible: boolean, canvasPainted: boolean): DirectState {
+    const el = entry?.el;
+    return {
+      enabled: DIRECT_VIDEO && this.hostEl !== null,
+      playing: this.clock.isRunning(),
+      rate: this.rate,
+      scrubbing: this.scrubbing,
+      override: this.overrides.size > 0,
+      eligible,
+      failed: entry ? this.failed.has(entry.mediaId) : false,
+      elementPlaying: el ? !el.paused && !el.ended : false,
+      readyState: el ? el.readyState : 0,
+      seeking: el ? el.seeking : false,
+      framesSinceArm: entry ? entry.frameSeq - this.directArmFrames : 0,
+      canvasPainted,
+    };
+  }
+
+  /** True when the element that is shown directly may stay on screen for this tick. */
+  private directStillAllowed(seg: PlanSegment, t: Tick): boolean {
+    const entry = this.directEntry;
+    if (!entry) return false;
+    const cand = this.directCandidate(seg, t);
+    if (!cand || cand.entry !== entry) return false;
+    return !shouldLeaveDirect(this.directState(entry, true, true));
+  }
+
+  /** After a canvas paint: shows the element directly once it is eligible and has presented a frame. */
+  private maybeEnterDirect(seg: PlanSegment, t: Tick): void {
+    if (this.directEntry !== null) return;
+    const cand = this.directCandidate(seg, t);
+    if (!cand) {
+      this.directArmSeg = null;
+      return;
+    }
+    if (this.directArmSeg !== seg) {
+      this.directArmSeg = seg;
+      this.directArmFrames = cand.entry.frameSeq;
+    }
+    if (!shouldEnterDirect(this.directState(cand.entry, true, !this.frameMissed))) return;
+    this.enterDirect(cand.entry, cand.fit);
+  }
+
+  /** Restyles the element in place (never re-parented: that would pause it) and shows the host background. */
+  private enterDirect(entry: ElementEntry, fit: 'contain' | 'cover' | 'fill'): void {
+    const project = this.project;
+    const host = this.hostEl;
+    if (!project || !host) return;
+    try {
+      host.style.background = cssColor(project.canvas.background);
+      entry.el.style.cssText = directStyle(fit);
+    } catch {
+      return;
+    }
+    this.directEntry = entry;
+    previewStats.update((s) => ({ ...s, direct: true }));
+  }
+
+  /**
+   * Leaves direct mode. With `paint`, the canvas first gets a normal frame at the playhead, then
+   * the element returns to its idle style, in the same task (no flash of a stale canvas).
+   */
+  private leaveDirect(paint: boolean): void {
+    const entry = this.directEntry;
+    if (entry === null) return;
+    this.directEntry = null;
+    this.paintDirty = true;
+    if (paint && !this.destroyed) {
+      try {
+        const plan = this.plan;
+        if (plan && this.ctx2d) {
+          const now = this.clock.now();
+          const at = now >= plan.end && plan.end > plan.start ? plan.end - 1 : now;
+          const seg = segmentAt(plan, at);
+          if (seg) this.paintSegment(seg, at);
+          else this.paintBlank();
+        }
+      } catch {
+        // The canvas keeps its last frame; the next paint redraws.
+      }
+    }
+    try {
+      if (this.hostEl) this.hostEl.style.background = '';
+      if (this.hostEl && entry.el.parentElement === this.hostEl) entry.el.style.cssText = IDLE_HOST_STYLE;
+    } catch {
+      // The element may be gone already.
+    }
+    previewStats.update((s) => ({ ...s, direct: false }));
+  }
+
   private paintSegment(seg: PlanSegment, t: Tick): void {
     const ctx = this.ctx2d;
     const project = this.project;
@@ -1146,7 +1329,7 @@ class Engine implements PreviewEngine {
     el.preservesPitch = false;
     // Media comes from another origin. Web Audio needs CORS or the source is silent.
     el.crossOrigin = 'anonymous';
-    hostElement(el);
+    hostElement(el, this.hostEl);
     const entry: ElementEntry = {
       mediaId,
       el,
@@ -1250,6 +1433,7 @@ class Engine implements PreviewEngine {
 
   private disposeEntry(entry: PlayEntry): void {
     const el = entry.el;
+    if (this.directEntry === entry) this.leaveDirect(false);
     el.onseeked = null;
     el.onloadeddata = null;
     el.onloadedmetadata = null;
@@ -1391,6 +1575,7 @@ class Engine implements PreviewEngine {
     if (this.destroyed || this.failed.has(mediaId)) return;
     const reason = typeof err === 'string' ? err : messageOf(err);
     this.failed.set(mediaId, reason);
+    if (this.directEntry?.mediaId === mediaId) this.leaveDirect(true);
     this.releaseMedia(mediaId);
     const name = this.project?.media.find((m) => m.id === mediaId)?.name ?? mediaId;
     this.emitError(`Media "${name}" is unavailable: ${reason}`);
@@ -1895,6 +2080,7 @@ class Engine implements PreviewEngine {
       paintFps: Math.round(this.statsPaints / secs),
       videoFps: Math.round(videoFps),
       dropped,
+      direct: this.directEntry !== null,
     });
     this.statsStartMs = now;
     this.statsPaints = 0;

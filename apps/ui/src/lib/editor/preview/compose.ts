@@ -8,7 +8,7 @@
 
 import type { PlanSegment, Project, Rgba, TextSpec, Tick, Transform, VideoLayer } from '../types';
 import { defaultTransform } from '../types';
-import { dipAmount, layerOpacityAt } from './scheduler';
+import { dipAmount, layerOpacityAt, transitionProgress } from './scheduler';
 
 /** Source frames for media layers. A null return means the frame is not ready yet. */
 export interface SourceFrames {
@@ -275,6 +275,63 @@ export function hitLayerAt(
     }
   }
   return null;
+}
+
+/** How a direct <video> element must be fitted so it looks like the canvas painting. */
+export interface DirectLayout {
+  fit: 'contain' | 'cover' | 'fill';
+}
+
+/** Inputs of {@link directLayout} that are not part of the layer. */
+export interface DirectLayoutOptions {
+  /** Timeline time, to tell whether a transition is active. */
+  t: Tick;
+  /** The project paints a blurred backdrop behind fit-mode clips. */
+  blurBackground: boolean;
+  /** The media failed to load (such a layer is painted as black). */
+  failed: boolean;
+}
+
+/** Relative aspect difference below which the source is treated as filling the canvas. */
+const DIRECT_ASPECT_EPS = 0.002;
+
+/**
+ * Whether composeFrame would draw `layer` as a plain fit, fill or stretch of the whole source into
+ * the canvas with an identity transform, so a visible <video> element can show it instead. Returns
+ * the matching CSS object-fit, or null when the layer needs the canvas: not a video clip, failed
+ * media, opacity below 1, an active transition or dip, rotation, flip, crop, a custom placement
+ * (other than scale 1 at the centre, which equals fit), or a blurred backdrop that would show in
+ * the letterbox bars. `canvasW`/`canvasH` are the project canvas (only the aspect matters).
+ */
+export function directLayout(
+  layer: VideoLayer,
+  canvasW: number,
+  canvasH: number,
+  srcW: number,
+  srcH: number,
+  opts: DirectLayoutOptions,
+): DirectLayout | null {
+  if (layer.kind !== 'video' || layer.media_id === null || opts.failed) return null;
+  if (!(Number.isFinite(canvasW) && Number.isFinite(canvasH) && canvasW > 0 && canvasH > 0)) return null;
+  if (!(Number.isFinite(srcW) && Number.isFinite(srcH) && srcW > 0 && srcH > 0)) return null;
+  if (!(Number.isFinite(layer.opacity) && layer.opacity >= 1)) return null;
+  if (transitionProgress(layer, opts.t) !== null) return null;
+  const tr = layer.transform;
+  if (quarterTurns(tr.rotate_90) !== 0 || tr.flip_h || tr.flip_v) return null;
+  if (frac(tr.crop.left) > 0 || frac(tr.crop.right) > 0 || frac(tr.crop.top) > 0 || frac(tr.crop.bottom) > 0) {
+    return null;
+  }
+  let fit: DirectLayout['fit'];
+  if (tr.fit === 'fit') fit = 'contain';
+  else if (tr.fit === 'fill') fit = 'cover';
+  else if (tr.fit === 'stretch') fit = 'fill';
+  else if (tr.scale === 1 && finiteOr(tr.pos_x, 1) === 0 && finiteOr(tr.pos_y, 1) === 0) fit = 'contain';
+  else return null;
+  if (fit === 'contain' && opts.blurBackground && tr.fit === 'fit') {
+    const bars = Math.abs(srcW / srcH / (canvasW / canvasH) - 1) > DIRECT_ASPECT_EPS;
+    if (bars) return null;
+  }
+  return { fit };
 }
 
 /** Creates a scratch canvas of the same document as the target. Null when there is no document. */
