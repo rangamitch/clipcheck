@@ -21,6 +21,7 @@ import type {
   MediaRef,
   MediaStatus,
   Preset,
+  CacheInfo,
   ProjectSummary,
   RenderPlan,
   SnapPointDto,
@@ -272,6 +273,21 @@ export const editorApi = {
   /** Saves editor settings and returns the normalised result. */
   setSettings(settings: EditorSettings): Promise<EditorSettings> {
     return invoke<EditorSettings>('editor_set_settings', { settings });
+  },
+
+  /** All export presets: the built-in ones, then the user's own. Same shape as `exportDefaults().presets`. */
+  listPresets(): Promise<Preset[]> {
+    return invoke<Preset[]>('editor_list_presets');
+  },
+
+  /** Size of the editor cache folder by kind, in bytes. */
+  cacheInfo(): Promise<CacheInfo> {
+    return invoke<CacheInfo>('editor_cache_info');
+  },
+
+  /** Deletes the editor cache files and returns the size left afterwards. */
+  clearCache(): Promise<CacheInfo> {
+    return invoke<CacheInfo>('editor_clear_cache');
   },
 };
 

@@ -42,7 +42,8 @@ pub struct EditorSettings {
     pub cache_dir: String,
     /// Cache size limit in GB (1..=100).
     pub cache_max_gb: u32,
-    /// Decoder cache budget in MB (128..=4096).
+    /// Reserved: no effect. Kept so existing settings files still load; the decoder has no
+    /// budget that reads this value.
     pub decode_cache_mb: u32,
     /// Default export preset id.
     pub default_preset: String,
@@ -60,7 +61,8 @@ pub struct EditorSettings {
     pub always_ask_location: bool,
     /// Last export folder chosen in the dialog ("" = configured default).
     pub last_export_dir: String,
-    /// Keep exports and project media out of auto-delete.
+    /// Reserved: no effect. Cache cleanup never deletes exports or project media, so this flag
+    /// is not read. Kept for serde compatibility.
     pub protect_exports_from_quota: bool,
     /// User presets.
     pub custom_presets: Vec<Preset>,

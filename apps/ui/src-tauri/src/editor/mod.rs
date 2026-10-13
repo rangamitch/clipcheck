@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use clipcheck_timeline::cmd::Session;
 use serde::{Deserialize, Serialize};
 
+pub mod cache;
 pub mod dialogs;
 pub mod export;
 pub mod media;

@@ -19,6 +19,7 @@ use clipcheck_timeline::model::{new_id, Canvas, EditModes, MediaRef, Project};
 use clipcheck_timeline::ops_basic::PlaceMode;
 use clipcheck_timeline::time::{Rate, Tick};
 
+use super::cache;
 use super::media::editor_media_from_recording;
 use super::settings::{self, EditorSettings};
 use super::{paths, session_cmds, EditorSnapshot, EditorState};
@@ -304,6 +305,7 @@ fn open_file(
     }
     let snapshot = session_cmds::snapshot_of(&session);
     *lock_session(state)? = Some(session);
+    cache::schedule_limit_check(&state.exports);
     Ok(snapshot)
 }
 
@@ -487,6 +489,7 @@ pub async fn editor_new_project(
     let snapshot = session_cmds::snapshot_of(&session);
     mediaserver::clear_imports();
     *lock_session(&state)? = Some(session);
+    cache::schedule_limit_check(&state.exports);
     Ok(snapshot)
 }
 

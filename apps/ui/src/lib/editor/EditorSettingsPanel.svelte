@@ -1,26 +1,28 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { editorApi } from './api';
-  import type { EditorSettings } from './types';
+  import { editorApi, type EncoderInfo } from './api';
+  import type { CacheInfo, EditorSettings, Preset } from './types';
+  import { encoderOptionsFor } from './exportEncoders';
+  import { formatBytes } from '../format';
   import { pickFolder } from '../recordingActions';
 
   /** Wait this long after the last change before saving, in milliseconds. */
   const SAVE_DEBOUNCE_MS = 400;
+  /** How long the Clear cache button waits for a second click, in milliseconds. */
+  const CLEAR_CONFIRM_MS = 4000;
 
-  /** Built-in export presets (ids from crates/timeline). */
-  const BUILTIN_PRESETS: readonly { value: string; label: string }[] = [
+  /** One dropdown entry for an export preset. */
+  interface PresetOption {
+    value: string;
+    label: string;
+  }
+
+  /** Used only when the backend preset list cannot be loaded (ids from crates/timeline). */
+  const FALLBACK_PRESETS: readonly PresetOption[] = [
     { value: 'original_quality', label: 'Original quality' },
     { value: 'high_1080p60', label: 'High 1080p60' },
     { value: 'balanced_1080p30', label: 'Balanced 1080p30' },
-    { value: 'res_1440p', label: '1440p' },
-    { value: 'res_4k', label: '4K' },
     { value: 'small_720p30', label: 'Small 720p30' },
-    { value: 'discord_10mb', label: 'Discord 10 MB' },
-    { value: 'discord_50mb', label: 'Discord 50 MB' },
-    { value: 'discord_500mb', label: 'Discord 500 MB' },
-    { value: 'youtube', label: 'YouTube' },
-    { value: 'vertical_1080x1920', label: 'Vertical 1080x1920' },
-    { value: 'twitter_x', label: 'X (Twitter)' },
   ];
 
   const CANVAS_OPTIONS: readonly { value: string; label: string }[] = [
@@ -50,10 +52,25 @@
   /** True while a change waits for the debounce timer or for the running save to finish. */
   let pending = $state(false);
 
+  /** Preset list from `editor_list_presets`, built-in first. Null until loaded or when loading failed. */
+  let presetList = $state<PresetOption[] | null>(null);
+  /** Shown when the preset list could not be loaded and the short fallback list is used. */
+  let presetsNote = $state<string | null>(null);
+  /** Encoders from `editor_list_encoders`. Null until loaded or when loading failed. */
+  let encoderList = $state<EncoderInfo[] | null>(null);
+  /** Cache size by kind from the backend. Null until the first read succeeds. */
+  let cacheInfo = $state<CacheInfo | null>(null);
+  let cacheError = $state<string | null>(null);
+  /** True while a clear-cache request is in flight. */
+  let cacheBusy = $state(false);
+  /** True after the first Clear cache click, for the length of CLEAR_CONFIRM_MS. */
+  let confirmingClear = $state(false);
+  let confirmTimer: ReturnType<typeof setTimeout> | null = null;
+
   let timer: ReturnType<typeof setTimeout> | null = null;
 
   /** Text boxes whose saved value may be normalised by the backend. */
-  const TEXT_KEYS = ['cacheDir', 'encoder', 'filenameTemplate'] as const;
+  const TEXT_KEYS = ['cacheDir', 'filenameTemplate'] as const;
   type TextKey = (typeof TEXT_KEYS)[number];
   /** The text box the user is typing in, or null. */
   let editingKey = $state<TextKey | null>(null);
@@ -64,11 +81,36 @@
     return e instanceof Error ? e.message : String(e);
   }
 
-  /** Presets offered in the export preset list: the built-in ones, then the user's own. */
-  const presetOptions = $derived.by(() => {
-    const custom = (draft?.customPresets ?? []).map((p) => ({ value: p.id, label: p.label }));
-    return [...BUILTIN_PRESETS, ...custom];
+  /**
+   * Presets offered in the export preset list: the backend list (built-in, then the user's own).
+   * Without it, the fallback list plus the user's presets from settings. A stored id that is in
+   * neither is kept as an extra entry so the select still shows the saved value.
+   */
+  const presetOptions = $derived.by((): PresetOption[] => {
+    const base: PresetOption[] = presetList ?? [
+      ...FALLBACK_PRESETS,
+      ...(draft?.customPresets ?? []).map((p) => ({ value: p.id, label: p.label })),
+    ];
+    const stored = draft?.defaultPreset;
+    if (stored === undefined || base.some((o) => o.value === stored)) return base;
+    return [...base, { value: stored, label: `${stored} (not found)` }];
   });
+
+  /** Encoder dropdown entries: Auto, the real encoders by GPU name, and Software (CPU). */
+  const encoderOptions = $derived(encoderOptionsFor(encoderList, draft?.encoder));
+
+  /** One line describing cache use, e.g. "Using 1.5 GB of 10 GB (thumbnails ..., waveforms ..., audio ...)". */
+  const cacheUsageText = $derived.by((): string => {
+    if (cacheInfo === null) return cacheError === null ? 'Checking cache size…' : '';
+    const info = cacheInfo;
+    const limit = draft?.cacheMaxGb ?? 0;
+    return `Using ${formatBytes(info.totalBytes)} of ${limit} GB (thumbnails ${formatBytes(info.thumbsBytes)}, waveforms ${formatBytes(info.peaksBytes)}, audio ${formatBytes(info.audioBytes)})`;
+  });
+
+  /** Clear cache button label: idle, first click (confirm), or running. */
+  const clearLabel = $derived(
+    cacheBusy ? 'Clearing…' : confirmingClear ? 'Click again to clear' : 'Clear cache',
+  );
 
   /** Status line text. Errors win, then pending or saving work, then the saved note. */
   const statusText = $derived.by(() => {
@@ -178,7 +220,7 @@
   }
 
   /** Number boxes apply on commit (Enter or leaving the box), so partial typing is not clamped. */
-  function onNumber(key: 'autosaveS' | 'cacheMaxGb' | 'decodeCacheMb', min: number, max: number) {
+  function onNumber(key: 'autosaveS' | 'cacheMaxGb', min: number, max: number) {
     return (e: Event) => {
       const value = numberOf(e);
       if (value === null) {
@@ -201,11 +243,84 @@
     }
   }
 
+  /** Reads the export preset list. A failure keeps the fallback list and shows a note. */
+  async function loadPresets(): Promise<void> {
+    try {
+      const all = await editorApi.listPresets();
+      const toOption = (p: Preset): PresetOption => ({ value: p.id, label: p.label });
+      presetList = [
+        ...all.filter((p) => p.builtin).map(toOption),
+        ...all.filter((p) => !p.builtin).map(toOption),
+      ];
+      presetsNote = null;
+    } catch (e) {
+      presetList = null;
+      presetsNote = `Could not load the full preset list: ${messageOf(e)}`;
+    }
+  }
+
+  /** Reads the encoder list. A failure leaves only Auto and Software offered. */
+  async function loadEncoders(): Promise<void> {
+    try {
+      encoderList = await editorApi.listEncoders('h264');
+    } catch {
+      encoderList = null;
+    }
+  }
+
+  /** Reads the cache size. */
+  async function loadCache(): Promise<void> {
+    try {
+      cacheInfo = await editorApi.cacheInfo();
+      cacheError = null;
+    } catch (e) {
+      cacheError = `Could not read the cache size: ${messageOf(e)}`;
+    }
+  }
+
+  /** Stops the inline confirmation of Clear cache. */
+  function cancelClearConfirm(): void {
+    confirmingClear = false;
+    if (confirmTimer !== null) {
+      clearTimeout(confirmTimer);
+      confirmTimer = null;
+    }
+  }
+
+  /** First click asks for a second click within CLEAR_CONFIRM_MS; the second click clears. */
+  function onClearClick(): void {
+    if (cacheBusy) return;
+    if (!confirmingClear) {
+      confirmingClear = true;
+      confirmTimer = setTimeout(cancelClearConfirm, CLEAR_CONFIRM_MS);
+      return;
+    }
+    void clearCache();
+  }
+
+  /** Deletes the cache files and shows what is left. */
+  async function clearCache(): Promise<void> {
+    cancelClearConfirm();
+    cacheBusy = true;
+    cacheError = null;
+    try {
+      cacheInfo = await editorApi.clearCache();
+    } catch (e) {
+      cacheError = `Could not clear the cache: ${messageOf(e)}`;
+    } finally {
+      cacheBusy = false;
+    }
+  }
+
   onMount(() => {
     void load();
+    void loadPresets();
+    void loadEncoders();
+    void loadCache();
   });
 
   onDestroy(() => {
+    cancelClearConfirm();
     // Leaving the page saves a change that is still waiting for the debounce.
     if (timer !== null) {
       clearTimeout(timer);
@@ -216,7 +331,10 @@
 </script>
 
 <h2>Video editor</h2>
-<p class="intro dim">Autosave, defaults for new projects, cache, and export options.</p>
+<p class="intro dim">
+  Projects: new-project defaults. Cache: thumbnails, waveforms and audio files. Export: defaults for
+  the Export dialog (resolution, fps and quality are chosen per export).
+</p>
 
 {#if loadError !== null}
   <p class="message" role="alert">Could not load video editor settings: {loadError}</p>
@@ -287,7 +405,10 @@
 
     <div class="field">
       <label class="label" for="ve-preview">Preview quality</label>
-      <p class="help">Lower quality plays more smoothly on slow computers.</p>
+      <p class="help">
+        Starting quality of the preview when a project opens. Lower quality plays more smoothly on
+        slow computers. The monitor's own Quality menu still changes it.
+      </p>
       <div class="control">
         <select
           id="ve-preview"
@@ -299,7 +420,6 @@
           {/each}
         </select>
       </div>
-      <p class="note dim">Takes effect in a later version.</p>
     </div>
   </section>
 
@@ -333,7 +453,9 @@
 
     <div class="field">
       <label class="label" for="ve-cache-max">Cache size limit</label>
-      <p class="help">Older cache files are removed when the cache grows past this size (1 to 100 GB).</p>
+      <p class="help" id="ve-cache-max-help">
+        Oldest cached thumbnails, waveforms and audio are removed when the cache goes over this limit.
+      </p>
       <div class="control">
         <input
           id="ve-cache-max"
@@ -341,30 +463,32 @@
           min="1"
           max="100"
           step="1"
+          aria-describedby="ve-cache-max-help"
           value={d.cacheMaxGb}
           onchange={onNumber('cacheMaxGb', 1, 100)}
         />
-        <span class="unit">GB</span>
+        <span class="unit">GB (1 to 100)</span>
       </div>
-      <p class="note dim">Takes effect in a later version.</p>
     </div>
 
     <div class="field">
-      <label class="label" for="ve-decode-cache">Decoder cache</label>
-      <p class="help">Memory used to keep decoded frames for smooth scrubbing (128 to 4096 MB).</p>
+      <span class="label">Cache usage</span>
+      <p class="help" role="status" aria-live="polite">{cacheUsageText}</p>
       <div class="control">
-        <input
-          id="ve-decode-cache"
-          type="number"
-          min="128"
-          max="4096"
-          step="64"
-          value={d.decodeCacheMb}
-          onchange={onNumber('decodeCacheMb', 128, 4096)}
-        />
-        <span class="unit">MB</span>
+        <button
+          type="button"
+          class="action"
+          disabled={cacheBusy}
+          aria-describedby="ve-cache-usage-note"
+          onclick={onClearClick}
+        >
+          {clearLabel}
+        </button>
       </div>
-      <p class="note dim">Takes effect in a later version.</p>
+      <p class="help" id="ve-cache-usage-note">Clearing deletes the cached thumbnails, waveforms and audio files.</p>
+      {#if cacheError !== null}
+        <p class="message" role="alert">{cacheError}</p>
+      {/if}
     </div>
   </section>
 
@@ -385,31 +509,25 @@
           {/each}
         </select>
       </div>
+      {#if presetsNote !== null}
+        <p class="note dim">{presetsNote}</p>
+      {/if}
     </div>
 
     <div class="field">
       <label class="label" for="ve-encoder">Default encoder</label>
-      <p class="help" id="ve-encoder-help">
-        auto picks a hardware encoder when one is available. software uses the CPU. You can also type
-        an encoder name.
-      </p>
+      <p class="help" id="ve-encoder-help">Auto uses the GPU with the most video memory.</p>
       <div class="control">
-        <input
+        <select
           id="ve-encoder"
-          type="text"
-          list="ve-encoder-list"
-          spellcheck="false"
-          autocomplete="off"
           aria-describedby="ve-encoder-help"
           value={d.encoder}
-          onfocus={() => onTextFocus('encoder')}
-          onblur={() => onTextBlur('encoder')}
-          oninput={(e) => setField('encoder', textOf(e))}
-        />
-        <datalist id="ve-encoder-list">
-          <option value="auto"></option>
-          <option value="software"></option>
-        </datalist>
+          onchange={(e) => setField('encoder', textOf(e))}
+        >
+          {#each encoderOptions as opt (opt.value)}
+            <option value={opt.value}>{opt.label}</option>
+          {/each}
+        </select>
       </div>
     </div>
 
@@ -613,6 +731,12 @@
   .action:hover,
   .retry:hover {
     border-color: var(--accent);
+  }
+
+  .action:disabled {
+    opacity: 0.6;
+    cursor: default;
+    border-color: var(--border);
   }
 
   .retry {

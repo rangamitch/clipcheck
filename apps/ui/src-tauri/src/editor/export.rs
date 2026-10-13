@@ -1359,6 +1359,15 @@ pub fn editor_export_pause_override(
     Ok(())
 }
 
+/// Built-in presets followed by the user's custom presets. Needs no open project.
+#[tauri::command]
+pub fn editor_list_presets() -> Vec<Preset> {
+    let ed = settings::load(&settings::settings_path());
+    let mut presets = builtin_presets();
+    presets.extend(ed.custom_presets);
+    presets
+}
+
 /// Current queue.
 #[tauri::command]
 pub fn editor_export_queue(state: State<'_, EditorState>) -> Result<Vec<JobDto>, String> {

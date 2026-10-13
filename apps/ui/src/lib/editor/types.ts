@@ -568,6 +568,15 @@ export interface EstimateReply {
   outPath: string;
 }
 
+/** Editor cache usage (`editor_cache_info` / `editor_clear_cache`, camelCase DTO). Sizes in bytes. */
+export interface CacheInfo {
+  dir: string;
+  thumbsBytes: number;
+  peaksBytes: number;
+  audioBytes: number;
+  totalBytes: number;
+}
+
 /** User settings for the editor and exports (`EditorSettings` in Rust, decision D72). */
 export interface EditorSettings {
   /** Autosave interval in seconds (10..=600). */

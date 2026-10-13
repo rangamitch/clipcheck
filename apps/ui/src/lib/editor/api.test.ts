@@ -80,6 +80,9 @@ const rows: Row[] = [
   ['deletePreset', () => editorApi.deletePreset('p'), 'editor_delete_preset', { id: 'p' }],
   ['getSettings', () => editorApi.getSettings(), 'editor_get_settings'],
   ['setSettings', () => editorApi.setSettings(editorSettings), 'editor_set_settings', { settings: editorSettings }],
+  ['listPresets', () => editorApi.listPresets(), 'editor_list_presets'],
+  ['cacheInfo', () => editorApi.cacheInfo(), 'editor_cache_info'],
+  ['clearCache', () => editorApi.clearCache(), 'editor_clear_cache'],
 ];
 
 beforeEach(() => {
@@ -129,7 +132,7 @@ describe('editorApi command names and arguments', () => {
   it('the table covers every method of editorApi', () => {
     const covered = new Set(rows.map((r) => r[0]));
     const methods = Object.keys(editorApi).sort();
-    expect(methods.length).toBe(43);
+    expect(methods.length).toBe(46);
     expect(methods.every((m) => covered.has(m))).toBe(true);
   });
 });

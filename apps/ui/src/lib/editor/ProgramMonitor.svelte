@@ -151,6 +151,8 @@
   let volume = $state(initialAudio.volume);
   let muted = $state(initialAudio.muted);
   let quality = $state<Quality>('auto');
+  /** True once the user picks a quality in this monitor, so the saved starting quality no longer applies. */
+  let qualityTouched = false;
   /** Level auto quality currently uses. Only steps down within the session. */
   let autoLevel = $state<AutoLevel>('full');
   let showGuides = $state(false);
@@ -546,6 +548,22 @@
     engine?.setDebugFlags?.(next);
   }
 
+  // Start at the saved preview quality (Settings > Video editor). Read once; the monitor's own
+  // Quality menu is never written back. 'auto' keeps the automatic behaviour.
+  onMount(() => {
+    void editorApi.getSettings().then(
+      (s) => {
+        if (qualityTouched) return;
+        if (s.previewQuality === 'full' || s.previewQuality === 'half' || s.previewQuality === 'quarter') {
+          quality = s.previewQuality;
+        }
+      },
+      () => {
+        // Settings unreadable: keep the automatic default.
+      },
+    );
+  });
+
   // Create the engine on mount; destroy it on unmount.
   onMount(() => {
     const el = canvasEl;
@@ -875,7 +893,10 @@
         <select
           bind:value={quality}
           aria-label="Preview quality"
-          onchange={() => (droppedStreak = 0)}
+          onchange={() => {
+            qualityTouched = true;
+            droppedStreak = 0;
+          }}
         >
           <option value="auto">Auto ({autoLevel})</option>
           <option value="full">Full</option>
