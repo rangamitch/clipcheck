@@ -3,6 +3,7 @@
   import { get } from 'svelte/store';
   import { editorApi } from './api';
   import { createPreviewEngine, type PreviewEngine } from './preview/engine';
+  import { formatDiagLine, loadDebugFlags, saveDebugFlags, type DebugFlags } from './preview/debug';
   import { hitLayerAt, projectToCanvasRect } from './preview/compose';
   import { loopInOut, runAction, shuttleRate, type ActionContext } from './actions';
   import { ACTIONS } from './shortcuts';
@@ -510,11 +511,40 @@
     else if (autoLevel === 'half') autoLevel = 'quarter';
   }
 
+  // Diagnostic switches (temporary investigation aid, see preview/debug.ts).
+  let debugFlags = $state<DebugFlags>(loadDebugFlags());
+  const DEBUG_CHIPS: { key: keyof DebugFlags; label: string; tip: string }[] = [
+    {
+      key: 'multiAudio',
+      label: 'multi-audio',
+      tip: 'diagnostic: switches the preview of extra audio streams (hidden audio elements) on or off. Off plays only the default stream. Pauses playback and rebuilds the media pool.',
+    },
+    {
+      key: 'webAudio',
+      label: 'web-audio',
+      tip: 'diagnostic: switches Web Audio routing on or off. Off lets the media elements play their own audio (pan, gain and envelopes do not apply). Pauses playback and rebuilds the media pool.',
+    },
+    {
+      key: 'direct',
+      label: 'direct',
+      tip: 'diagnostic: switches direct-video mode on or off. Off always paints through the canvas. Pauses playback and rebuilds the media pool.',
+    },
+  ];
+  function toggleDebug(key: keyof DebugFlags): void {
+    const next = { ...debugFlags, [key]: !debugFlags[key] };
+    debugFlags = next;
+    saveDebugFlags(next);
+    // The engine pauses to rebuild its pool: keep the transport state in line.
+    playing.set(false);
+    engine?.setDebugFlags?.(next);
+  }
+
   // Create the engine on mount; destroy it on unmount.
   onMount(() => {
     const el = canvasEl;
     if (el === undefined) return;
     const e = createPreviewEngine({ mediaUrl: (id) => editorApi.mediaUrl(id) });
+    e.setDebugFlags?.(debugFlags);
     e.attach(el);
     // Before any element exists (setProject runs later): elements are created inside the host.
     e.attachHost(directHostEl ?? null);
@@ -684,9 +714,23 @@
     >
       <canvas bind:this={canvasEl} class="picture" aria-label="Program picture"></canvas>
       <div class="direct-host" bind:this={directHostEl} aria-hidden="true"></div>
-      {#if $playing}
-        <div class="perf-stats" aria-hidden="true">
-          paint {$previewStats.paintFps} fps  video {$previewStats.videoFps} fps  dropped {$previewStats.dropped}{$previewStats.direct ? '  direct' : ''}
+      {#if $playing || $previewStats.ctxState !== undefined}
+        <div class="perf-stats">
+          {#if $playing}<div aria-hidden="true">paint {$previewStats.paintFps} fps  video {$previewStats.videoFps} fps  dropped {$previewStats.dropped}{$previewStats.direct ? '  direct' : ''}</div>{/if}
+          <div class="diag-line">
+            <span aria-hidden="true">{formatDiagLine($previewStats)}</span>
+            {#each DEBUG_CHIPS as chip (chip.key)}
+              <button
+                type="button"
+                class="diag-chip"
+                class:off={!debugFlags[chip.key]}
+                title={chip.tip}
+                aria-pressed={debugFlags[chip.key]}
+                onpointerdown={(ev) => ev.stopPropagation()}
+                onclick={() => toggleDebug(chip.key)}
+              >{chip.label} {debugFlags[chip.key] ? 'on' : 'off'}</button>
+            {/each}
+          </div>
         </div>
       {/if}
 
@@ -917,6 +961,30 @@
     pointer-events: none;
     white-space: pre;
     text-shadow: 0 0 2px #000;
+  }
+
+  .diag-line {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+  }
+
+  .diag-chip {
+    pointer-events: auto;
+    font: inherit;
+    color: inherit;
+    background: rgba(0, 0, 0, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.4);
+    border-radius: 3px;
+    padding: 0 4px;
+    cursor: pointer;
+    text-shadow: none;
+  }
+
+  .diag-chip.off {
+    color: #ff9a8a;
+    border-color: #ff9a8a;
   }
 
   .picture {

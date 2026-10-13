@@ -69,6 +69,30 @@ export interface PreviewStats {
   dropped: number;
   /** True while the monitor shows the playing <video> element directly (no canvas copy). */
   direct?: boolean;
+  // Diagnostics (temporary investigation aid, see preview/debug.ts). Sampled once per second.
+  /** AudioContext state, or 'none'. */
+  ctxState?: string;
+  baseLatencyMs?: number;
+  outputLatencyMs?: number;
+  /** Primary playing video element: readyState, networkState, seconds buffered ahead. */
+  rs?: number;
+  ns?: number;
+  aheadS?: number;
+  /** Decoded frames per second (getVideoPlaybackQuality) and cumulative dropped frames. */
+  decodedFps?: number;
+  droppedFrames?: number;
+  /** waiting / stalled events in the last second (all pooled video elements). */
+  waiting?: number;
+  stalled?: number;
+  /** Element time minus expected source time (seconds). */
+  drift?: number;
+  /** Hidden stream <audio> elements pooled, and how many of them are playing. */
+  audioEls?: number;
+  audioPlaying?: number;
+  /** Long tasks (>50 ms) in the last second and the longest duration. */
+  longTasks?: number;
+  longTaskMaxMs?: number;
+  mode?: 'direct' | 'canvas';
 }
 export const previewStats = writable<PreviewStats>({ paintFps: 0, videoFps: 0, dropped: 0 });
 /** Active tool. */

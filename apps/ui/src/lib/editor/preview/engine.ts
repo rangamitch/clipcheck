@@ -36,7 +36,8 @@ import { gainRamp, segmentAt, sourceTimeFor, upcoming, upcomingStreams, type Gai
 import { editorApi } from '../api';
 import { composeFrame, directLayout, type SourceFrames } from './compose';
 import { shouldEnterDirect, shouldLeaveDirect, type DirectState } from './direct';
-import { previewStats } from '../store';
+import { previewStats, type PreviewStats } from '../store';
+import { bufferedAhead, defaultDebugFlags, loadDebugFlags, ratePerSec, type DebugFlags } from './debug';
 
 /** Preview resolution as a fraction of the project canvas. */
 export type PreviewQuality = 'full' | 'half' | 'quarter';
@@ -93,6 +94,11 @@ export interface PreviewEngine {
    * the exact frame is shown when scrubbing stops.
    */
   setScrubbing?(on: boolean): void;
+  /**
+   * Diagnostic switches (see debug.ts). Pauses, drops the whole element pool and recreates it lazily;
+   * the playhead is kept and playback is not resumed.
+   */
+  setDebugFlags?(flags: DebugFlags): void;
   /** Pauses, releases elements and the audio graph, and cancels all timers. */
   destroy(): void;
 }
@@ -103,17 +109,10 @@ export interface PreviewEngineOptions {
   mediaUrl: (mediaId: string) => Promise<string>;
 }
 
-/**
- * Kill switch for bisecting playback lag: false skips the hidden <audio> elements of the non-default
- * streams (the lanes using streams 1..6 are then silent).
+/*
+ * Bisecting switches (multiAudio: hidden <audio> elements of the non-default streams; direct: direct-video
+ * mode, where the playing <video> element itself is shown) live in the engine's DebugFlags.
  */
-const MULTI_STREAM_AUDIO = true;
-/**
- * Kill switch for direct-video mode: when a segment is one plain video layer, the playing <video>
- * element itself is shown (visible, unoccluded) instead of being copied to the canvas, because
- * Chromium starves frame delivery of a hidden element. False always paints through the canvas.
- */
-const DIRECT_VIDEO = true;
 /** Quiet time after the last seek of a paused playhead before the exact frame is seeked (ms). */
 const SCRUB_SETTLE_MS = 120;
 /** Minimum gap between positioning passes of the audio-stream elements while playing (ms). */
@@ -475,6 +474,17 @@ class Engine implements PreviewEngine {
   private scrubTimer: ReturnType<typeof setTimeout> | null = null;
   private paintRaf: number | null = null;
   private lastStreamSyncMs = 0;
+  /** Diagnostic switches (debug.ts). */
+  private flags: DebugFlags = defaultDebugFlags();
+  /** waiting / stalled events since the last stats update. */
+  private waitCount = 0;
+  private stallCount = 0;
+  private longTaskObserver: PerformanceObserver | null = null;
+  private longTaskCount = 0;
+  private longTaskMax = 0;
+  /** getVideoPlaybackQuality().totalVideoFrames of the primary element at the last stats update. */
+  private diagDecoded0 = 0;
+  private diagDecodedEl: HTMLVideoElement | null = null;
 
   private readonly timeCbs = new Set<(t: Tick) => void>();
   private readonly levelCbs = new Set<(l: { master: number; tracks: number[] }) => void>();
@@ -508,6 +518,7 @@ class Engine implements PreviewEngine {
 
   constructor(opts: PreviewEngineOptions) {
     this.mediaUrl = opts.mediaUrl;
+    this.flags = loadDebugFlags();
     this.sources = {
       video: (mediaId) => this.frameForPaint(mediaId),
       image: (mediaId) => this.imageForPaint(mediaId),
@@ -516,6 +527,7 @@ class Engine implements PreviewEngine {
     // The clock follows the audio device only while the context runs (see onAudioState).
     this.audio.ctx.onstatechange = () => this.onAudioState();
     document.addEventListener('visibilitychange', this.onVisibility);
+    this.observeLongTasks();
   }
 
   attach(canvas: HTMLCanvasElement): void {
@@ -649,7 +661,7 @@ class Engine implements PreviewEngine {
     if (this.clock.isRunning()) return;
     this.redrawNow();
     const plan = this.plan;
-    if (!plan || !MULTI_STREAM_AUDIO) return;
+    if (!plan || !this.flags.multiAudio) return;
     const seg = segmentAt(plan, this.clock.now());
     if (!seg) return;
     this.collectNeeds(seg, this.clock.now());
@@ -695,7 +707,8 @@ class Engine implements PreviewEngine {
   /** Resumes a suspended audio context and attaches the audio clock once it runs. Never throws. */
   private resumeAudio(): void {
     const ctx = this.audio.ctx;
-    if (ctx.state === 'running') return;
+    // Without Web Audio the clock follows the wall clock and the context stays untouched.
+    if (!this.flags.webAudio || ctx.state === 'running') return;
     void this.audio.resume().then(() => {
       if (!this.destroyed && ctx.state === 'running') this.clock.attachAudio(ctx);
     });
@@ -783,6 +796,69 @@ class Engine implements PreviewEngine {
     }
   }
 
+  setDebugFlags(flags: DebugFlags): void {
+    if (this.destroyed) return;
+    const prev = this.flags;
+    const next = { ...flags };
+    if (prev.multiAudio === next.multiAudio && prev.webAudio === next.webAudio && prev.direct === next.direct) return;
+    // Playing: pause first (keeps the playhead; the caller presses play again).
+    if (this.clock.isRunning()) this.pause();
+    this.leaveDirect(true);
+    this.flags = next;
+    this.resetPool();
+    this.onAudioState();
+    this.scheduleRedraw();
+  }
+
+  /** Disposes every pooled element and the URL state; elements are recreated lazily on next use. */
+  private resetPool(): void {
+    for (const [mediaId, entry] of this.elements) {
+      this.disposeEntry(entry);
+      this.audio.detach(mediaId);
+    }
+    this.elements.clear();
+    for (const [key, entry] of this.audioEls) {
+      this.disposeEntry(entry);
+      this.audio.detach(key);
+    }
+    this.audioEls.clear();
+    this.urls.clear();
+    this.streamUrls.clear();
+    this.failedStreams.clear();
+    this.prefetched.clear();
+    this.prefetchedStreams.clear();
+    this.keepIds.clear();
+    this.keepAudioKeys.clear();
+    this.needs.clear();
+    this.streamNeeds.clear();
+    this.retried.clear();
+    this.directArmSeg = null;
+    this.lastPaintSeg = null;
+    this.lastPaintFrames = -1;
+    this.lastFrameTotalSeen = -1;
+    this.diagDecodedEl = null;
+    this.segStart = null;
+    this.exactResync = true;
+    this.paintDirty = true;
+  }
+
+  /** Counts long tasks (main-thread blocks over 50 ms) for the diagnostics line. */
+  private observeLongTasks(): void {
+    try {
+      if (typeof PerformanceObserver === 'undefined') return;
+      const obs = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          this.longTaskCount++;
+          if (e.duration > this.longTaskMax) this.longTaskMax = e.duration;
+        }
+      });
+      obs.observe({ type: 'longtask', buffered: false });
+      this.longTaskObserver = obs;
+    } catch {
+      // Long-task entries are not supported here.
+    }
+  }
+
   destroy(): void {
     if (this.destroyed) return;
     this.pause();
@@ -794,6 +870,12 @@ class Engine implements PreviewEngine {
     if (this.paintRaf !== null && typeof cancelAnimationFrame !== 'undefined') cancelAnimationFrame(this.paintRaf);
     this.paintRaf = null;
     this.audio.ctx.onstatechange = null;
+    try {
+      this.longTaskObserver?.disconnect();
+    } catch {
+      // Already disconnected.
+    }
+    this.longTaskObserver = null;
     if (this.redrawTimer !== null) {
       clearTimeout(this.redrawTimer);
       this.redrawTimer = null;
@@ -839,7 +921,7 @@ class Engine implements PreviewEngine {
   /** Attaches the audio clock while the context runs, and falls back to the wall clock otherwise. */
   private onAudioState(): void {
     if (this.destroyed) return;
-    this.clock.attachAudio(this.audio.ctx.state === 'running' ? this.audio.ctx : null);
+    this.clock.attachAudio(this.flags.webAudio && this.audio.ctx.state === 'running' ? this.audio.ctx : null);
   }
 
   /** Visibility change: the frame loop stops when hidden, so audio-only ticks take over. */
@@ -934,7 +1016,7 @@ class Engine implements PreviewEngine {
         return;
       }
       const now = performance.now();
-      if (this.audio.ctx.state === 'suspended' && now - this.lastResumeMs >= RESUME_RETRY_MS) {
+      if (this.flags.webAudio && this.audio.ctx.state === 'suspended' && now - this.lastResumeMs >= RESUME_RETRY_MS) {
         // Elements routed through a suspended context stall, so keep asking until it runs.
         this.lastResumeMs = now;
         this.resumeAudio();
@@ -1106,7 +1188,7 @@ class Engine implements PreviewEngine {
    */
   private directCandidate(seg: PlanSegment, t: Tick): { entry: ElementEntry; fit: 'contain' | 'cover' | 'fill' } | null {
     const project = this.project;
-    if (!DIRECT_VIDEO || !this.hostEl || !project || !this.hasFrameCallback) return null;
+    if (!this.flags.direct || !this.hostEl || !project || !this.hasFrameCallback) return null;
     if (seg.video.length !== 1) return null;
     const layer = seg.video[0];
     if (!layer || layer.kind !== 'video' || layer.media_id === null) return null;
@@ -1124,7 +1206,7 @@ class Engine implements PreviewEngine {
   private directState(entry: ElementEntry | null, eligible: boolean, canvasPainted: boolean): DirectState {
     const el = entry?.el;
     return {
-      enabled: DIRECT_VIDEO && this.hostEl !== null,
+      enabled: this.flags.direct && this.hostEl !== null,
       playing: this.clock.isRunning(),
       rate: this.rate,
       scrubbing: this.scrubbing,
@@ -1323,7 +1405,8 @@ class Engine implements PreviewEngine {
     const el = document.createElement('video');
     el.preload = 'metadata';
     el.playsInline = true;
-    el.muted = false;
+    // Native audio (webAudio off) starts muted; syncAudio unmutes the elements a segment sounds.
+    el.muted = !this.flags.webAudio;
     el.volume = 1;
     // Export resamples, so pitch follows speed in the preview too.
     el.preservesPitch = false;
@@ -1360,13 +1443,19 @@ class Engine implements PreviewEngine {
       if (this.clock.isRunning()) this.scheduleRedraw();
       else this.redrawNow();
     };
+    el.onwaiting = () => {
+      this.waitCount++;
+    };
+    el.onstalled = () => {
+      this.stallCount++;
+    };
     el.onloadeddata = () => this.scheduleRedraw();
     el.onloadedmetadata = () => this.checkDecodable(mediaId, el);
     el.onerror = () => this.onMediaError(mediaId, el);
     this.elements.set(mediaId, entry);
 
     try {
-      this.audio.attach(mediaId, el);
+      if (this.flags.webAudio) this.audio.attach(mediaId, el);
     } catch (err) {
       this.failMedia(mediaId, err);
       return null;
@@ -1436,6 +1525,8 @@ class Engine implements PreviewEngine {
     if (this.directEntry === entry) this.leaveDirect(false);
     el.onseeked = null;
     el.onloadeddata = null;
+    el.onwaiting = null;
+    el.onstalled = null;
     el.onloadedmetadata = null;
     el.onerror = null;
     try {
@@ -1700,13 +1791,13 @@ class Engine implements PreviewEngine {
     this.keepAudioKeys.clear();
     for (const key of streams.keys()) this.keepAudioKeys.add(key);
     for (const [key, entry] of this.audioEls) {
-      if (streams.has(key) && playing && MULTI_STREAM_AUDIO) continue;
+      if (streams.has(key) && playing && this.flags.multiAudio) continue;
       if (!entry.el.paused) entry.el.pause();
     }
     // Paused (scrubbing, stepping) the stream elements are not touched: they are silent anyway and
     // seeking them on every playhead move only costs decoder and disk time. Playing, they are
     // positioned at 10 Hz, not on every animation frame.
-    if (!playing || !MULTI_STREAM_AUDIO) return;
+    if (!playing || !this.flags.multiAudio) return;
     if (now - this.lastStreamSyncMs < STREAM_SYNC_MS && this.segStart === seg.start) return;
     this.lastStreamSyncMs = now;
     for (const need of streams.values()) {
@@ -1888,7 +1979,7 @@ class Engine implements PreviewEngine {
 
     const el = document.createElement('audio');
     el.preload = 'auto';
-    el.muted = false;
+    el.muted = !this.flags.webAudio;
     el.volume = 1;
     el.preservesPitch = false;
     // The file comes from another origin. Web Audio needs CORS or the source is silent.
@@ -1915,7 +2006,7 @@ class Engine implements PreviewEngine {
     this.audioEls.set(key, entry);
 
     try {
-      this.audio.attach(key, el);
+      if (this.flags.webAudio) this.audio.attach(key, el);
     } catch {
       this.failStream(mediaId, stream);
       return null;
@@ -1964,6 +2055,10 @@ class Engine implements PreviewEngine {
       this.silenceKeys();
       return;
     }
+    if (!this.flags.webAudio) {
+      this.syncNativeAudio(seg, t);
+      return;
+    }
     const at = this.audio.ctx.currentTime;
     const mag = Math.abs(this.rate);
     const seen = new Set<string>();
@@ -1991,6 +2086,28 @@ class Engine implements PreviewEngine {
       if (!seen.has(key)) this.audio.silenceSource(key);
     }
     this.activeKeys = seen;
+  }
+
+  /**
+   * Diagnostic mode without Web Audio: the elements play their own audio. Only the on/off state of a
+   * source applies (an element is muted unless a source of it has gain now); pan, gain curves,
+   * mono and track buses do not.
+   */
+  private syncNativeAudio(seg: PlanSegment, t: Tick): void {
+    const live = new Set<string>();
+    for (const src of seg.audio) {
+      const first = gainRamp(src, t, t + secToTick(RAMP_STEP_S), RAMP_STEP_S)[0];
+      if (first === undefined || !(first.gain > 0)) continue;
+      live.add(src.source_track === 0 ? src.media_id : streamKey(src.media_id, src.source_track));
+    }
+    for (const entry of this.elements.values()) {
+      const muted = !live.has(entry.mediaId);
+      if (entry.el.muted !== muted) entry.el.muted = muted;
+    }
+    for (const entry of this.audioEls.values()) {
+      const muted = !live.has(entry.key);
+      if (entry.el.muted !== muted) entry.el.muted = muted;
+    }
   }
 
   private silenceKeys(): void {
@@ -2081,11 +2198,77 @@ class Engine implements PreviewEngine {
       videoFps: Math.round(videoFps),
       dropped,
       direct: this.directEntry !== null,
+      ...this.diagnostics(span),
     });
     this.statsStartMs = now;
     this.statsPaints = 0;
     this.statsFrames0 = cur.total;
     this.statsDropped0 = cur.dropped;
+  }
+
+  /** Diagnostic fields of the stats update; counters are reset. Never throws. */
+  private diagnostics(spanMs: number): Partial<PreviewStats> {
+    const out: Partial<PreviewStats> = {
+      ctxState: this.flags.webAudio ? this.audio.ctx.state : 'none',
+      mode: this.directEntry !== null ? 'direct' : 'canvas',
+      waiting: this.waitCount,
+      stalled: this.stallCount,
+      longTasks: this.longTaskCount,
+    };
+    out.longTaskMaxMs = Math.round(this.longTaskMax);
+    this.waitCount = 0;
+    this.stallCount = 0;
+    this.longTaskCount = 0;
+    this.longTaskMax = 0;
+    try {
+      const ctx = this.audio.ctx;
+      out.baseLatencyMs = Math.round((ctx.baseLatency ?? 0) * 1000);
+      out.outputLatencyMs = Math.round((ctx.outputLatency ?? 0) * 1000);
+      let playing = 0;
+      for (const entry of this.audioEls.values()) {
+        if (!entry.el.paused && entry.el.readyState >= 3) playing++;
+      }
+      out.audioEls = this.audioEls.size;
+      out.audioPlaying = playing;
+      const primary = this.primaryEntry();
+      if (primary) {
+        const el = primary.entry.el;
+        out.rs = el.readyState;
+        out.ns = el.networkState;
+        out.aheadS = bufferedAhead(el.buffered, el.currentTime);
+        out.drift = Math.round((el.currentTime - primary.srcSec) * 100) / 100;
+        const q = el.getVideoPlaybackQuality();
+        out.droppedFrames = q.droppedVideoFrames;
+        if (this.diagDecodedEl === el) {
+          out.decodedFps = Math.round(ratePerSec(q.totalVideoFrames - this.diagDecoded0, spanMs));
+        } else {
+          out.decodedFps = 0;
+          this.diagDecodedEl = el;
+        }
+        this.diagDecoded0 = q.totalVideoFrames;
+      } else {
+        this.diagDecodedEl = null;
+      }
+    } catch {
+      // Diagnostics must never disturb playback.
+    }
+    return out;
+  }
+
+  /** Pooled element of the first video layer of the current segment, with its expected source time. */
+  private primaryEntry(): { entry: ElementEntry; srcSec: number } | null {
+    const plan = this.plan;
+    if (!plan) return null;
+    const t = this.clock.now();
+    const seg = segmentAt(plan, t);
+    if (!seg) return null;
+    for (const layer of seg.video) {
+      if (layer.kind !== 'video' || layer.media_id === null) continue;
+      const entry = this.elements.get(layer.media_id);
+      if (!entry) return null;
+      return { entry, srcSec: tickToSec(sourceTimeFor(layer, seg.start, t)) };
+    }
+    return null;
   }
 
   private emitTime(t: Tick): void {
