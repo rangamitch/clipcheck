@@ -3,6 +3,7 @@
   import { tick, untrack } from 'svelte';
   import { formatBytes } from '../format';
   import { editorApi, type EncoderInfo } from './api';
+  import { encoderOptionsFor } from './exportEncoders';
   import { playhead, snapshot, toast } from './store';
   import { formatDuration, secToTick } from './ticks';
   import {
@@ -194,21 +195,7 @@
     if (av1Available || settings?.codec === 'av1') opts.push({ value: 'av1', label: 'AV1' });
     return opts;
   });
-  const encoderOptions = $derived.by(() => {
-    const opts: { value: string; label: string }[] = [
-      { value: 'auto', label: 'Auto (best available)' },
-    ];
-    const list: EncoderInfo[] = encoderList ?? [{ name: 'software', hardware: false }];
-    for (const e of list) {
-      if (e.name === 'auto') continue;
-      opts.push({ value: e.name, label: encoderLabel(e) });
-    }
-    const current = settings?.encoder ?? 'auto';
-    if (!opts.some((o) => o.value === current)) {
-      opts.push({ value: current, label: encoderLabel({ name: current, hardware: false }) });
-    }
-    return opts;
-  });
+  const encoderOptions = $derived(encoderOptionsFor(encoderList, settings?.encoder ?? 'auto'));
   const loudnessOptions = $derived.by(() => {
     const opts = [
       { value: 'off', label: 'Off' },
@@ -296,11 +283,6 @@
 
   function mbpsText(kbps: number): string {
     return String(Math.round(kbps / 100) / 10);
-  }
-
-  function encoderLabel(e: EncoderInfo): string {
-    if (e.name === 'software') return 'Software (CPU)';
-    return `${e.name} (${e.hardware ? 'GPU' : 'CPU'})`;
   }
 
   function fileStem(path: string): string {

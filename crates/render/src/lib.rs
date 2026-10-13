@@ -40,4 +40,6 @@ pub mod titles;
 
 pub use error::RenderError;
 pub use frame::Frame;
+#[cfg(windows)]
+pub use gpuenc::{adapter_info, AdapterInfo};
 pub use job::{JobControl, Progress};

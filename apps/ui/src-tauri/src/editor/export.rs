@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use clipcheck_hwenc::Codec;
 use clipcheck_render::engine::{run_export, ExportReport, ExportRequest};
-use clipcheck_render::{still, JobControl, Progress, RenderError};
+use clipcheck_render::{still, AdapterInfo, JobControl, Progress, RenderError};
 use clipcheck_timeline::export::{
     apply_preset, builtin_presets, estimate_size, expand_name, find_preset, validate_settings,
     ExportKind, ExportRange, ExportSettings, Preset, SizeEstimate,
@@ -1646,12 +1646,39 @@ pub struct EncoderInfo {
     /// Friendly name, e.g. "NVIDIA H.264 Encoder MFT". The render engine accepts it as the
     /// `encoder` setting.
     pub name: String,
+    /// Text for the dropdown, e.g. "NVIDIA GeForce RTX 5080 (NVENC H.264)" or "Software (CPU)".
+    pub label: String,
     /// True for a GPU/ASIC encoder, false for the Microsoft software encoder.
     pub hardware: bool,
 }
 
-/// Lists the Media Foundation encoders for `codec` ("h264" or "hevc", case-insensitive), hardware
-/// first. Other codecs (such as "av1") give an empty list.
+/// Display text for an encoder: hardware encoders read "<GPU> (<NVENC|AMF|Quick Sync|GPU>
+/// <H.264|HEVC>)", with the encoder's own name when its adapter is unknown; software reads
+/// "Software (CPU)".
+fn encoder_label(
+    desc: &clipcheck_hwenc::EncoderDescriptor,
+    adapter: Option<&AdapterInfo>,
+) -> String {
+    if !desc.hardware {
+        return "Software (CPU)".to_string();
+    }
+    let kind = match desc.vendor {
+        clipcheck_hwenc::Vendor::Nvidia => "NVENC",
+        clipcheck_hwenc::Vendor::Amd => "AMF",
+        clipcheck_hwenc::Vendor::Intel => "Quick Sync",
+        clipcheck_hwenc::Vendor::Microsoft | clipcheck_hwenc::Vendor::Other => "GPU",
+    };
+    let codec = match desc.codec {
+        Codec::H264 => "H.264",
+        Codec::Hevc => "HEVC",
+    };
+    let gpu = adapter.map_or(desc.name.as_str(), |a| a.name.as_str());
+    format!("{gpu} ({kind} {codec})")
+}
+
+/// Lists the Media Foundation encoders for `codec` ("h264" or "hevc", case-insensitive): the
+/// hardware ones best first (by [`clipcheck_render::engine::ranked_hardware`]), then software.
+/// Entries with the same name are listed once. Other codecs (such as "av1") give an empty list.
 #[tauri::command]
 pub async fn editor_list_encoders(codec: String) -> Result<Vec<EncoderInfo>, String> {
     let codec = match codec.trim().to_ascii_lowercase().as_str() {
@@ -1662,15 +1689,77 @@ pub async fn editor_list_encoders(codec: String) -> Result<Vec<EncoderInfo>, Str
     blocking(move || {
         clipcheck_hwenc::mf_startup().map_err(|e| e.to_string())?;
         let list = clipcheck_hwenc::enumerate(codec).map_err(|e| e.to_string())?;
-        Ok(list
-            .into_iter()
-            .map(|desc| EncoderInfo {
+        let mut out: Vec<EncoderInfo> = Vec::new();
+        for (desc, adapter) in clipcheck_render::engine::ranked_hardware(&list) {
+            let label = encoder_label(&desc, adapter.as_ref());
+            out.push(EncoderInfo {
                 name: desc.name,
-                hardware: desc.hardware,
-            })
-            .collect())
+                label,
+                hardware: true,
+            });
+        }
+        for desc in list.iter().filter(|d| !d.hardware) {
+            if out.iter().any(|e| e.name == desc.name) {
+                continue;
+            }
+            out.push(EncoderInfo {
+                name: desc.name.clone(),
+                label: encoder_label(desc, None),
+                hardware: false,
+            });
+        }
+        Ok(out)
     })
     .await
+}
+
+#[cfg(test)]
+mod encoder_label_tests {
+    use super::*;
+    use clipcheck_hwenc::{EncoderDescriptor, Vendor};
+
+    fn desc(vendor: Vendor, hardware: bool, codec: Codec) -> EncoderDescriptor {
+        EncoderDescriptor {
+            name: "MFT".to_string(),
+            vendor,
+            codec,
+            hardware,
+            index: 0,
+        }
+    }
+
+    #[test]
+    fn hardware_label_names_the_adapter_and_api() {
+        let gpu = AdapterInfo {
+            name: "NVIDIA GeForce RTX 5080".to_string(),
+            dedicated_vram: 16 << 30,
+            is_software: false,
+        };
+        assert_eq!(
+            encoder_label(&desc(Vendor::Nvidia, true, Codec::H264), Some(&gpu)),
+            "NVIDIA GeForce RTX 5080 (NVENC H.264)"
+        );
+        assert_eq!(
+            encoder_label(&desc(Vendor::Amd, true, Codec::Hevc), Some(&gpu)),
+            "NVIDIA GeForce RTX 5080 (AMF HEVC)"
+        );
+        assert_eq!(
+            encoder_label(&desc(Vendor::Intel, true, Codec::H264), None),
+            "MFT (Quick Sync H.264)"
+        );
+        assert_eq!(
+            encoder_label(&desc(Vendor::Other, true, Codec::H264), None),
+            "MFT (GPU H.264)"
+        );
+    }
+
+    #[test]
+    fn software_label_is_fixed() {
+        assert_eq!(
+            encoder_label(&desc(Vendor::Microsoft, false, Codec::H264), None),
+            "Software (CPU)"
+        );
+    }
 }
 
 #[cfg(test)]

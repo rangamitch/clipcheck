@@ -36,8 +36,11 @@ export interface PeaksReady {
 
 /** One encoder from `editor_list_encoders`. */
 export interface EncoderInfo {
+  /** Stored/selected value, e.g. "NVIDIA H.264 Encoder MFT" or "software". */
   name: string;
   hardware: boolean;
+  /** Friendly display text, e.g. "NVIDIA GeForce RTX 5080 (NVENC H.264)". */
+  label?: string;
 }
 
 export const editorApi = {

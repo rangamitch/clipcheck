@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 
 use clipcheck_aacenc::AacEncoder;
 use clipcheck_hwenc::{
-    Codec, EncodedPacket, EncoderDescriptor, InputFrame, RateControl, VideoEncoder,
+    Codec, EncodedPacket, EncoderDescriptor, InputFrame, RateControl, Vendor, VideoEncoder,
     VideoEncoderConfig,
 };
 use clipcheck_mp4::annexb::VideoCodec as Mp4VideoCodec;
@@ -32,7 +32,7 @@ use clipcheck_timeline::time::{Rate, Tick};
 use crate::dsp::normalize_gain_db;
 use crate::error::RenderError;
 use crate::frame::Frame;
-use crate::gpuenc::GpuUploader;
+use crate::gpuenc::{adapter_info, AdapterInfo, GpuUploader};
 use crate::job::{JobControl, Progress};
 use crate::nv12;
 use crate::pipeline::{self, PipelineConfig, Sink};
@@ -485,6 +485,62 @@ fn software_encoder(
     ))
 }
 
+/// Preference between vendors whose adapters have the same dedicated memory: NVIDIA, AMD, Intel,
+/// then any other vendor.
+fn vendor_rank(vendor: Vendor) -> u8 {
+    match vendor {
+        Vendor::Nvidia => 0,
+        Vendor::Amd => 1,
+        Vendor::Intel => 2,
+        Vendor::Microsoft | Vendor::Other => 3,
+    }
+}
+
+/// Orders the hardware encoders in `candidates` best first and returns their indices into
+/// `candidates`. Software entries are skipped. An entry with the same (vendor, name) as an earlier
+/// one is a duplicate and is dropped. The rest sort by the dedicated VRAM of their adapter
+/// (largest first), then by [`vendor_rank`]. An entry whose vendor has no adapter (None) comes
+/// last. Ties keep their input order.
+pub fn rank_hardware(candidates: &[(EncoderDescriptor, Option<AdapterInfo>)]) -> Vec<usize> {
+    let mut kept: Vec<(usize, &EncoderDescriptor, Option<&AdapterInfo>)> = Vec::new();
+    for (i, (desc, adapter)) in candidates.iter().enumerate() {
+        if !desc.hardware {
+            continue;
+        }
+        let duplicate = kept
+            .iter()
+            .any(|(_, k, _)| k.vendor == desc.vendor && k.name == desc.name);
+        if !duplicate {
+            kept.push((i, desc, adapter.as_ref()));
+        }
+    }
+    kept.sort_by_key(|(_, desc, adapter)| {
+        let vram = adapter.map_or(0, |a| a.dedicated_vram);
+        (
+            adapter.is_none(),
+            std::cmp::Reverse(vram),
+            vendor_rank(desc.vendor),
+        )
+    });
+    kept.into_iter().map(|(i, _, _)| i).collect()
+}
+
+/// The hardware encoders of `list`, best first (see [`rank_hardware`]), each with the adapter of
+/// its vendor. Adapters are looked up once per hardware entry.
+pub fn ranked_hardware(
+    list: &[EncoderDescriptor],
+) -> Vec<(EncoderDescriptor, Option<AdapterInfo>)> {
+    let candidates: Vec<(EncoderDescriptor, Option<AdapterInfo>)> = list
+        .iter()
+        .filter(|d| d.hardware)
+        .map(|d| (d.clone(), adapter_info(d.vendor)))
+        .collect();
+    rank_hardware(&candidates)
+        .into_iter()
+        .filter_map(|i| candidates.get(i).cloned())
+        .collect()
+}
+
 /// The encoder to try first and the software encoder to fall back to if the first one fails.
 struct Chosen {
     desc: EncoderDescriptor,
@@ -519,8 +575,8 @@ fn choose_encoder(
         "software" => software_only(warnings),
         "auto" => {
             let list = clipcheck_hwenc::enumerate(codec).map_err(enc_err)?;
-            match list.iter().find(|d| d.hardware).cloned() {
-                Some(hw) => Ok(hardware(hw, &list)),
+            match ranked_hardware(&list).into_iter().next() {
+                Some((hw, _)) => Ok(hardware(hw, &list)),
                 None => software_only(warnings),
             }
         }
@@ -1448,5 +1504,125 @@ mod retry_tests {
         // Target smaller than the audio share: nothing video-wise fits, use the floor.
         let v = retry_video_kbps(1000, 2_000_000, 500_000.0, 60.0, 128);
         assert_eq!(v, MIN_RETRY_KBPS as u32);
+    }
+}
+
+#[cfg(test)]
+mod rank_tests {
+    use super::*;
+
+    fn enc(name: &str, vendor: Vendor, hardware: bool) -> EncoderDescriptor {
+        EncoderDescriptor {
+            name: name.to_string(),
+            vendor,
+            codec: Codec::H264,
+            hardware,
+            index: 0,
+        }
+    }
+
+    fn gpu(name: &str, vram_gb: u64) -> Option<AdapterInfo> {
+        Some(AdapterInfo {
+            name: name.to_string(),
+            dedicated_vram: vram_gb * 1024 * 1024 * 1024,
+            is_software: false,
+        })
+    }
+
+    fn names(candidates: &[(EncoderDescriptor, Option<AdapterInfo>)]) -> Vec<String> {
+        rank_hardware(candidates)
+            .into_iter()
+            .filter_map(|i| candidates.get(i).map(|(d, _)| d.name.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn owner_machine_prefers_nvidia_over_amd_igpu() {
+        // Enumeration order from Media Foundation on the owner's machine: AMD twice, NVIDIA, then
+        // the Microsoft software encoder (not a candidate).
+        let candidates = vec![
+            (
+                enc("AMDh264Encoder", Vendor::Amd, true),
+                gpu("AMD Radeon(TM) Graphics", 2),
+            ),
+            (
+                enc("AMDh264Encoder", Vendor::Amd, true),
+                gpu("AMD Radeon(TM) Graphics", 2),
+            ),
+            (
+                enc("NVIDIA H.264 Encoder MFT", Vendor::Nvidia, true),
+                gpu("NVIDIA GeForce RTX 5080", 16),
+            ),
+            (enc("H264 Encoder MFT", Vendor::Microsoft, false), None),
+        ];
+        assert_eq!(
+            names(&candidates),
+            vec!["NVIDIA H.264 Encoder MFT", "AMDh264Encoder"]
+        );
+        assert_eq!(rank_hardware(&candidates), vec![2, 0]);
+    }
+
+    #[test]
+    fn more_vram_wins_even_against_a_preferred_vendor() {
+        let candidates = vec![
+            (
+                enc("NVIDIA H.264 Encoder MFT", Vendor::Nvidia, true),
+                gpu("NVIDIA small", 4),
+            ),
+            (enc("AMDh264Encoder", Vendor::Amd, true), gpu("AMD big", 8)),
+        ];
+        assert_eq!(
+            names(&candidates),
+            vec!["AMDh264Encoder", "NVIDIA H.264 Encoder MFT"]
+        );
+    }
+
+    #[test]
+    fn equal_vram_orders_nvidia_then_amd_then_intel() {
+        let candidates = vec![
+            (enc("QuickSync H.264", Vendor::Intel, true), gpu("Intel", 4)),
+            (enc("AMDh264Encoder", Vendor::Amd, true), gpu("AMD", 4)),
+            (
+                enc("NVIDIA H.264 Encoder MFT", Vendor::Nvidia, true),
+                gpu("NVIDIA", 4),
+            ),
+        ];
+        assert_eq!(
+            names(&candidates),
+            vec![
+                "NVIDIA H.264 Encoder MFT",
+                "AMDh264Encoder",
+                "QuickSync H.264"
+            ]
+        );
+    }
+
+    #[test]
+    fn encoder_without_adapter_ranks_last() {
+        let candidates = vec![
+            (enc("Other H.264", Vendor::Other, true), None),
+            (enc("AMDh264Encoder", Vendor::Amd, true), gpu("AMD", 2)),
+        ];
+        assert_eq!(names(&candidates), vec!["AMDh264Encoder", "Other H.264"]);
+    }
+
+    #[test]
+    fn duplicates_are_removed_keeping_the_first_index() {
+        let candidates = vec![
+            (enc("AMDh264Encoder", Vendor::Amd, true), gpu("AMD", 2)),
+            (enc("AMDh264Encoder", Vendor::Amd, true), gpu("AMD", 2)),
+            (
+                enc("NVIDIA H.264 Encoder MFT", Vendor::Nvidia, true),
+                gpu("NVIDIA", 16),
+            ),
+            (enc("AMDh264Encoder", Vendor::Amd, true), gpu("AMD", 2)),
+        ];
+        assert_eq!(rank_hardware(&candidates), vec![2, 0]);
+    }
+
+    #[test]
+    fn software_entries_are_skipped() {
+        let candidates = vec![(enc("H264 Encoder MFT", Vendor::Microsoft, false), None)];
+        assert!(rank_hardware(&candidates).is_empty());
     }
 }

@@ -11,38 +11,93 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE,
+};
 
 use crate::error::RenderError;
 
 /// NV12 textures cycled through, so the encoder can still hold earlier frames.
 const POOL_SIZE: usize = 8;
 
+/// What DXGI reports about the GPU adapter of a vendor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterInfo {
+    /// Adapter description (DXGI `Description`), trimmed.
+    pub name: String,
+    /// Dedicated video memory in bytes.
+    pub dedicated_vram: u64,
+    /// True for a software adapter. [`adapter_info`] never returns one, so this is false there.
+    pub is_software: bool,
+}
+
 fn gerr(context: &str, e: impl std::fmt::Display) -> RenderError {
     RenderError::Encode(format!("{context}: {e}"))
 }
 
-/// The DXGI adapter whose PCI vendor id matches `vendor`, if there is one.
-fn adapter_for(vendor: Vendor) -> Option<IDXGIAdapter> {
-    let id = match vendor {
-        Vendor::Nvidia => 0x10DE,
-        Vendor::Amd => 0x1002,
-        Vendor::Intel => 0x8086,
-        Vendor::Microsoft | Vendor::Other => return None,
-    };
+/// PCI vendor id of `vendor`; None for the software and unknown vendors.
+fn pci_vendor_id(vendor: Vendor) -> Option<u32> {
+    match vendor {
+        Vendor::Nvidia => Some(0x10DE),
+        Vendor::Amd => Some(0x1002),
+        Vendor::Intel => Some(0x8086),
+        Vendor::Microsoft | Vendor::Other => None,
+    }
+}
+
+/// The hardware adapter with `vendor`'s PCI id that has the most dedicated video memory (the
+/// first one wins a tie). Software adapters are skipped.
+fn best_adapter(vendor: Vendor) -> Option<(IDXGIAdapter, DXGI_ADAPTER_DESC1)> {
+    let id = pci_vendor_id(vendor)?;
     // SAFETY: plain factory creation; no pointers are passed.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.ok()?;
+    let software_flag = DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32;
+    let mut best: Option<(IDXGIAdapter, DXGI_ADAPTER_DESC1)> = None;
     let mut i = 0;
-    loop {
-        // SAFETY: EnumAdapters1 returns an owned COM reference or an error at the end of the list.
-        let adapter = unsafe { factory.EnumAdapters1(i) }.ok()?;
-        // SAFETY: adapter is a live adapter.
-        let desc = unsafe { adapter.GetDesc1() }.ok()?;
-        if desc.VendorId == id {
-            return adapter.cast::<IDXGIAdapter>().ok();
-        }
+    // SAFETY: EnumAdapters1 returns an owned COM reference, or an error at the end of the list.
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(i) } {
         i += 1;
+        // SAFETY: adapter is a live adapter.
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if desc.VendorId != id || (desc.Flags & software_flag) != 0 {
+            continue;
+        }
+        let better = match &best {
+            Some((_, current)) => desc.DedicatedVideoMemory > current.DedicatedVideoMemory,
+            None => true,
+        };
+        if better {
+            if let Ok(a) = adapter.cast::<IDXGIAdapter>() {
+                best = Some((a, desc));
+            }
+        }
     }
+    best
+}
+
+/// The DXGI adapter for `vendor` (the one with the most dedicated VRAM), if there is one.
+fn adapter_for(vendor: Vendor) -> Option<IDXGIAdapter> {
+    best_adapter(vendor).map(|(adapter, _)| adapter)
+}
+
+/// Name and memory of the GPU adapter for `vendor`, or None when there is no such adapter (or
+/// the vendor is software or unknown). With several adapters of one vendor, the one with the most
+/// dedicated VRAM is reported, the same one [`GpuUploader`] uses.
+pub fn adapter_info(vendor: Vendor) -> Option<AdapterInfo> {
+    let (_, desc) = best_adapter(vendor)?;
+    let end = desc
+        .Description
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(desc.Description.len());
+    let name = String::from_utf16_lossy(desc.Description.get(..end).unwrap_or(&[]));
+    Some(AdapterInfo {
+        name: name.trim().to_string(),
+        dedicated_vram: desc.DedicatedVideoMemory as u64,
+        is_software: false,
+    })
 }
 
 /// Uploads BGRA frames and converts them to NV12 textures on the encoder's D3D11 device.
