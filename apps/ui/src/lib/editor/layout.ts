@@ -3,7 +3,7 @@
 // all y values are relative to the top of the timeline area (ruler included).
 
 import type { Clip, Project, Tick, Track, TrackKind } from './types';
-import { TICKS_PER_SECOND } from './ticks';
+import { TICKS_PER_SECOND, clipEnd, formatTimecode } from './ticks';
 
 /** Height of the time ruler at the top of the timeline area, px. */
 export const RULER_HEIGHT = 28;
@@ -553,4 +553,83 @@ export function snapTargets(
     targets.push({ time: project.work_area.end, kind: 'work-area-end' });
   }
   return targets;
+}
+
+/** Cut point for the Cut tool: the raw time, or a snapped point (see `cutSnapPoint`). */
+export interface CutSnap {
+  tick: Tick;
+  /** x of the cut point in the track area, px. */
+  x: number;
+  /** What the cut point snapped to, or null when it is the raw pointer time. */
+  kind: 'playhead' | 'clip' | null;
+}
+
+/** Cut-tool preview over a clip: the snapped cut point plus its timecode label. */
+export interface CutPreview extends CutSnap {
+  snapped: boolean;
+  label: string;
+}
+
+/**
+ * Cut point for pointer x (track area). Candidates are the playhead and every clip's start and end
+ * (enabled or not). The nearest candidate within `snapPx` wins; the playhead is listed first, so it
+ * wins ties. `shift` disables snapping. Used by both the cut preview and the click that cuts.
+ */
+export function cutSnapPoint(
+  project: Project,
+  x: number,
+  shift: boolean,
+  playhead: Tick,
+  view: View,
+  snapPx: number,
+): CutSnap {
+  const raw = xToTick(x, view);
+  if (shift) return { tick: raw, x: tickToX(raw, view), kind: null };
+  const candidates: { tick: Tick; kind: 'playhead' | 'clip' }[] = [{ tick: playhead, kind: 'playhead' }];
+  for (const clip of project.clips) {
+    candidates.push({ tick: clip.start, kind: 'clip' }, { tick: clipEnd(clip), kind: 'clip' });
+  }
+  let best: { tick: Tick; x: number; kind: 'playhead' | 'clip'; dist: number } | null = null;
+  for (const cand of candidates) {
+    const cx = tickToX(cand.tick, view);
+    const dist = Math.abs(cx - x);
+    if (dist > snapPx) continue;
+    if (best === null || dist < best.dist) best = { tick: cand.tick, x: cx, kind: cand.kind, dist };
+  }
+  if (best === null) return { tick: raw, x: tickToX(raw, view), kind: null };
+  return { tick: best.tick, x: best.x, kind: best.kind };
+}
+
+/**
+ * Timecode `HH:MM:SS:FF` of a cut point, at the project frame rate (`canvas.fps`). Never throws:
+ * a missing project or rate gives an empty label.
+ */
+export function cutPreviewLabel(tick: Tick, project: Project): string {
+  try {
+    const rate = project?.canvas?.fps;
+    if (!rate) return '';
+    return formatTimecode(tick, rate);
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Cut-tool preview for a pointer at (x, y): shown only over a clip (the one a click would cut),
+ * at the snapped cut point. Null when the pointer is not over a clip.
+ */
+export function cutPreviewFor(
+  project: Project,
+  rows: readonly TrackRow[],
+  view: View,
+  x: number,
+  y: number,
+  shift: boolean,
+  playhead: Tick,
+  snapPx: number,
+): CutPreview | null {
+  const hit = hitTest(project, rows, view, x, y);
+  if (hit.kind !== 'clip' || !hit.clipId) return null;
+  const cut = cutSnapPoint(project, x, shift, playhead, view, snapPx);
+  return { ...cut, snapped: cut.kind !== null, label: cutPreviewLabel(cut.tick, project) };
 }

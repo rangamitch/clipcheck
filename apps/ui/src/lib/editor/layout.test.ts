@@ -6,6 +6,9 @@ import {
   RULER_HEIGHT,
   TRACK_GAP,
   clipRect,
+  cutPreviewFor,
+  cutPreviewLabel,
+  cutSnapPoint,
   dragMoveTarget,
   envelopeDbAt,
   envelopeY,
@@ -739,5 +742,68 @@ describe('hitEnvelopePoint with a selection', () => {
     const { proj, rows } = build(flat);
     const rect = clipRect(flat, rows, VIEW)!;
     expect(hitEnvelopePoint(proj, rows, VIEW, rect.x + rect.w / 2, envelopeY(0, rect))?.index).toBeNull();
+  });
+});
+
+describe('cut tool snapping and preview', () => {
+  const CUT_VIEW: View = { pxPerSec: 100, scrollX: 0, width: 1000, height: 300 };
+  // Clip a spans 0..5 s (track area x 0..500). Its end is the only clip boundary nearby in these tests.
+  const cutProj = (playSec = 0): { proj: Project; rows: TrackRow[]; play: number } => {
+    const proj = project([track('v1', 'video')], [clip('a', 'v1', 0, 5)]);
+    return { proj, rows: trackLayout(proj, 0), play: Math.round(playSec * S) };
+  };
+
+  it('snaps to a clip end within the threshold', () => {
+    const { proj, play } = cutProj(0);
+    const cut = cutSnapPoint(proj, 503, false, play, CUT_VIEW, 8);
+    expect(cut.kind).toBe('clip');
+    expect(cut.tick).toBe(5 * S);
+    expect(cut.x).toBeCloseTo(500, 6);
+  });
+
+  it('snaps to the playhead when it is nearer than a clip boundary', () => {
+    const { proj, play } = cutProj(4.99);
+    const cut = cutSnapPoint(proj, 497, false, play, CUT_VIEW, 8);
+    expect(cut.kind).toBe('playhead');
+    expect(cut.tick).toBe(play);
+    expect(cut.x).toBeCloseTo(499, 6);
+  });
+
+  it('does not snap beyond the threshold', () => {
+    const { proj, play } = cutProj(0);
+    const cut = cutSnapPoint(proj, 520, false, play, CUT_VIEW, 8);
+    expect(cut.kind).toBeNull();
+    expect(cut.tick).toBe(xToTick(520, CUT_VIEW));
+    expect(cut.x).toBeCloseTo(520, 6);
+  });
+
+  it('Shift ignores snapping', () => {
+    const { proj, play } = cutProj(0);
+    const cut = cutSnapPoint(proj, 503, true, play, CUT_VIEW, 8);
+    expect(cut.kind).toBeNull();
+    expect(cut.tick).toBe(xToTick(503, CUT_VIEW));
+  });
+
+  it('preview is shown only over a clip, with the snapped point and a canvas-rate label', () => {
+    const { proj, rows, play } = cutProj(0);
+    const row = rows[0]!;
+    const over = cutPreviewFor(proj, rows, CUT_VIEW, 250, row.top + 5, false, play, 8);
+    expect(over).not.toBeNull();
+    expect(over!.snapped).toBe(false);
+    expect(over!.kind).toBeNull();
+    expect(over!.label).toBe('00:00:02:15');
+    const off = cutPreviewFor(proj, rows, CUT_VIEW, 900, row.top + 5, false, play, 8);
+    expect(off).toBeNull();
+  });
+
+  it('labels a cut point as HH:MM:SS:FF at the canvas frame rate', () => {
+    const { proj } = cutProj(0);
+    expect(cutPreviewLabel(Math.round(1.5 * S), proj)).toBe('00:00:01:15');
+  });
+
+  it('label is empty instead of throwing when the frame rate is missing', () => {
+    const { proj } = cutProj(0);
+    const broken = { ...proj, canvas: { ...proj.canvas, fps: undefined as unknown as { num: number; den: number } } };
+    expect(cutPreviewLabel(Math.round(1.5 * S), broken)).toBe('');
   });
 });

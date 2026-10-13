@@ -41,6 +41,8 @@
     RULER_HEIGHT,
     TRACK_GAP,
     clipRect,
+    cutPreviewFor,
+    cutSnapPoint,
     hitTest,
     snapTargets,
     snapTick,
@@ -70,7 +72,7 @@
     type MarqueeRect,
     type PointerLike,
   } from './timelineDrag';
-  import { clipEnd, formatTimecode, secToTick, tickToSec } from './ticks';
+  import { clipEnd, secToTick, tickToSec } from './ticks';
   import type { ApplyReply, Clip, Command, MediaRef, Project, Tick, Track, TrackKind } from './types';
 
   /** Width of the track header column, px. */
@@ -270,50 +272,14 @@
   const playVisible = $derived(proj !== null && playX >= 0 && playX <= vpWidth);
 
   /**
-   * Cut point for an x in the track area: the raw time, or the playhead / nearest clip boundary
-   * (any track, enabled or not) within SNAP_PX. The playhead is listed first, so it wins ties.
-   * Shift disables snapping. Used by both the cut preview and the click that cuts.
+   * Cut preview (Cut tool only): shown only over a clip, at the snapped cut point (playhead or clip
+   * boundary within SNAP_PX; Shift disables snapping). Null when the tool is off or the pointer is
+   * not over a clip. The click that cuts uses the same `cutSnapPoint` (layout.ts).
    */
-  function cutSnap(current: Project, x: number, shift: boolean, play: Tick, v: View): {
-    tick: Tick;
-    x: number;
-    kind: 'playhead' | 'clip' | null;
-  } {
-    const raw = xToTick(x, v);
-    if (shift) return { tick: raw, x: tickToX(raw, v), kind: null };
-    const candidates: { tick: Tick; kind: 'playhead' | 'clip' }[] = [{ tick: play, kind: 'playhead' }];
-    for (const c of current.clips) {
-      candidates.push({ tick: c.start, kind: 'clip' }, { tick: clipEnd(c), kind: 'clip' });
-    }
-    let best: { tick: Tick; x: number; kind: 'playhead' | 'clip'; dist: number } | null = null;
-    for (const cand of candidates) {
-      const cx = tickToX(cand.tick, v);
-      const dist = Math.abs(cx - x);
-      if (dist > SNAP_PX) continue;
-      if (best === null || dist < best.dist) best = { tick: cand.tick, x: cx, kind: cand.kind, dist };
-    }
-    if (best === null) return { tick: raw, x: tickToX(raw, v), kind: null };
-    return { tick: best.tick, x: best.x, kind: best.kind };
-  }
-
-  /**
-   * Cut preview: shown only over a clip (the one a click would cut), at the snapped cut point.
-   * Null when the Cut tool is off or the pointer is not over a clip.
-   */
-  const cutPreview = $derived.by(
-    (): { x: number; snapped: boolean; kind: 'playhead' | 'clip' | null; label: string } | null => {
-      if ($tool !== 'razor' || cutPos === null || proj === null) return null;
-      const hit = hitTest(proj, rows, view, cutPos.x, cutPos.y);
-      if (hit.kind !== 'clip' || !hit.clipId) return null;
-      const cut = cutSnap(proj, cutPos.x, shiftHeld, $playhead, view);
-      return {
-        x: cut.x,
-        snapped: cut.kind !== null,
-        kind: cut.kind,
-        label: formatTimecode(cut.tick, proj.fps),
-      };
-    },
-  );
+  const cutPreview = $derived.by(() => {
+    if ($tool !== 'razor' || cutPos === null || proj === null) return null;
+    return cutPreviewFor(proj, rows, view, cutPos.x, cutPos.y, shiftHeld, $playhead, SNAP_PX);
+  });
 
   // Cut tool: Shift is tracked on the window (not only on pointer events) so the preview reacts to
   // Shift without the mouse moving. Listeners exist only while the Cut tool is active.
@@ -881,7 +847,7 @@
     if ($tool === 'razor') {
       if (hit.kind === 'clip' && hit.clipId) {
         // Same snapped tick as the cut preview; Shift on this press disables snapping.
-        const cut = cutSnap(current, p.x, e.shiftKey, get(playhead), view);
+        const cut = cutSnapPoint(current, p.x, e.shiftKey, get(playhead), view, SNAP_PX);
         void dispatch({ type: 'split_at', time: cut.tick, ids: [hit.clipId] });
       }
       return;
