@@ -37,6 +37,48 @@ fn expand_env(input: &str) -> String {
     out
 }
 
+/// The Explorer argument that opens the folder and selects the file: `/select,"<path>"`. Explorer
+/// only selects when every separator is a backslash and the path has no verbatim (`\\?\`) prefix.
+/// The library joins a root with a forward-slash relative path, which made Explorer open the folder
+/// without selecting the file.
+fn select_arg(path: &Path) -> String {
+    let text = path.display().to_string().replace('/', "\\");
+    let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text
+    };
+    format!("/select,\"{text}\"")
+}
+
+#[cfg(test)]
+mod select_arg_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_separators_become_backslashes() {
+        let p = Path::new(r"F:\ClipCheck\Sessions").join("FiveM/FiveM 2026-10-13.mp4");
+        assert_eq!(
+            select_arg(&p),
+            "/select,\"F:\\ClipCheck\\Sessions\\FiveM\\FiveM 2026-10-13.mp4\""
+        );
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_removed() {
+        assert_eq!(
+            select_arg(Path::new(r"\\?\C:\Videos\a.mp4")),
+            "/select,\"C:\\Videos\\a.mp4\""
+        );
+        assert_eq!(
+            select_arg(Path::new(r"\\?\UNC\server\share\a.mp4")),
+            "/select,\"\\\\server\\share\\a.mp4\""
+        );
+    }
+}
+
 /// Opens Explorer with the recording's file selected.
 #[tauri::command]
 pub fn reveal_recording(id: String) -> Result<(), String> {
@@ -50,7 +92,7 @@ pub fn reveal_recording(id: String) -> Result<(), String> {
     // whole /select,... token when the path has spaces, and Explorer then opens Documents instead.
     let mut cmd = Command::new("explorer.exe");
     #[cfg(windows)]
-    cmd.raw_arg(format!("/select,\"{}\"", path.display()));
+    cmd.raw_arg(select_arg(&path));
     #[cfg(not(windows))]
     cmd.arg(format!("/select,{}", path.display()));
     cmd.spawn()
