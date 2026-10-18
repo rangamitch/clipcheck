@@ -14,6 +14,7 @@ use clipcheck_ipc::proto::{AutostartState, Event, StatusDto};
 use clipcheck_ipc::{default_pipe_name, PipeServer};
 use clipcheck_library::Library;
 
+use crate::autostart;
 use crate::configstore::ConfigStore;
 use crate::configwatch::ConfigWatcher;
 use crate::events::EventBus;
@@ -172,7 +173,14 @@ impl AppState {
     /// Snapshot for `get_status`: the service's view plus the daemon-level fields.
     pub fn status(&self) -> Result<StatusDto, ServiceError> {
         let mut status = self.service.status()?;
-        status.autostart = if self.config.general.autostart {
+        // The live config (reloads change it); the startup copy is the fallback.
+        let configured = self
+            .service
+            .config()
+            .ok()
+            .and_then(|view| view.config.get("general")?.get("autostart")?.as_bool())
+            .unwrap_or(self.config.general.autostart);
+        status.autostart = if configured && autostart::is_registered() {
             AutostartState::Enabled
         } else {
             AutostartState::Disabled
@@ -282,6 +290,8 @@ where
             return EXIT_FAILURE;
         }
     };
+    // Re-register "start with Windows" so it follows the exe after an update or move.
+    autostart::reconcile(config.general.autostart);
     let state = Arc::new(AppState::new(config, bus, service));
 
     // Hand edits to config.toml take effect without a restart. The watcher

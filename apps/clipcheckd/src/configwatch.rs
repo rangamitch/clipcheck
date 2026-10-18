@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clipcheck_ipc::proto::ErrorCode;
 
+use crate::autostart;
 use crate::logging;
 use crate::service::{ConfigOutcome, Service};
 
@@ -126,6 +127,7 @@ fn watch_loop(path: &Path, service: &Service, stop: &AtomicBool) {
                     ),
                     Ok(ConfigOutcome::Applied { .. }) => {
                         logging::info("config.toml changed on disk; new settings applied");
+                        autostart::sync_from_service(service);
                     }
                     Ok(ConfigOutcome::Checked { .. }) => {}
                     Err(e) if matches!(e.code, ErrorCode::ShuttingDown) => return,

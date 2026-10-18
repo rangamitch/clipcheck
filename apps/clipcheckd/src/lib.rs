@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod appinfo;
+pub mod autostart;
 pub mod branding;
 pub mod configstore;
 pub mod configwatch;
