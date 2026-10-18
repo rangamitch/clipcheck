@@ -13,6 +13,7 @@ pub mod details;
 pub mod editor;
 pub mod fileops;
 pub mod ipc;
+pub mod logs;
 pub mod media;
 pub mod mediaserver;
 pub mod player;
@@ -126,6 +127,9 @@ pub fn run() {
             commands::get_game_icons,
             fileops::reveal_recording,
             fileops::open_folder,
+            logs::get_log_dir,
+            logs::collect_diagnostics,
+            logs::export_diagnostics,
             fileops::pick_folder,
             ipc::daemon_request,
             ipc::daemon_connected,

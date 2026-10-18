@@ -16,8 +16,10 @@
     startSettingsSync,
   } from './settings/store';
   import { liveStatus } from './status';
+  import LogsPanel from './settings/LogsPanel.svelte';
 
   let active = $state(SETTINGS_TABS[0].id);
+  let logsOpen = $state(false);
 
   function messageOf(e: unknown): string {
     return e instanceof Error ? e.message : String(e);
@@ -147,6 +149,17 @@
           {tab.label}
         </button>
       {/each}
+      <div class="logs-entry">
+        <button
+          type="button"
+          class="tab"
+          aria-haspopup="dialog"
+          aria-expanded={logsOpen}
+          onclick={() => (logsOpen = true)}
+        >
+          Logs &amp; diagnostics
+        </button>
+      </div>
     </div>
 
     <div
@@ -194,6 +207,8 @@
       {/if}
     </div>
   </div>
+
+  <LogsPanel bind:open={logsOpen} />
 
   <footer class="footer">
     <div class="status" role="status" aria-live="polite">
@@ -283,6 +298,18 @@
     color: var(--text-dim);
     font: inherit;
     cursor: pointer;
+  }
+
+  /* Pinned to the bottom of the tab column, below a divider. Not a tab (see LogsPanel). */
+  .logs-entry {
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+  }
+
+  .logs-entry .tab {
+    width: 100%;
+    box-sizing: border-box;
   }
 
   .tab:hover {
