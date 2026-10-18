@@ -17,8 +17,9 @@ use crate::service::Service;
 pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 /// Value name under [`RUN_KEY`]. Matches the NSIS installer's uninstall cleanup.
 pub const VALUE_NAME: &str = "ClipCheck";
-/// File name of the UI executable that the Run entry starts.
-pub const UI_EXE_NAME: &str = "ClipCheck.exe";
+/// File names of the UI executable that the Run entry starts: the installed `clipcheck-ui.exe`
+/// (the daemon runs inside it) first, then a portable `ClipCheck.exe`.
+pub const UI_EXE_NAMES: [&str; 2] = ["clipcheck-ui.exe", "ClipCheck.exe"];
 
 /// Last value this process reconciled: 0 unknown, 1 disabled, 2 enabled.
 static LAST_APPLIED: AtomicU8 = AtomicU8::new(0);
@@ -132,9 +133,18 @@ pub fn is_registered() -> bool {
 /// The UI exe expected next to this process (`ClipCheck.exe` beside `clipcheckd.exe`, or
 /// beside the running `ClipCheck.exe` when the daemon runs inside it). `None` if it is missing.
 pub fn ui_exe_path() -> Option<PathBuf> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let candidate = dir.join(UI_EXE_NAME);
-    candidate.is_file().then_some(candidate)
+    pick_ui_exe(&std::env::current_exe().ok()?, &|p| p.is_file())
+}
+
+/// Chooses the UI exe for `current` (the running exe): itself when the daemon runs inside the UI
+/// (`clipcheck-ui.exe`, the installed layout), else a sibling `clipcheck-ui.exe` or `ClipCheck.exe`.
+pub fn pick_ui_exe(current: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    let name = current.file_name()?.to_string_lossy().to_ascii_lowercase();
+    if UI_EXE_NAMES.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+        return Some(current.to_path_buf());
+    }
+    let dir = current.parent()?;
+    UI_EXE_NAMES.iter().map(|n| dir.join(n)).find(|c| exists(c))
 }
 
 /// Brings the Run value in line with `desired`. Never fails: problems are logged.
@@ -144,9 +154,7 @@ pub fn reconcile(desired: bool) {
         match ui_exe_path() {
             Some(exe) => apply(true, &exe),
             None => {
-                logging::warn(&format!(
-                    "start with Windows: {UI_EXE_NAME} not found next to the daemon; not registered"
-                ));
+                logging::warn("start with Windows: clipcheck-ui.exe not found next to the daemon; not registered");
                 LAST_APPLIED.store(2, Ordering::SeqCst);
                 return;
             }
@@ -186,6 +194,20 @@ pub fn sync_from_service(service: &Service) {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn installed_layout_registers_the_running_ui_exe() {
+        let cur = Path::new(r"C:\Users\u\AppData\Local\ClipCheck\clipcheck-ui.exe");
+        assert_eq!(pick_ui_exe(cur, &|_| false), Some(cur.to_path_buf()));
+    }
+
+    #[test]
+    fn daemon_exe_picks_a_sibling_ui_exe() {
+        let cur = Path::new(r"C:\app\clipcheckd.exe");
+        let found = pick_ui_exe(cur, &|p| p.ends_with("ClipCheck.exe"));
+        assert_eq!(found, Some(PathBuf::from(r"C:\app\ClipCheck.exe")));
+        assert_eq!(pick_ui_exe(cur, &|_| false), None);
+    }
 
     /// Records every call and answers from a canned list of results.
     struct FakeReg {
