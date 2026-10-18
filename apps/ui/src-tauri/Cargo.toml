@@ -30,7 +30,7 @@ clipcheck-timeline = { path = "../../../crates/timeline" }
 clipcheck-render = { path = "../../../crates/render" }
 clipcheck-hwenc = { path = "../../../crates/hwenc" }
 tauri-plugin-single-instance = "2"
-tauri-plugin-updater = "2"
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 url = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
