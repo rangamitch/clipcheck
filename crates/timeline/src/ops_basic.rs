@@ -117,7 +117,7 @@ pub fn relink_media(p: &mut Project, media_id: &str, mut new: MediaRef) -> EditR
 /// `src_in`/`src_len` select the used range of the source (zero `src_len` means "to the end of the
 /// media"). All created clips share a fresh `link_id`. Returns the new clip ids (video first).
 /// `Append` places at the end of the video track (or the audio track for audio media). The project
-/// canvas size/fps is NOT changed.
+/// canvas size/fps is NOT changed. Uses the default microphone choice (`ptt_mix_gated` = true).
 pub fn place_media(
     p: &mut Project,
     media_id: &str,
@@ -126,6 +126,22 @@ pub fn place_media(
     src_len: Tick,
     video_track: Option<&str>,
     mode: PlaceMode,
+) -> EditResult<Vec<String>> {
+    place_media_with_mic(p, media_id, at, src_in, src_len, video_track, mode, true)
+}
+
+/// Same as [`place_media`], with `ptt_mix_gated` telling which microphone stream the recorder's
+/// "Mix" carries (see [`placed_audio_streams`]).
+#[allow(clippy::too_many_arguments)]
+pub fn place_media_with_mic(
+    p: &mut Project,
+    media_id: &str,
+    at: Tick,
+    src_in: Tick,
+    src_len: Tick,
+    video_track: Option<&str>,
+    mode: PlaceMode,
+    ptt_mix_gated: bool,
 ) -> EditResult<Vec<String>> {
     let media: MediaRef = p
         .media_ref(media_id)
@@ -205,7 +221,7 @@ pub fn place_media(
 
     // Audio slots: one audio track per placed stream, consecutive from the first unlocked audio
     // track. `placed[i]` is the original stream index of slot `i`.
-    let placed = placed_audio_streams(&media);
+    let placed = placed_audio_streams(&media, ptt_mix_gated);
     let stream_count = placed.len();
     let mut slots: Vec<String> = Vec::new();
     if stream_count > 0 {
@@ -365,8 +381,10 @@ pub fn place_media(
 /// Video media skip every stream whose trimmed title is "Mix" (case-insensitive): that stream is
 /// the pre-mixed combination of the individual sources, which are placed instead. If skipping
 /// would leave no stream (only a Mix stream, or one unnamed stream), all streams are placed.
+/// When the remaining streams include both "Microphone" and "Push to talk" (trimmed,
+/// case-insensitive), only the one the Mix carries is kept (see [`pick_mic_stream`]).
 /// Audio media place stream 0 only (one lane, as before). Image media place none.
-fn placed_audio_streams(media: &MediaRef) -> Vec<usize> {
+fn placed_audio_streams(media: &MediaRef, ptt_mix_gated: bool) -> Vec<usize> {
     match media.kind {
         MediaKind::Image => Vec::new(),
         MediaKind::Audio => vec![0],
@@ -380,10 +398,37 @@ fn placed_audio_streams(media: &MediaRef) -> Vec<usize> {
             if kept.is_empty() {
                 all
             } else {
-                kept
+                let titles: Vec<&str> = kept
+                    .iter()
+                    .map(|&i| media.audio.get(i).map_or("", |a| a.title.as_str()))
+                    .collect();
+                match pick_mic_stream(&titles, ptt_mix_gated) {
+                    Some(drop_at) => kept
+                        .iter()
+                        .enumerate()
+                        .filter(|(pos, _)| *pos != drop_at)
+                        .map(|(_, &i)| i)
+                        .collect(),
+                    None => kept,
+                }
             }
         }
     }
+}
+
+/// When `titles` holds both a "Microphone" and a "Push to talk" stream (trimmed, case-insensitive),
+/// returns the position of the one NOT carried by the recorder's Mix: "Microphone" when
+/// `ptt_mix_gated` (the Mix has the push-to-talk version), "Push to talk" otherwise. Returns None
+/// when either title is missing (nothing to choose between).
+fn pick_mic_stream(titles: &[&str], ptt_mix_gated: bool) -> Option<usize> {
+    let find = |name: &str| {
+        titles
+            .iter()
+            .position(|t| t.trim().eq_ignore_ascii_case(name))
+    };
+    let mic = find("Microphone")?;
+    let ptt = find("Push to talk")?;
+    Some(if ptt_mix_gated { mic } else { ptt })
 }
 
 /// True when audio stream `i` of `media` is titled "Mix" (ignoring case and surrounding spaces).
@@ -392,6 +437,30 @@ fn is_mix_stream(media: &MediaRef, i: usize) -> bool {
         .audio
         .get(i)
         .is_some_and(|a| a.title.trim().eq_ignore_ascii_case("Mix"))
+}
+
+#[cfg(test)]
+mod mic_pick_tests {
+    use super::pick_mic_stream;
+
+    #[test]
+    fn gated_mix_keeps_push_to_talk_and_drops_microphone() {
+        let titles = ["Game", "Microphone", " push TO talk "];
+        assert_eq!(pick_mic_stream(&titles, true), Some(1));
+    }
+
+    #[test]
+    fn ungated_mix_keeps_microphone_and_drops_push_to_talk() {
+        let titles = ["Push to talk", "Game", "Microphone"];
+        assert_eq!(pick_mic_stream(&titles, false), Some(0));
+    }
+
+    #[test]
+    fn single_mic_stream_is_left_alone() {
+        assert_eq!(pick_mic_stream(&["Game", "Microphone"], true), None);
+        assert_eq!(pick_mic_stream(&["Push to talk", "Game"], false), None);
+        assert_eq!(pick_mic_stream(&["Game", "Audio 2"], true), None);
+    }
 }
 
 /// Label of audio stream `i` (an index into `media.audio`) of a media file: its title, else

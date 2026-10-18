@@ -214,6 +214,9 @@ pub struct Session {
     pub clipboard: Vec<Clip>,
     /// Number of commands applied since the last [`Session::mark_saved`] (0 = clean).
     dirty: bool,
+    /// Runtime-only microphone preference for `PlaceMedia` (not saved): true when the recorder's
+    /// Mix carries the push-to-talk microphone. See [`Session::set_ptt_mix_gated`].
+    ptt_mix_gated: bool,
 }
 
 impl Session {
@@ -225,7 +228,15 @@ impl Session {
             redo: Vec::new(),
             clipboard: Vec::new(),
             dirty: false,
+            ptt_mix_gated: true,
         }
+    }
+
+    /// Sets which microphone stream the recorder's Mix carries (`audio.mic.ptt_mix_gated`): true
+    /// for the push-to-talk version (the default), false for the normal "Microphone". Used by
+    /// `PlaceMedia` to skip the duplicate microphone lane. Not part of the saved project.
+    pub fn set_ptt_mix_gated(&mut self, gated: bool) {
+        self.ptt_mix_gated = gated;
     }
 
     /// Applies a command. On `Err` the project and the stacks are unchanged. On success pushes a
@@ -248,7 +259,7 @@ impl Session {
         }
         let before = self.project.clone();
         let before_ids = ids_of(&before);
-        if let Err(e) = run(&mut self.project, cmd, &self.clipboard) {
+        if let Err(e) = run(&mut self.project, cmd, &self.clipboard, self.ptt_mix_gated) {
             self.project = before;
             return Err(e);
         }
@@ -329,7 +340,8 @@ fn ids_of(p: &Project) -> BTreeSet<String> {
 
 /// Runs one non-clipboard command against the project. Ops are atomic; the caller restores the
 /// snapshot on error. `clipboard` is used by `PasteClips` when its own clip list is empty.
-fn run(p: &mut Project, cmd: Command, clipboard: &[Clip]) -> EditResult<()> {
+/// `ptt_mix_gated` is the session's microphone preference, used by `PlaceMedia`.
+fn run(p: &mut Project, cmd: Command, clipboard: &[Clip], ptt_mix_gated: bool) -> EditResult<()> {
     match cmd {
         Command::AddMedia { media } => ops_basic::add_media(p, media).map(|_| ()),
         Command::RemoveMedia { media_id } => ops_basic::remove_media(p, &media_id),
@@ -341,7 +353,7 @@ fn run(p: &mut Project, cmd: Command, clipboard: &[Clip]) -> EditResult<()> {
             src_len,
             video_track,
             mode,
-        } => ops_basic::place_media(
+        } => ops_basic::place_media_with_mic(
             p,
             &media_id,
             at,
@@ -349,6 +361,7 @@ fn run(p: &mut Project, cmd: Command, clipboard: &[Clip]) -> EditResult<()> {
             src_len,
             video_track.as_deref(),
             mode,
+            ptt_mix_gated,
         )
         .map(|_| ()),
         Command::MoveClips { moves } => ops_basic::move_clips(p, &moves),

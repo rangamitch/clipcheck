@@ -160,6 +160,7 @@ pub fn run() {
             editor::session_cmds::editor_snap_points,
             editor::session_cmds::editor_clipboard_len,
             editor::session_cmds::editor_current_snapshot,
+            editor::session_cmds::editor_set_mic_pref,
             editor::media::editor_probe_media,
             editor::media::editor_media_from_recording,
             editor::media::editor_media_status,

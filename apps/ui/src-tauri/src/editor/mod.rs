@@ -27,6 +27,19 @@ pub struct EditorState {
     pub session: Mutex<Option<Session>>,
     /// Export job manager.
     pub exports: export::ExportManager,
+    /// `audio.mic.ptt_mix_gated` as last reported by the UI (None until it is). Applied to every
+    /// session created or opened, so `PlaceMedia` skips the duplicate microphone stream.
+    pub mic_ptt_mix_gated: Mutex<Option<bool>>,
+}
+
+impl EditorState {
+    /// The microphone preference for new sessions: true (the default) until the UI reports one.
+    pub fn ptt_mix_gated(&self) -> bool {
+        self.mic_ptt_mix_gated
+            .lock()
+            .map(|g| g.unwrap_or(true))
+            .unwrap_or(true)
+    }
 }
 
 /// What the UI receives after opening a project or applying an edit.

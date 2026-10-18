@@ -288,6 +288,7 @@ fn open_file(
     refresh_media_status(&mut project);
     let modes = project.modes;
     let mut session = Session::new(project);
+    session.set_ptt_mix_gated(state.ptt_mix_gated());
     let same_project = lock_session(state)?
         .as_ref()
         .is_some_and(|s| s.project.id == id);
@@ -450,6 +451,7 @@ pub async fn editor_new_project(
         snap: settings.snap_default,
     };
     let mut session = Session::new(project);
+    session.set_ptt_mix_gated(state.ptt_mix_gated());
 
     let canvas = canvas.unwrap_or_else(|| default_canvas_for(&settings, medias.first()));
     apply(&mut session, Command::SetCanvas { canvas })?;
@@ -481,6 +483,7 @@ pub async fn editor_new_project(
 
     // Setup steps (canvas, media, placement) are the project's content, not undoable history.
     let mut session = Session::new(session.project.clone());
+    session.set_ptt_mix_gated(state.ptt_mix_gated());
     session.project.modified_ms = now_ms();
     let path = ccproj_path(&session.project.id)?;
     write_atomic(&path, &json::to_json(&session.project))?;

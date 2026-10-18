@@ -117,6 +117,19 @@ pub fn editor_apply(state: State<'_, EditorState>, command: Command) -> Result<A
     Ok(ApplyReply { applied, snapshot })
 }
 
+/// Sets the microphone preference (`audio.mic.ptt_mix_gated`): remembered for sessions opened
+/// later and applied to the open session now. Runtime-only; not saved in the project.
+#[tauri::command]
+pub fn editor_set_mic_pref(state: State<'_, EditorState>, gated: bool) -> Result<(), String> {
+    if let Ok(mut pref) = state.mic_ptt_mix_gated.lock() {
+        *pref = Some(gated);
+    }
+    if let Some(session) = lock_session(&state).as_mut() {
+        session.set_ptt_mix_gated(gated);
+    }
+    Ok(())
+}
+
 /// Snapshot of the open session, or `None` when no project is open (not an error).
 #[tauri::command]
 pub fn editor_current_snapshot(

@@ -32,6 +32,7 @@
     stopAutosave,
   } from './store';
   import { msToTick } from './ticks';
+  import { watchMicPref } from './micPref';
   import type { Command, EditorSnapshot } from './types';
   import { editorTarget, type EditorTarget } from '../nav';
 
@@ -339,6 +340,8 @@
     const unsubSource = sourceRequest.subscribe((req) => {
       if (req !== null && sourceMediaId !== null) showTab('source');
     });
+    // Tell the backend which microphone the recorder's Mix carries (see micPref.ts).
+    const unsubMicPref = watchMicPref();
 
     void (async () => {
       try {
@@ -386,6 +389,7 @@
     return () => {
       cancelled = true;
       unsubSource();
+      unsubMicPref();
       window.removeEventListener('keydown', onWindowKey);
     };
   });
