@@ -1,6 +1,7 @@
-//! Tests for the default-audio ordering: the first logical audio track ("Mix", track id 2) is
-//! written LAST in the moov so Windows plays it by default. Logical order (track ids) must be
-//! preserved by the reader and by `concat_remux`.
+//! Tests for the default-audio ordering: traks are written in input order, so the first logical
+//! audio track ("Mix", track id 2) is also the FIRST audio trak physically in the moov (physical
+//! order == input order, id stays 2). The reader sorts tracks by id, so files written with Mix
+//! physically last (the pre-change layout) must still read in logical order.
 //!
 //! Synthetic media only (no native media generator), so these run everywhere.
 
@@ -125,10 +126,59 @@ fn remux_one(input: &Path, out: &Path) -> Vec<u8> {
     std::fs::read(out).expect("read output")
 }
 
+/// Byte range (start, end) and track id of every `trak` box in `bytes`. The box starts 4 bytes
+/// before the `trak` fourcc; the track id sits 16 bytes after the `tkhd` fourcc.
+fn trak_ranges(bytes: &[u8]) -> Vec<(usize, usize, u32)> {
+    let mut out = Vec::new();
+    for i in 4..bytes.len().saturating_sub(4) {
+        if &bytes[i..i + 4] != b"trak" {
+            continue;
+        }
+        let start = i - 4;
+        let size = u32::from_be_bytes([
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ]) as usize;
+        let end = start + size;
+        let tkhd = (i..end.min(bytes.len()).saturating_sub(4))
+            .find(|&j| &bytes[j..j + 4] == b"tkhd")
+            .expect("trak has tkhd");
+        let at = tkhd + 16;
+        let id = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+        out.push((start, end, id));
+    }
+    out
+}
+
+/// Rewrites an init segment so the trak with `id` is physically after every other trak (the
+/// pre-change layout where the first audio trak was written last). Traks are contiguous in moov
+/// and the moov size is unchanged, so no other offsets move.
+fn move_trak_to_end(bytes: &[u8], id: u32) -> Vec<u8> {
+    let ranges = trak_ranges(bytes);
+    let (start, end, _) = *ranges
+        .iter()
+        .find(|r| r.2 == id)
+        .expect("trak with requested id");
+    let last_end = ranges.iter().map(|r| r.1).max().expect("at least one trak");
+    assert!(
+        end <= last_end && start < last_end,
+        "trak not before last trak"
+    );
+    [
+        &bytes[..start],
+        &bytes[end..last_end],
+        &bytes[start..end],
+        &bytes[last_end..],
+    ]
+    .concat()
+}
+
 #[test]
-fn init_writes_first_audio_trak_last() {
+fn init_writes_audio_traks_in_input_order() {
     let init = write_init(&init_spec(&["Mix", "Game", "Microphone"]));
-    assert_eq!(raw_tkhd_ids(&init), vec![1, 3, 4, 2]);
+    assert_eq!(raw_tkhd_ids(&init), vec![1, 2, 3, 4]);
 }
 
 #[test]
@@ -146,7 +196,7 @@ fn reader_returns_logical_order_for_three_audio_tracks() {
 }
 
 #[test]
-fn remux_preserves_logical_order_and_puts_mix_last_in_raw_order() {
+fn remux_preserves_logical_order_and_keeps_mix_first_in_raw_order() {
     let dir = tempfile::tempdir().unwrap();
     let input = write_file(dir.path(), "in.mp4", &media(&["Mix", "Game", "Microphone"]));
     let out = dir.path().join("out.mp4");
@@ -165,8 +215,38 @@ fn remux_preserves_logical_order_and_puts_mix_last_in_raw_order() {
     );
     assert_eq!(
         raw_tkhd_ids(&bytes),
-        vec![1, 3, 4, 2],
-        "raw tkhd order of remux output (first audio last)"
+        vec![1, 2, 3, 4],
+        "raw tkhd order of remux output (Mix, the first audio trak, is physically first)"
+    );
+}
+
+#[test]
+fn reader_sorts_by_id_for_old_file_with_mix_physically_last() {
+    // Old layout: Mix (id 2) written after the Game and Microphone traks.
+    let old_init = move_trak_to_end(&write_init(&init_spec(&["Mix", "Game", "Microphone"])), 2);
+    assert_eq!(raw_tkhd_ids(&old_init), vec![1, 3, 4, 2], "fixture layout");
+    let old = [old_init, fragment(3, 1)].concat();
+
+    let m = parse(&old);
+    assert_eq!(
+        ids_and_titles(&m),
+        vec![
+            (1, None),
+            (2, Some("Mix".to_string())),
+            (3, Some("Game".to_string())),
+            (4, Some("Microphone".to_string())),
+        ],
+        "reader returns id-sorted tracks for old files"
+    );
+
+    // Remuxing the old file writes the traks in input (id) order.
+    let dir = tempfile::tempdir().unwrap();
+    let input = write_file(dir.path(), "old.mp4", &old);
+    let out = remux_one(&input, &dir.path().join("out.mp4"));
+    assert_eq!(raw_tkhd_ids(&out), vec![1, 2, 3, 4], "remux of old file");
+    assert_eq!(
+        audio_titles(&parse(&out)),
+        vec!["Mix", "Game", "Microphone"]
     );
 }
 
@@ -180,7 +260,7 @@ fn remux_twice_is_stable() {
     let twice = remux_one(&once_path, &twice_path);
 
     assert_eq!(raw_tkhd_ids(&twice), raw_tkhd_ids(&once), "raw tkhd order");
-    assert_eq!(raw_tkhd_ids(&twice), vec![1, 3, 4, 2]);
+    assert_eq!(raw_tkhd_ids(&twice), vec![1, 2, 3, 4]);
     let m = parse(&twice);
     assert_eq!(audio_titles(&m), vec!["Mix", "Game", "Microphone"]);
     assert_eq!(
