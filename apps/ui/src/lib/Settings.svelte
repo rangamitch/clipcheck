@@ -17,6 +17,7 @@
   } from './settings/store';
   import { liveStatus } from './status';
   import LogsPanel from './settings/LogsPanel.svelte';
+  import CacheEntry from './settings/CacheEntry.svelte';
 
   let active = $state(SETTINGS_TABS[0].id);
   let logsOpen = $state(false);
@@ -150,6 +151,7 @@
         </button>
       {/each}
       <div class="logs-entry">
+        <CacheEntry />
         <button
           type="button"
           class="tab"
@@ -305,6 +307,9 @@
     margin-top: auto;
     padding-top: 12px;
     border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
   }
 
   .logs-entry .tab {

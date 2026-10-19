@@ -12,12 +12,16 @@ use clipcheck_library::Library;
 pub const MAX_CHUNK: u64 = 8 * 1024 * 1024;
 
 /// Where the audio sidecar for track `n` of a recording lives.
+///
+/// The file name carries a `.v2` marker (`track{n}.v2.m4a`). Sidecars written by older builds
+/// are about 24 times too large and are never reused: they keep the plain `track{n}.m4a` name,
+/// so the cache maintenance can recognise and delete them (see `app_cache`).
 pub fn sidecar_path(cache_dir: &Path, id: &str, size: u64, mtime_ms: i64, n: u32) -> PathBuf {
     cache_dir
         .join("audio")
         .join(id)
         .join(format!("{size}-{mtime_ms}"))
-        .join(format!("track{n}.m4a"))
+        .join(format!("track{n}.v2.m4a"))
 }
 
 /// Parsed `Range` header.

@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use serde_json::json;
 use tauri::{Emitter, Manager};
 
+pub mod app_cache;
 pub mod cli;
 pub mod closing;
 pub mod commands;
@@ -97,6 +98,8 @@ pub fn run() {
             }
             // Update state and the background check loop (reads the client managed above).
             updater::setup(app.handle());
+            // Player and editor cache maintenance: legacy sidecar pruning and the size limit.
+            app_cache::spawn_maintenance();
             // Set explicitly so the logo also shows in dev runs, where the bundle icon is not applied.
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(tauri::include_image!("icons/icon.png"))?;
@@ -187,6 +190,8 @@ pub fn run() {
             editor::export::editor_list_presets,
             editor::cache::editor_cache_info,
             editor::cache::editor_clear_cache,
+            app_cache::app_cache_info,
+            app_cache::app_clear_cache,
             ipc::daemon_connection_error
         ])
         .run(tauri::generate_context!())

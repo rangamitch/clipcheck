@@ -26,6 +26,9 @@ const TARGET_PERCENT: u64 = 90;
 /// Minimum time between two automatic limit checks.
 const LIMIT_CHECK_INTERVAL: Duration = Duration::from_secs(600);
 
+/// Youngest age at which an empty audio-cache folder is removed.
+const EMPTY_DIR_MIN_AGE: Duration = Duration::from_secs(600);
+
 /// Bytes in one GB (GiB, as Explorer reports sizes).
 const GIB: u64 = 1024 * 1024 * 1024;
 
@@ -101,13 +104,13 @@ pub fn limit_bytes(max_gb: u32) -> u64 {
 }
 
 /// Cache root for `settings` (the override when set, else `<editor_root>\cache`).
-fn cache_root(settings: &EditorSettings) -> PathBuf {
+pub(crate) fn cache_root(settings: &EditorSettings) -> PathBuf {
     let root = paths::editor_root(std::env::var("LOCALAPPDATA").ok().as_deref());
     paths::cache_dir(&root, &settings.cache_dir)
 }
 
 /// True for symlinks and reparse points (junctions). Never followed, never deleted.
-fn is_link(meta: &fs::Metadata) -> bool {
+pub(crate) fn is_link(meta: &fs::Metadata) -> bool {
     meta.file_type().is_symlink() || reparse_point(meta)
 }
 
@@ -239,7 +242,8 @@ pub fn clear_at(root: &Path) {
 }
 
 /// Enforces `limit_bytes` on the editor subfolders under `root`. In-progress (`.part`) files are
-/// never candidates. Returns how many files were deleted.
+/// never candidates. Afterwards empty folders under `audio` are removed (see
+/// [`remove_empty_dirs`]). Returns how many files were deleted.
 pub fn enforce_limit(root: &Path, limit_bytes: u64) -> usize {
     let files: Vec<CacheFile> = CACHE_SUBDIRS
         .iter()
@@ -247,10 +251,52 @@ pub fn enforce_limit(root: &Path, limit_bytes: u64) -> usize {
         .filter(|f| !f.partial)
         .map(|f| f.file)
         .collect();
-    eviction_plan(&files, limit_bytes)
+    let deleted = eviction_plan(&files, limit_bytes)
         .iter()
         .filter(|path| fs::remove_file(path).is_ok())
-        .count()
+        .count();
+    remove_empty_dirs(root);
+    deleted
+}
+
+/// Removes the empty folders under `root\audio`, bottom-up. Best effort. Links are never followed
+/// or removed, and the `audio` folder itself (and the other two subfolders) are kept.
+pub fn remove_empty_dirs(root: &Path) {
+    let audio = root.join("audio");
+    let Ok(meta) = fs::symlink_metadata(&audio) else {
+        return;
+    };
+    if meta.is_dir() && !is_link(&meta) {
+        remove_empty_below(&audio);
+    }
+}
+
+/// Recursively removes the empty subfolders of `dir` (not `dir` itself). Returns nothing; errors
+/// (a folder in use, a missing folder) are ignored.
+fn remove_empty_below(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() && !is_link(&meta) {
+            remove_empty_below(&path);
+            // A folder younger than this may be about to receive a file (the player creates it
+            // before its long extraction starts), so it is left alone.
+            let fresh = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < EMPTY_DIR_MIN_AGE);
+            if !fresh {
+                // Fails harmlessly when the folder still has content or is in use.
+                let _ = fs::remove_dir(&path);
+            }
+        }
+    }
 }
 
 /// True while an export is queued, running or paused. Cache deletion waits for that.

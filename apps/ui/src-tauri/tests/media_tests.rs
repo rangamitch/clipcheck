@@ -524,6 +524,6 @@ fn sidecar_path_shape() {
         .join("audio")
         .join("01REC100000000000000000000")
         .join("1234-5678")
-        .join("track2.m4a");
+        .join("track2.v2.m4a");
     assert_eq!(p, want);
 }
