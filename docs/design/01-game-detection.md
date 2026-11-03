@@ -557,6 +557,7 @@ Result is cached per `(pid, process_start_ms)` for the process lifetime.
 | G1 | exe not in blocklist (built-in ∪ `block_extra`) | `Blocklisted` |
 | G2 | exe not in launchers, not in SystemShell | `Launcher` / `SystemShell` |
 | G3 | window not `tool_window`, not `cloaked`-and-untitled | `ToolWindow` / `Cloaked` |
+| G3b | window not click-through overlay (`WS_EX_LAYERED` + `WS_EX_TRANSPARENT`), unless the exe is allowlisted | `Overlay` |
 | G4 | `visible || minimized` | `NoVisibleWindow` |
 | G5 | window ≥ 640×480 | `TooSmall` |
 | G6 | title not in `["", "Default IME", "MSCTFIME UI", "Program Manager"]` or known match | `BadTitle` |
@@ -813,6 +814,7 @@ Detection never sends IPC directly; `clipcheckd` maps `DetectEvent` to these mes
 | E19 | Game switches to a Windows "Game Bar" overlay or Steam overlay window | Overlay windows are tool windows or blocklisted (`gamebar`, `gamebarpresencewriter`); not candidates. |
 | E20 | Anti-cheat service stays running after game exit | `anticheat_running` true is only used to skip probes; it never keeps a session Active. |
 | E21 | High process churn (installers, updaters spawning many exes) | Scheduler coalesces snapshots; library and module caches keyed by `(pid, start_ms)`; CandidatesChanged rate-limited. |
+| E26 | Click-through overlay (crosshair, stats) fullscreen on top of the game | Overlay windows (layered + transparent) are rejected by G3b and never take the best-candidate slot; the game stays the candidate. Allowlisted exes are exempt. |
 | E22 | Foreground event storm (rapid alt-tab) | Coalesced to one forced tick per 250 ms (5.12). |
 | E23 | Manual add of a stale candidate (process exited between UI render and click) | `NotFound`; UI refreshes list. |
 | E24 | Config file edited by hand with a bad `detect.allow` entry | Invalid rule is skipped with a logged warning; the others apply. Config reload never clears active state unless mode becomes `off`. |

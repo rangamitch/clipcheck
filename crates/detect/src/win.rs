@@ -40,7 +40,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, GWL_EXSTYLE,
-    GWL_STYLE, WS_CAPTION, WS_EX_TOOLWINDOW,
+    GWL_STYLE, WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 use crate::{CandidateSnapshot, CaptureTarget, Rect};
@@ -247,6 +247,9 @@ fn snapshot_window(
     // SAFETY: plain read of the extended style for a valid window handle.
     let ex_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) };
     let is_tool_window = (ex_style as usize) & (WS_EX_TOOLWINDOW.0 as usize) != 0;
+    // Overlay: layered AND click-through. Layered alone is not enough (many games use it).
+    let is_overlay = (ex_style as usize) & (WS_EX_LAYERED.0 as usize) != 0
+        && (ex_style as usize) & (WS_EX_TRANSPARENT.0 as usize) != 0;
 
     // SAFETY: plain read of the window style for a valid window handle.
     let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) };
@@ -275,6 +278,7 @@ fn snapshot_window(
         is_minimized: minimized,
         is_cloaked,
         is_tool_window,
+        is_overlay,
         has_caption,
         is_launcher: false,
         is_primary_in_group: true,

@@ -30,6 +30,7 @@ fn snap(exe: &str, title: &str, rect: Rect, pid: u32, hwnd: u64) -> CandidateSna
         is_minimized: false,
         is_cloaked: false,
         is_tool_window: false,
+        is_overlay: false,
         has_caption: true,
         is_launcher: false,
         is_primary_in_group: true,

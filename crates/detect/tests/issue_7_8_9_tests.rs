@@ -36,6 +36,7 @@ fn game(exe: &str, title: &str) -> CandidateSnapshot {
         is_minimized: false,
         is_cloaked: false,
         is_tool_window: false,
+        is_overlay: false,
         has_caption: false,
         is_launcher: false,
         is_primary_in_group: true,

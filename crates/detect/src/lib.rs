@@ -98,6 +98,8 @@ pub struct CandidateSnapshot {
     pub is_cloaked: bool,
     /// Window is a tool window (`WS_EX_TOOLWINDOW`).
     pub is_tool_window: bool,
+    /// Layered AND click-through (WS_EX_LAYERED + WS_EX_TRANSPARENT) window: a crosshair or stats overlay, never a game.
+    pub is_overlay: bool,
     /// Window has a caption/title bar (used for NearFullscreen).
     pub has_caption: bool,
     /// Process is a known launcher (caller-side check; lists are also consulted).

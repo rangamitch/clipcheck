@@ -30,6 +30,8 @@ pub enum GateReason {
     AntiCheatService,
     /// G3: tool window.
     ToolWindow,
+    /// G3b: layered click-through overlay (crosshair, stats); rejected unless allowlisted.
+    Overlay,
     /// G3: cloaked and untitled.
     Cloaked,
     /// G4: neither visible nor minimized.
@@ -179,6 +181,11 @@ pub fn evaluate_with(lists: &Lists, snap: &CandidateSnapshot, cfg: &DetectConfig
     // G3: tool windows, cloaked untitled windows.
     if snap.is_tool_window {
         return Verdict::Rejected(GateReason::ToolWindow);
+    }
+    // G3b: click-through overlays (layered + transparent) are never games. Allowlisted
+    // games stay allowed because the user explicitly chose them.
+    if snap.is_overlay && !lists.is_allowlisted(exe) {
+        return Verdict::Rejected(GateReason::Overlay);
     }
     if snap.is_cloaked && title.trim().is_empty() {
         return Verdict::Rejected(GateReason::Cloaked);
@@ -340,6 +347,7 @@ mod tests {
             is_minimized: false,
             is_cloaked: false,
             is_tool_window: false,
+            is_overlay: false,
             has_caption: false,
             is_launcher: false,
             is_primary_in_group: true,
