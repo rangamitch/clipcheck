@@ -70,6 +70,7 @@ fn cand(exe: &str, title: &str) -> WindowCandidate {
         launcher: false,
         is_self: false,
         score: 0,
+        accepted: false,
         known: false,
         in_library: false,
     }
@@ -106,7 +107,7 @@ fn running_apps_drops_non_candidate_windows() {
         ("empty exe", with(|c| c.exe.clear())),
     ];
     for (label, c) in cases {
-        let rows = build_running_apps(&[c], &[], 60);
+        let rows = build_running_apps(&[c], &[]);
         assert!(
             rows.is_empty(),
             "{label} window was kept: {:?}",
@@ -114,7 +115,7 @@ fn running_apps_drops_non_candidate_windows() {
         );
     }
 
-    let rows = build_running_apps(&[cand("ok.exe", "ok")], &[], 60);
+    let rows = build_running_apps(&[cand("ok.exe", "ok")], &[]);
     assert_eq!(exes(&rows), vec!["ok.exe"], "plain window must be kept");
 
     // Size boundary: exactly MIN_WINDOW_PX on both sides is kept.
@@ -123,7 +124,7 @@ fn running_apps_drops_non_candidate_windows() {
         c.width = MIN_WINDOW_PX;
         c.height = MIN_WINDOW_PX;
     });
-    let rows = build_running_apps(&[edge], &[], 60);
+    let rows = build_running_apps(&[edge], &[]);
     assert_eq!(
         exes(&rows),
         vec!["edge.exe"],
@@ -147,7 +148,7 @@ fn running_apps_dedupes_per_exe_topmost_wins() {
         c.exe = "Other.exe".into();
         c.title = "Other".into();
     });
-    let rows = build_running_apps(&[top, second, other], &[], 60);
+    let rows = build_running_apps(&[top, second, other], &[]);
     assert_eq!(rows.len(), 2, "rows: {:?}", exes(&rows));
     let g = row(&rows, "Game.exe");
     assert_eq!(g.name, "Top title", "topmost title must win");
@@ -159,15 +160,10 @@ fn running_apps_excluded_list_is_case_insensitive() {
     let rows = build_running_apps(
         &[cand("DISCORD.exe", "d"), cand("Keep.exe", "k")],
         &["Discord.EXE".to_string()],
-        60,
     );
     assert_eq!(exes(&rows), vec!["Keep.exe"]);
 
-    let rows = build_running_apps(
-        &[cand("Discord.exe", "d")],
-        &["discord.exe".to_string()],
-        60,
-    );
+    let rows = build_running_apps(&[cand("Discord.exe", "d")], &["discord.exe".to_string()]);
     assert!(
         rows.is_empty(),
         "lowercase exclusion did not match: {:?}",
@@ -178,9 +174,11 @@ fn running_apps_excluded_list_is_case_insensitive() {
 #[test]
 fn running_apps_suggested_and_game_thresholds() {
     assert_eq!(SUGGEST_SCORE, 30, "SUGGEST_SCORE changed; update this test");
+    // `accepted` stands in for the detector verdict; its threshold is min_score 60.
     let mk = |exe: &str, score: u32, known: bool, lib: bool| {
         let mut c = cand(exe, exe);
         c.score = score;
+        c.accepted = score >= 60;
         c.known = known;
         c.in_library = lib;
         c
@@ -193,7 +191,7 @@ fn running_apps_suggested_and_game_thresholds() {
         mk("known.exe", 0, true, false),
         mk("lib.exe", 0, false, true),
     ];
-    let rows = build_running_apps(&cands, &[], 60);
+    let rows = build_running_apps(&cands, &[]);
     let check = |exe: &str, suggested: bool, is_game: bool| {
         let r = row(&rows, exe);
         assert_eq!(
@@ -206,8 +204,10 @@ fn running_apps_suggested_and_game_thresholds() {
     check("s30.exe", true, false);
     check("s59.exe", true, false);
     check("s60.exe", true, true);
-    check("known.exe", true, true);
-    check("lib.exe", true, true);
+    // Known and library exes are suggested, but only an accepted window is a game.
+    // The detector rejected these fixtures, so they are not games.
+    check("known.exe", true, false);
+    check("lib.exe", true, false);
 }
 
 #[test]
@@ -233,7 +233,7 @@ fn running_apps_ordering_suggested_then_name_then_exe() {
         c.exe = "aa.exe".into();
         c.title = "Beta".into();
     });
-    let rows = build_running_apps(&[zeta, mid, apple, bb, aa], &[], 60);
+    let rows = build_running_apps(&[zeta, mid, apple, bb, aa], &[]);
     assert_eq!(
         exes(&rows),
         vec!["zeta.exe", "Apple.exe", "aa.exe", "bb.exe", "mid.exe"],
@@ -250,7 +250,6 @@ fn running_apps_name_is_trimmed_title_or_exe_stem() {
             cand("Bar.EXE", ""),
         ],
         &[],
-        60,
     );
     assert_eq!(row(&rows, "a.exe").name, "Spaced Title");
     assert_eq!(row(&rows, "Foo.exe").name, "Foo");
@@ -262,7 +261,7 @@ fn running_apps_capped_at_max_rows() {
     let cands: Vec<WindowCandidate> = (0..MAX_RUNNING_APPS + 10)
         .map(|i| cand(&format!("app{i:03}.exe"), &format!("app {i}")))
         .collect();
-    let rows = build_running_apps(&cands, &[], 60);
+    let rows = build_running_apps(&cands, &[]);
     assert_eq!(rows.len(), MAX_RUNNING_APPS);
 }
 

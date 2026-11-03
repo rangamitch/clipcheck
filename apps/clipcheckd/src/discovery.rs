@@ -79,6 +79,8 @@ pub struct WindowCandidate {
     pub is_self: bool,
     /// Detector score, 0 when a gate rejected the window.
     pub score: u32,
+    /// The detector's verdict accepted this window (`Verdict::Scored { accepted: true, .. }`).
+    pub accepted: bool,
     /// Exe is in the known-games database.
     pub known: bool,
     /// Install directory is inside a library scan.
@@ -90,14 +92,12 @@ pub struct WindowCandidate {
 /// Candidates arrive in z-order (topmost first). Non-game windows are dropped,
 /// windows of the same exe are merged into the first (topmost) one, and exes in
 /// `excluded` (lowercase; allow list and attached game) are removed. A row is a
-/// game when its score reaches `accept_score` or it is known or in a library; it
-/// is suggested at `SUGGEST_SCORE` or the same known/library rule. Suggested rows
-/// come first, then rows sort by name (case-insensitive) and exe.
-pub fn build_running_apps(
-    cands: &[WindowCandidate],
-    excluded: &[String],
-    accept_score: u32,
-) -> Vec<RunningAppDto> {
+/// game when the detector verdict accepted its window (`WindowCandidate::accepted`);
+/// a known or library exe the detector rejected is not a game. A row is suggested
+/// at `SUGGEST_SCORE` or when it is known or in a library, so known games stay
+/// listed and selectable. Suggested rows come first, then rows sort by name
+/// (case-insensitive) and exe.
+pub fn build_running_apps(cands: &[WindowCandidate], excluded: &[String]) -> Vec<RunningAppDto> {
     let mut seen: Vec<String> = Vec::new();
     let mut rows: Vec<RunningAppDto> = Vec::new();
     for c in cands {
@@ -121,7 +121,7 @@ pub fn build_running_apps(
         seen.push(key);
         let known_or_lib = c.known || c.in_library;
         let suggested = c.score >= SUGGEST_SCORE || known_or_lib;
-        let is_game = c.score >= accept_score || known_or_lib;
+        let is_game = c.accepted;
         let name = if c.title.trim().is_empty() {
             stem(&c.exe)
         } else {
@@ -456,9 +456,11 @@ pub fn running_apps_reply(config: &Value, attached: Option<&str>) -> Reply {
                 continue;
             }
             let exe = snap.exe_name.clone();
-            let score = match evaluate_with(&lists, snap, &cfg) {
-                Verdict::Scored { score, .. } => score,
-                Verdict::Rejected(_) => 0,
+            let (score, accepted) = match evaluate_with(&lists, snap, &cfg) {
+                Verdict::Scored {
+                    score, accepted, ..
+                } => (score, accepted),
+                Verdict::Rejected(_) => (0, false),
             };
             let exe_path = modules::exe_path(snap.target.pid);
             let in_library = exe_path
@@ -481,6 +483,7 @@ pub fn running_apps_reply(config: &Value, attached: Option<&str>) -> Reply {
                 launcher: lists.is_launcher(&exe),
                 is_self: snap.target.pid == own_pid || is_self_exe(&exe),
                 score,
+                accepted,
                 known: known_games::is_known(&exe).is_some(),
                 in_library,
             });
@@ -488,7 +491,7 @@ pub fn running_apps_reply(config: &Value, attached: Option<&str>) -> Reply {
     }
 
     let excluded = excluded_exes(config, attached);
-    let mut apps = build_running_apps(&cands, &excluded, u32::from(cfg.min_score));
+    let mut apps = build_running_apps(&cands, &excluded);
     for app in &mut apps {
         if let Some(path) = paths.get(&app.exe.to_lowercase()) {
             app.icon_png_b64 = appinfo::icon_png_b64(path);
@@ -703,6 +706,7 @@ mod tests {
             launcher: false,
             is_self: false,
             score,
+            accepted: false,
             known: false,
             in_library: false,
         }
@@ -715,7 +719,7 @@ mod tests {
             cand("zeta.exe", 40),
             cand("alpha.exe", 10),
         ];
-        let apps = build_running_apps(&cands, &[], 60);
+        let apps = build_running_apps(&cands, &[]);
         let order: Vec<&str> = apps.iter().map(|a| a.exe.as_str()).collect();
         assert_eq!(order, ["zeta.exe", "alpha.exe", "notepad.exe"]);
         assert!(apps[0].suggested && !apps[0].is_game);
@@ -726,17 +730,33 @@ mod tests {
     fn known_or_library_is_game_and_suggested() {
         let mut known = cand("cs2.exe", 0);
         known.known = true;
+        known.accepted = true;
         let mut lib = cand("lib.exe", 5);
         lib.in_library = true;
-        let apps = build_running_apps(&[known, lib], &[], 60);
+        lib.accepted = true;
+        let apps = build_running_apps(&[known, lib], &[]);
         assert!(apps.iter().all(|a| a.is_game && a.suggested));
     }
 
     #[test]
-    fn score_at_accept_threshold_is_game() {
-        let apps = build_running_apps(&[cand("g.exe", 60)], &[], 60);
+    fn known_but_rejected_window_is_suggested_not_game() {
+        let mut known = cand("FiveM_b3258_GTAProcess.exe", 0);
+        known.known = true;
+        known.accepted = false;
+        let apps = build_running_apps(&[known], &[]);
+        assert!(apps[0].suggested, "known exe must stay listed");
+        assert!(!apps[0].is_game, "rejected window must not count as a game");
+    }
+
+    #[test]
+    fn accepted_verdict_decides_is_game() {
+        let mut at = cand("g.exe", 60);
+        at.accepted = true;
+        let apps = build_running_apps(&[at], &[]);
         assert!(apps[0].is_game);
-        let apps = build_running_apps(&[cand("g.exe", 59)], &[], 60);
+        let mut below = cand("g.exe", 59);
+        below.accepted = false;
+        let apps = build_running_apps(&[below], &[]);
         assert!(!apps[0].is_game && apps[0].suggested);
     }
 
@@ -746,7 +766,7 @@ mod tests {
         top.title = "Top".to_owned();
         let mut below = cand("APP.exe", 0);
         below.title = "Below".to_owned();
-        let apps = build_running_apps(&[top, below], &[], 60);
+        let apps = build_running_apps(&[top, below], &[]);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].name, "Top");
     }
@@ -776,7 +796,6 @@ mod tests {
                 hidden, cloaked, tool, blocked, shell, launcher, me, tiny, empty,
             ],
             &[],
-            60,
         );
         assert!(apps.is_empty());
     }
@@ -784,7 +803,7 @@ mod tests {
     #[test]
     fn excluded_exes_are_removed_case_insensitively() {
         let cands = vec![cand("Game.exe", 90), cand("other.exe", 90)];
-        let apps = build_running_apps(&cands, &["game.exe".to_owned()], 60);
+        let apps = build_running_apps(&cands, &["game.exe".to_owned()]);
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].exe, "other.exe");
     }
@@ -793,7 +812,7 @@ mod tests {
     fn running_name_falls_back_to_stem() {
         let mut c = cand("tool.exe", 0);
         c.title = "   ".to_owned();
-        let apps = build_running_apps(&[c], &[], 60);
+        let apps = build_running_apps(&[c], &[]);
         assert_eq!(apps[0].name, "tool");
     }
 
