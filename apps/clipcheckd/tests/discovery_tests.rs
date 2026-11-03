@@ -265,6 +265,69 @@ fn running_apps_capped_at_max_rows() {
     assert_eq!(rows.len(), MAX_RUNNING_APPS);
 }
 
+#[test]
+fn running_apps_is_game_follows_accepted_not_score() {
+    // High score but the detector rejected it (e.g. overlay gate): not a game.
+    let rejected = with(|c| {
+        c.exe = "hi.exe".into();
+        c.score = 90;
+        c.accepted = false;
+    });
+    // Zero score but accepted by the detector (allowlisted): a game.
+    let accepted = with(|c| {
+        c.exe = "lo.exe".into();
+        c.score = 0;
+        c.accepted = true;
+    });
+    let rows = build_running_apps(&[rejected, accepted], &[]);
+    assert!(
+        !row(&rows, "hi.exe").is_game,
+        "rejected high score must not be a game"
+    );
+    assert!(
+        row(&rows, "hi.exe").suggested,
+        "score >= SUGGEST_SCORE is suggested"
+    );
+    assert!(
+        row(&rows, "lo.exe").is_game,
+        "accepted window must be a game"
+    );
+}
+
+#[test]
+fn running_apps_known_but_rejected_is_listed_not_game() {
+    let rows = build_running_apps(
+        &[with(|c| {
+            c.exe = "fivem_rejected.exe".into();
+            c.known = true;
+            c.accepted = false;
+        })],
+        &[],
+    );
+    let r = row(&rows, "fivem_rejected.exe");
+    assert!(
+        !r.is_game,
+        "known but rejected (e.g. overlay) must not be is_game"
+    );
+    assert!(r.suggested, "known exe stays suggested");
+}
+
+#[test]
+fn running_apps_excluded_exe_dropped_even_when_accepted() {
+    let rows = build_running_apps(
+        &[with(|c| {
+            c.exe = "Pinned.exe".into();
+            c.accepted = true;
+        })],
+        &["pinned.exe".to_string()],
+    );
+    assert!(
+        rows.is_empty(),
+        "excluded accepted exe kept: {:?}",
+        exes(&rows)
+    );
+}
+
 fn seen(exe: &str, display: &str, last_ms: u64) -> SeenApp {
     SeenApp {
         exe_name: exe.into(),
