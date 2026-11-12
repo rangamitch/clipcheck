@@ -159,6 +159,55 @@
     });
   }
 
+  /**
+   * Clips the daemon accepted but has not finished writing. Each shows a placeholder card
+   * until the real recording is listed. `saved` is set once the daemon reports the file, and
+   * the placeholder is dropped only after a listing that started afterwards lands, so the
+   * card never vanishes before its replacement appears.
+   */
+  let pendingClips = $state<{ id: string; saved: boolean }[]>([]);
+  /** A placeholder that never resolves (lost event) goes away after this long. */
+  const PENDING_MAX_MS = 180_000;
+  const pendingTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function dropPending(ids: Iterable<string>): void {
+    const drop = new Set(ids);
+    if (drop.size === 0) return;
+    for (const id of drop) {
+      clearTimeout(pendingTimers.get(id));
+      pendingTimers.delete(id);
+    }
+    pendingClips = pendingClips.filter((p) => !drop.has(p.id));
+  }
+
+  /** Ids already reported saved; a listing that starts now can replace their placeholders. */
+  function savedPendingIds(): string[] {
+    return pendingClips.filter((p) => p.saved).map((p) => p.id);
+  }
+
+  /** A clip was requested: show a "still saving" card at once. */
+  export function clipPending(id: string): void {
+    if (pendingClips.some((p) => p.id === id)) return;
+    pendingClips = [{ id, saved: false }, ...pendingClips];
+    pendingTimers.set(
+      id,
+      setTimeout(() => dropPending([id]), PENDING_MAX_MS),
+    );
+  }
+
+  /** The clip file is written; its placeholder stays until the next listing includes it. */
+  export function clipSaved(id: string): void {
+    pendingClips = pendingClips.map((p) => (p.id === id ? { ...p, saved: true } : p));
+  }
+
+  /** The clip failed; there will be no recording, so the placeholder goes now. */
+  export function clipFailed(id: string): void {
+    dropPending([id]);
+  }
+
+  /** Placeholders show only on an unfiltered listing, where the new clip would appear. */
+  const visiblePending = $derived(filtersActive ? [] : pendingClips);
+
   /** True while a load-more page is in flight (not reactive; only gates refresh). */
   let loadMoreInFlight = false;
   /** A refresh asked for while a load-more was in flight; runs once that page lands. */
@@ -171,6 +220,7 @@
    */
   async function fetchPage(cursor: string | null, quiet = false): Promise<void> {
     const seq = ++requestSeq;
+    const settled = cursor === null ? savedPendingIds() : [];
     if (!quiet) loading = true;
     error = null;
     // A fresh first page may find posters written since the last listing, so retry them.
@@ -184,6 +234,7 @@
       // An append pushes onto the existing list rather than copying it.
       if (cursor === null) {
         items = page.items;
+        dropPending(settled);
       } else {
         items.push(...page.items);
       }
@@ -217,6 +268,7 @@
    */
   async function refetchLoaded(): Promise<void> {
     const seq = ++requestSeq;
+    const settled = savedPendingIds();
     const target = refetchTarget(items.length, DEFAULT_PAGE_SIZE);
     const quiet = loadedOnce;
     if (!quiet) loading = true;
@@ -237,6 +289,7 @@
       } while (wantsMorePages(collected.length, target, cursor));
       items = collected;
       nextCursor = cursor;
+      dropPending(settled);
     } catch (e) {
       if (seq !== requestSeq) return;
       error = e instanceof Error ? e.message : String(e);
@@ -552,6 +605,8 @@
     // Stats are decorative; the listing reports real errors.
     void refreshStats();
     return () => {
+      for (const t of pendingTimers.values()) clearTimeout(t);
+      pendingTimers.clear();
       searchDebounce.cancel();
       pageObserver?.disconnect();
       sizeObserver?.disconnect();
@@ -699,6 +754,25 @@
       <p class="notice error" role="alert">Could not load recordings: {error}</p>
     {/if}
 
+    {#if visiblePending.length > 0}
+      <ul class="grid pending-grid" aria-label="Clips being saved">
+        {#each visiblePending as p (p.id)}
+          <li class="card pending" aria-busy="true">
+            <div class="open">
+              <span class="thumb" aria-hidden="true">
+                <span class="badge kind">Clip</span>
+                <span class="spinner"></span>
+              </span>
+              <span class="meta">
+                <span class="name">Saving clip...</span>
+                <span class="sub">Still processing. Check back in a bit.</span>
+              </span>
+            </div>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+
     {#if items.length > 0}
       {#each pages as page, i (i)}
         <section class="page" data-page={i} use:observePage={i}>
@@ -784,7 +858,7 @@
           {/if}
         </section>
       {/each}
-    {:else if loadedOnce && !loading && !error}
+    {:else if loadedOnce && !loading && !error && visiblePending.length === 0}
       <div class="empty">
         {#if filtersActive}
           <p>No recordings match these filters.</p>
@@ -925,6 +999,46 @@
   .card.picked {
     border-color: var(--accent);
     box-shadow: 0 0 0 2px var(--accent);
+  }
+
+  .pending-grid {
+    margin-bottom: 14px;
+  }
+
+  .card.pending,
+  .card.pending:hover {
+    border-style: dashed;
+    border-color: var(--border);
+    cursor: default;
+  }
+
+  .card.pending .open {
+    cursor: default;
+  }
+
+  .spinner {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 28px;
+    height: 28px;
+    margin: -14px 0 0 -14px;
+    border: 3px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: pending-spin 0.9s linear infinite;
+  }
+
+  @keyframes pending-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spinner {
+      animation: none;
+    }
   }
 
   .card.selecting .menu-slot {

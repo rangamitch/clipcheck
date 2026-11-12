@@ -44,7 +44,15 @@
   const POLL_WINDOW_MS = 120_000;
 
   /** `isEmpty` is optional: without it the retry always runs, which is harmless. */
-  let gallery: { refresh: () => void; isEmpty?: () => boolean } | undefined = $state();
+  let gallery:
+    | {
+        refresh: () => void;
+        isEmpty?: () => boolean;
+        clipPending: (id: string) => void;
+        clipSaved: (id: string) => void;
+        clipFailed: (id: string) => void;
+      }
+    | undefined = $state();
 
   onMount(() => {
     const stopStatus = startLiveStatus();
@@ -54,6 +62,9 @@
     let connectedAtMount: boolean | null = null;
 
     const stopEvents = onEvent((ev) => {
+      if (ev.type === 'clip_pending') gallery?.clipPending(ev.data.clip_id);
+      else if (ev.type === 'clip_failed') gallery?.clipFailed(ev.data.clip_id);
+      else if (ev.type === 'clip_saved') gallery?.clipSaved(ev.data.clip_id);
       if (refreshesGallery(ev)) {
         refreshSoon.call();
       }

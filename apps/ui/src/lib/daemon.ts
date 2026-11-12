@@ -237,6 +237,8 @@ export type Event =
         parts_saved: number;
       };
     }
+  | { type: 'clip_pending'; data: { clip_id: string; seconds: number } }
+  | { type: 'clip_failed'; data: { clip_id: string; error: string } }
   | { type: 'clip_saved'; data: { clip_id: string; path: string; duration_ms: number; bytes: number } }
   | { type: 'capture_health'; data: { fps: number; dropped_frames: number; black_frames_active: boolean } }
   | { type: 'encoder_selected'; data: { codec: string; encoder: string } }
