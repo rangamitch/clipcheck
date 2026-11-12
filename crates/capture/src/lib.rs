@@ -39,6 +39,12 @@ pub fn no_border_attempts() -> u64 {
     dda::attempts()
 }
 
+/// Turns the "black while the game is not the foreground window" rule of the no-border source on
+/// or off for this process. On by default; tests switch it off because they cannot take focus.
+pub fn set_no_border_focus_blanking(enabled: bool) {
+    dda::set_focus_blanking(enabled);
+}
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard};

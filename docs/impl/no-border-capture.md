@@ -15,6 +15,14 @@ the game window covers (at least 95 % of) its monitor, i.e. borderless/fullscree
 recorder falls back to normal window capture (border stays) and logs why. The setting's help text
 says all of this.
 
+## Focus blanking
+
+Desktop Duplication sees the whole screen, so when the game loses focus (alt-tab) the source
+publishes black frames (same size as the crop) until the game window is the foreground window
+again. Foreground is compared by top-level (GA_ROOT) window; "no foreground window" counts as
+focused so the switch itself does not flicker. `set_no_border_focus_blanking(false)` disables it
+(tests only: they cannot take focus).
+
 ## Settings
 
 `[video] no_border_capture = false` (bool). Global only (no per-game override). Lives in the

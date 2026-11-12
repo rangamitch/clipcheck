@@ -460,6 +460,8 @@ fn no_border_frames_match_client_size_and_colour() {
     let Some((dev, ctx)) = gpu_device(T) else {
         return;
     };
+    // The test window cannot take foreground focus, which would otherwise blank the frames.
+    clipcheck_capture::set_no_border_focus_blanking(false);
     let win = spawn_test_window(640, 480, RED, true);
     let cfg = CaptureConfig {
         hwnd: win.hwnd,
