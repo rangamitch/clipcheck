@@ -784,6 +784,22 @@ pub enum Event {
         /// Parts of this session finished so far, including this one.
         parts_saved: u32,
     },
+    /// A clip was requested and is still being written. Sent the moment the request is
+    /// accepted so clients can show a placeholder; `ClipSaved` or `ClipFailed` with the
+    /// same `clip_id` follows.
+    ClipPending {
+        /// Id of the clip (the same id `ClipSaved` will carry).
+        clip_id: String,
+        /// Length requested, in seconds.
+        seconds: u32,
+    },
+    /// A requested clip could not be saved.
+    ClipFailed {
+        /// Id of the clip.
+        clip_id: String,
+        /// What went wrong.
+        error: String,
+    },
     /// A clip finished saving.
     ClipSaved {
         /// Id of the clip.
@@ -935,7 +951,9 @@ impl Event {
             | Event::Degraded { .. }
             | Event::DetectionPauseChanged { .. }
             | Event::MicMuteChanged { .. } => Some(Topic::State),
-            Event::ClipSaved { .. } => Some(Topic::Clips),
+            Event::ClipPending { .. } | Event::ClipFailed { .. } | Event::ClipSaved { .. } => {
+                Some(Topic::Clips)
+            }
             Event::SessionStarted { .. }
             | Event::SessionPartStarted { .. }
             | Event::SessionPartFinished { .. } => Some(Topic::Sessions),

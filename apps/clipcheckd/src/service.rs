@@ -1550,14 +1550,15 @@ impl Core {
                     duration_ms,
                     bytes: file_len(&path),
                 });
-                // Both feedbacks are non-blocking: the sound plays asynchronously and
-                // the toast is handed off to its own window.
-                crate::sound::play_clip_saved();
-                let toast_seconds = (seconds_actual.round() as u32).max(1);
-                crate::toast::clip_saved(toast_seconds);
+                // The sound and toast already played when the clip was requested (see
+                // `Inner::clip`), so nothing more is announced here.
             }
             RecorderEvent::ClipFailed { job, error } => {
                 self.warn("clip_failed", format!("clip {} failed: {error}", job.0));
+                self.bus.publish(Event::ClipFailed {
+                    clip_id: job.0.to_string(),
+                    error: error.to_string(),
+                });
                 // Only failures reported by the recorder reach this arm. Requests
                 // refused before the recorder (such as "no window is attached") are
                 // returned to the caller or logged elsewhere and are not toasted.
@@ -1952,7 +1953,17 @@ impl Core {
             .recorder_mut()?
             .clip(seconds)
             .map_err(to_service_error)?;
-        Ok(job.0.to_string())
+        let clip_id = job.0.to_string();
+        // Instant feedback: the request was accepted, so confirm it now. The file is written
+        // in the background; clients show a placeholder until `ClipSaved` arrives. Both
+        // feedbacks are non-blocking (async sound, toast on its own window).
+        self.bus.publish(Event::ClipPending {
+            clip_id: clip_id.clone(),
+            seconds,
+        });
+        crate::sound::play_clip_saved();
+        crate::toast::clip_saved(seconds);
+        Ok(clip_id)
     }
 
     fn status_dto(&self) -> StatusDto {
