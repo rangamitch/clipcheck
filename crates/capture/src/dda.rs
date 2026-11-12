@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -15,7 +15,7 @@ use std::time::Duration;
 use windows::core::Interface;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
+    ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D, D3D11_BOX,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::{
@@ -31,7 +31,8 @@ use windows::Win32::UI::HiDpi::{
     SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetDesktopWindow, GetShellWindow, IsWindow,
+    GetAncestor, GetClientRect, GetDesktopWindow, GetForegroundWindow, GetShellWindow, IsWindow,
+    GA_ROOT,
 };
 
 use crate::dda_geom::{covers_monitor, crop_box, rotation_supported, CropBox, Rect};
@@ -46,6 +47,14 @@ const RETRY_MS: u64 = 250;
 
 /// Longest single sleep, so a stop request is seen promptly.
 const SLICE_MS: u64 = 50;
+
+/// Whether frames are blanked while the game is not the foreground window.
+static FOCUS_BLANKING: AtomicBool = AtomicBool::new(true);
+
+/// See [`crate::set_no_border_focus_blanking`].
+pub(crate) fn set_focus_blanking(enabled: bool) {
+    FOCUS_BLANKING.store(enabled, Ordering::Relaxed);
+}
 
 /// See [`crate::no_border_attempts`].
 pub(crate) fn attempts() -> u64 {
@@ -218,6 +227,12 @@ fn frame_loop(
         if stop_requested(stop_rx) || !ensure_duplication(cap, errors, stop_rx) {
             return;
         }
+        let focused = game_has_focus(cap.hwnd);
+        if !focused {
+            // Desktop Duplication sees the whole screen: show black while another window is
+            // in front, even when the screen is static and no new desktop frames arrive.
+            publish_black(cap, shared, errors, &mut last, period);
+        }
         let acquired = match cap.dup.as_ref() {
             Some(d) => acquire_frame(&d.dup, timeout),
             None => continue,
@@ -242,12 +257,88 @@ fn frame_loop(
         // A frame is held from here on; it is released on every path below.
         if let Some(resource) = resource.as_ref() {
             // LastPresentTime == 0 means a cursor-only update, which carries no new pixels.
-            if info.LastPresentTime != 0 {
+            if focused && info.LastPresentTime != 0 {
                 publish_frame(cap, shared, errors, resource, &mut last, period);
             }
         }
         release_frame(cap, errors);
     }
+}
+
+/// Publishes an all-black frame the size of the window's crop. Rate-gated like real frames.
+fn publish_black(
+    cap: &mut Capture,
+    shared: &Shared,
+    errors: &AtomicU64,
+    last: &mut Option<i64>,
+    period: i64,
+) {
+    let now = wgc::qpc_now();
+    if !wgc::accept_frame(*last, now, period) {
+        return;
+    }
+    let Some(output) = cap.dup.as_ref().map(|d| d.output) else {
+        return;
+    };
+    let Some(crop) = client_rect_screen(cap.hwnd)
+        .ok()
+        .and_then(|client| crop_box(client, output))
+    else {
+        return;
+    };
+    let dst = match cap.ring.acquire(crop.width, crop.height) {
+        Ok(t) => t,
+        Err(e) => {
+            wgc::note_error(errors, derr("TextureRing::acquire")(e));
+            return;
+        }
+    };
+    if let Err(e) = clear_black(&cap.device, &cap.context, &dst) {
+        wgc::note_error(errors, derr("clear black frame")(e));
+        return;
+    }
+    *last = Some(now);
+    let mut lat = wgc::lock_counted(shared, errors);
+    lat.seq = lat.seq.wrapping_add(1);
+    lat.width = crop.width;
+    lat.height = crop.height;
+    lat.texture = Some(SharedTexture(dst));
+}
+
+/// Fills `tex` (created with the render-target bind flag) with opaque black.
+fn clear_black(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    tex: &ID3D11Texture2D,
+) -> windows::core::Result<()> {
+    let mut rtv: Option<ID3D11RenderTargetView> = None;
+    // SAFETY: tex is a live texture on `device` with D3D11_BIND_RENDER_TARGET; rtv is a valid
+    // out-pointer.
+    unsafe { device.CreateRenderTargetView(tex, None, Some(&mut rtv as *mut _)) }?;
+    let rtv =
+        rtv.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_POINTER))?;
+    // SAFETY: rtv is live on the same device as context.
+    unsafe { context.ClearRenderTargetView(&rtv, &[0.0, 0.0, 0.0, 1.0]) };
+    Ok(())
+}
+
+/// True when the game's top-level window is the foreground window. Treats "no foreground
+/// window" (mid-switch) as focused so alt-tab does not flicker.
+fn game_has_focus(game: HWND) -> bool {
+    if !FOCUS_BLANKING.load(Ordering::Relaxed) {
+        return true;
+    }
+    // SAFETY: these calls only read window handle values.
+    let (fg_root, game_root) = unsafe {
+        let fg = GetForegroundWindow();
+        (GetAncestor(fg, GA_ROOT), GetAncestor(game, GA_ROOT))
+    };
+    is_focused(fg_root.0 as isize, game_root.0 as isize)
+}
+
+/// Pure focus rule: a null foreground root counts as focused.
+fn is_focused(fg_root: isize, game_root: isize) -> bool {
+    fg_root == 0 || fg_root == game_root
 }
 
 /// Copies the window's crop from an acquired desktop image into a ring texture and publishes it.

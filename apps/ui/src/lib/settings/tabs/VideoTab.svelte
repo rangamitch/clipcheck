@@ -403,7 +403,7 @@
     <FieldRow
       label="Capture Method"
       path="video.no_border_capture"
-      help="Standard Capture records the game window and is right for most people. Experimental Capture records the screen area under the game instead, so Windows never draws its coloured outline. It can fix border and recording problems on Windows 10 and is also usable on Windows 11. A notification or window on top of the game will appear in your clips. It is only used when the game is borderless fullscreen; otherwise Standard Capture is used."
+      help="Standard Capture records the game window and is right for most people. Experimental Capture records the screen area under the game instead, so Windows never draws its coloured outline. It can fix border and recording problems on Windows 10 and is also usable on Windows 11. A notification on top of the game will appear in your clips, but the clip goes black while you are tabbed out to another window. It is only used when the game is borderless fullscreen; otherwise Standard Capture is used."
     >
       {#snippet children(ctl)}
         <Segmented
