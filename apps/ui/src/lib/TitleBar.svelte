@@ -118,7 +118,10 @@
 <style>
   .titlebar {
     position: relative;
-    z-index: 10;
+    /* Above in-page sticky bars (the gallery's top bar is z-index 10 and comes later in the DOM), so the
+       recorder confirm and notices that drop out of the title bar are never painted under page content.
+       Stays below the modal layers (900 and up). */
+    z-index: 100;
     display: flex;
     align-items: stretch;
     flex: 0 0 36px;
